@@ -1,7 +1,8 @@
 """The configuration resolved against the registered plugin classes
-(decision 0010): every configured use of a class as a `Profile`, its options
-validated, and every workflow's runs, all checked at startup. Nothing is
-built here: `Application` builds a profile's object when a run needs it.
+(decisions 0010, 0015): every configured use of a class as a `Profile`, its
+options validated, every workflow's process runs, and the applet and sink
+instances with their routes, all checked at startup. Nothing is built here:
+`Application` builds a profile's object when it is first needed.
 """
 
 from __future__ import annotations
@@ -14,15 +15,15 @@ from typing import Annotated, Any
 
 import pydantic
 
+from .applets import WEEKDAYS, AppletType, Schedule
 from .config import (
     DEFAULT_WORKFLOW,
     NAME_PATTERN,
+    AppEntry,
     Config,
     ConfigError,
-    DeliveryEntry,
     Entry,
     ProcessEntry,
-    RemixEntry,
     Workflow,
     options_error,
 )
@@ -30,8 +31,7 @@ from .llms import LLMType
 from .plugins import ClassRegister, UsesLLMOptions, merge_options
 from .processors import ProcessorType
 from .providers import ProviderType
-from .remixers import RemixerType
-from .sinks import SinkType
+from .sinks import SinkType, accepts
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class Kind:
 LLM = Kind("llm", LLMType)
 PROVIDER = Kind("provider", ProviderType)
 PROCESSOR = Kind("processor", ProcessorType)
-REMIXER = Kind("remixer", RemixerType)
+APPLET = Kind("applet", AppletType)
 SINK = Kind("sink", SinkType)
 
 
@@ -85,15 +85,26 @@ class Use:
     location: str
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class AppInstance:
+    """A configured applet instance: its profile, when it is due, and the
+    sink instances each of its outputs is routed to."""
+
+    id: str
+    profile: Profile
+    schedule: Schedule
+    routes: Mapping[str, tuple[str, ...]]
+    location: str
+
+
 class Catalog:
-    """The profiles and runs of a configuration. Every use is validated, run
-    or not; a run's options in its profile, the rest in its key and in what
-    it reads."""
+    """The profiles, runs and instances of a configuration. Every use is
+    validated, run or not."""
 
     def __init__(self, config: Config, register: ClassRegister) -> None:
         self._classes = {
             kind: register.classes(kind.protocol)
-            for kind in (LLM, PROVIDER, PROCESSOR, REMIXER, SINK)
+            for kind in (LLM, PROVIDER, PROCESSOR, APPLET, SINK)
         }
         self._sections = {
             name: section or {} for name, section in config.plugins.items()
@@ -111,36 +122,32 @@ class Catalog:
             for source in config.sources
         }
         processors = self._catalog(PROCESSOR, config.processors, "processors")
-        remixers = self._catalog(REMIXER, config.remixers, "remixers")
-        sinks = self._catalog(SINK, config.sinks, "sinks")
-        self._ids = {
-            PROCESSOR: ids_of(processors),
-            REMIXER: ids_of(remixers),
-            SINK: ids_of(sinks),
-        }
+        self._processor_ids = ids_of(processors)
 
-        # By (workflow, key), by key and by ledger key, in configuration order.
+        # By (workflow, key), in configuration order.
         self.process: dict[tuple[str, str], Run] = {}
-        self.remix: dict[str, Run] = {}
-        self.deliveries: dict[str, Run] = {}
         for workflow in config.all_workflows():
             if workflow.name == DEFAULT_WORKFLOW:
                 process = in_default(processors)
-                remix = in_default(remixers)
-                deliver: list[Use] = []
             else:
-                process = self._resolve_all(
-                    PROCESSOR, workflow, "process", workflow.process
-                )
-                remix = self._resolve_all(REMIXER, workflow, "remix", workflow.remix)
-                deliver = self._resolve_all(SINK, workflow, "deliver", workflow.deliver)
+                process = [
+                    self._resolve(ref, f"workflows.{workflow.name}.process.{index}")
+                    for index, ref in enumerate(workflow.process)
+                ]
             for use in process:
                 self._add_process(Run(workflow, use.key, use.profile, use.location))
-            for use in remix:
-                self._add_remix(Run(workflow, use.key, use.profile, use.location))
-            for use in deliver:
-                self._add_delivery(Run(workflow, use.key, use.profile, use.location))
         self._check_requirements()
+
+        # By id, in configuration order.
+        self.sinks: dict[str, Profile] = {
+            entry.id: self._profile(SINK, entry.sink, entry.options, f"sinks.{index}")
+            for index, entry in enumerate(config.sinks)
+        }
+        self._source_ids = [source.id for source in config.sources]
+        self.apps: dict[str, AppInstance] = {
+            entry.id: self._app(entry, f"apps.{index}")
+            for index, entry in enumerate(config.apps)
+        }
         self._check_llms()
 
     @property
@@ -210,20 +217,15 @@ class Catalog:
         return llms
 
     def _catalog(
-        self,
-        kind: Kind,
-        entries: Sequence[ProcessEntry | RemixEntry | DeliveryEntry],
-        section: str,
-    ) -> list[tuple[Entry, Use]]:
+        self, kind: Kind, entries: Sequence[ProcessEntry], section: str
+    ) -> list[tuple[ProcessEntry, Use]]:
         """A catalog section's entries with their uses."""
-        uses: list[tuple[Entry, Use]] = []
+        uses: list[tuple[ProcessEntry, Use]] = []
         for index, entry in enumerate(entries):
             location = f"{section}.{index}"
             self._check_id(kind, entry, location)
             profile = self._profile(kind, entry.type_name, entry.options, location)
-            uses.append(
-                (entry, Use(profile, self._key(kind, entry, profile), location))
-            )
+            uses.append((entry, Use(profile, process_key(entry, profile), location)))
         return uses
 
     def _check_id(self, kind: Kind, entry: Entry, location: str) -> None:
@@ -233,54 +235,22 @@ class Catalog:
                 f"{location}: the id '{entry.id}' is a {kind.label} type's name"
             )
 
-    @staticmethod
-    def _key(
-        kind: Kind,
-        entry: ProcessEntry | RemixEntry | DeliveryEntry | None,
-        profile: Profile,
-    ) -> str:
-        """The entry's key, or else the default one: the processor's for its
-        options, the remixer's or the sink's name."""
-        if entry is not None and entry.key is not None:
-            return entry.key
-        if kind is PROCESSOR:
-            return profile.cls.output_key(profile.options)
-        return profile.name
-
-    def _resolve_all(
-        self,
-        kind: Kind,
-        workflow: Workflow,
-        section: str,
-        refs: Sequence[str | ProcessEntry | RemixEntry | DeliveryEntry],
-    ) -> list[Use]:
-        """A workflow section's uses."""
-        return [
-            self._resolve(kind, ref, f"workflows.{workflow.name}.{section}.{index}")
-            for index, ref in enumerate(refs)
-        ]
-
-    def _resolve(
-        self,
-        kind: Kind,
-        ref: str | ProcessEntry | RemixEntry | DeliveryEntry,
-        location: str,
-    ) -> Use:
-        """A catalog entry by id, a type with its section's options, or an
-        entry of the workflow's own."""
+    def _resolve(self, ref: str | ProcessEntry, location: str) -> Use:
+        """A processor catalog entry by id, a type with its section's
+        options, or an entry of the workflow's own."""
         if isinstance(ref, str):
-            if (use := self._ids[kind].get(ref)) is not None:
+            if (use := self._processor_ids.get(ref)) is not None:
                 return dataclasses.replace(use, location=location)
-            if ref not in self._classes[kind]:
+            if ref not in self._classes[PROCESSOR]:
                 raise ConfigError(
-                    f"{location}: no {kind.label} has the id or type '{ref}'"
+                    f"{location}: no processor has the id or type '{ref}'"
                 )
-            profile = self._type_profile(kind, ref, location)
-            return Use(profile, self._key(kind, None, profile), location)
-        profile = self._profile(kind, ref.type_name, ref.options, location)
-        return Use(profile, self._key(kind, ref, profile), location)
+            profile = self._type_profile(PROCESSOR, ref, location)
+            return Use(profile, process_key(None, profile), location)
+        profile = self._profile(PROCESSOR, ref.type_name, ref.options, location)
+        return Use(profile, process_key(ref, profile), location)
 
-    # --- Runs --------------------------------------------------------------
+    # --- Process runs ------------------------------------------------------
 
     def _add_process(self, run: Run) -> None:
         """A process run. Its key is the annotation's identity: in a workflow
@@ -299,7 +269,10 @@ class Catalog:
             if (
                 other.key != key
                 or other.profile is run.profile
-                or not share_sources(other.workflow, workflow)
+                or not (
+                    other.workflow.name == workflow.name
+                    or share_sources(other.workflow.sources, workflow.sources)
+                )
             ):
                 continue
             if other.profile.name != run.profile.name:
@@ -316,45 +289,13 @@ class Catalog:
                 )
         self.process[workflow.name, key] = run
 
-    def _add_remix(self, run: Run) -> None:
-        """A remix run. Its key belongs to one workflow: artifacts are not
-        per source, so another run would overwrite them."""
-        if not NAME_PATTERN.fullmatch(run.key):
-            raise ConfigError(f"{run.location}: invalid remix key '{run.key}'")
-        if (other := self.remix.get(run.key)) is not None:
-            raise ConfigError(
-                f"{run.location}: remix key '{run.key}' is used by"
-                f" {other.location} too (workflow '{other.workflow.name}'); a"
-                " remix key belongs to one workflow (give one a `key`, or mark"
-                " the catalog entry with `skip_default: true`)"
-            )
-        self.remix[run.key] = run
-
-    def _add_delivery(self, run: Run) -> None:
-        """A delivery run, under its workflow's ledger key."""
-        if not NAME_PATTERN.fullmatch(run.key):
-            raise ConfigError(f"{run.location}: invalid delivery key '{run.key}'")
-        ledger_key = run.workflow.ledger_key(run.key)
-        if ledger_key in self.deliveries:
-            raise ConfigError(
-                f"{run.location}: delivery key '{run.key}' is used by another"
-                f" entry of workflow '{run.workflow.name}'; give one a `key`"
-            )
-        self.deliveries[ledger_key] = run
-
-    # --- Checks ------------------------------------------------------------
-
     def _check_requirements(self) -> None:
-        """Every annotation a run reads is written by a process run on its
-        workflow's sources, in any workflow."""
-        runs = [*self.process.values(), *self.remix.values(), *self.deliveries.values()]
-        for run in runs:
+        """Every annotation a process run reads is written by a process run
+        on its workflow's sources, in any workflow."""
+        for run in self.process.values():
             required = run.profile.cls.required_key(run.profile.options)
-            if required is None:
-                continue
-            if not any(
-                writer.key == required and share_sources(writer.workflow, run.workflow)
-                for writer in self.process.values()
+            if required is not None and not self._is_written(
+                required, run.workflow.sources, run.workflow.name
             ):
                 raise ConfigError(
                     f"{run.location}: {run.profile.name} reads '{required}', and"
@@ -362,11 +303,90 @@ class Catalog:
                     f" '{run.workflow.name}'"
                 )
 
+    def _is_written(
+        self, key: str, sources: Sequence[str], workflow: str | None = None
+    ) -> bool:
+        """Whether some process run writes `key` on any of `sources`, or in
+        `workflow`."""
+        return any(
+            writer.key == key
+            and (
+                writer.workflow.name == workflow
+                or share_sources(writer.workflow.sources, sources)
+            )
+            for writer in self.process.values()
+        )
+
+    # --- Applet instances --------------------------------------------------
+
+    def _app(self, entry: AppEntry, location: str) -> AppInstance:
+        """An applet instance with its routes, checked against its outputs,
+        the sinks and the sources."""
+        profile = self._profile(APPLET, entry.app, entry.options, location)
+        outputs = profile.cls.outputs
+        if not all(NAME_PATTERN.fullmatch(output) for output in outputs):
+            raise ConfigError(f"{location}: {entry.app} declares an invalid output")
+        if entry.sink is not None:
+            if len(outputs) != 1:
+                raise ConfigError(
+                    f"{location}: `sink` needs an applet with one output;"
+                    f" {entry.app} has {', '.join(outputs)}: use `routes`"
+                )
+            routes = {next(iter(outputs)): (entry.sink,)}
+        else:
+            routes = {output: tuple(sinks) for output, sinks in entry.routes.items()}
+        for output, sinks in routes.items():
+            if output not in outputs:
+                raise ConfigError(
+                    f"{location}: {entry.app} has no output '{output}'"
+                    f" (it has {', '.join(outputs)})"
+                )
+            for sink in sinks:
+                if (sink_profile := self.sinks.get(sink)) is None:
+                    raise ConfigError(f"{location}: no sink has the id '{sink}'")
+                if not accepts(sink_profile.cls, outputs[output]):
+                    raise ConfigError(
+                        f"{location}: sink '{sink}' ({sink_profile.name}) does not"
+                        f" accept the content of output '{output}'"
+                        f" ({', '.join(sorted(outputs[output]))})"
+                    )
+        self._check_app_requirements(profile, location)
+        schedule = Schedule(
+            every=entry.every,
+            at=entry.at,
+            days=frozenset(WEEKDAYS.index(day) for day in entry.days),
+        )
+        return AppInstance(entry.id, profile, schedule, routes, location)
+
+    def _check_app_requirements(self, profile: Profile, location: str) -> None:
+        """The sources an instance reads exist, and every annotation key it
+        reads is written by a process run on one of them."""
+        requirements = profile.cls.requirements(profile.options)
+        sources = requirements.sources
+        if sources is not None:
+            if unknown := [s for s in sources if s not in self._source_ids]:
+                raise ConfigError(f"{location}: unknown source(s) {', '.join(unknown)}")
+        else:
+            sources = tuple(self._source_ids)
+        for key in requirements.keys:
+            if not self._is_written(key, sources):
+                raise ConfigError(
+                    f"{location}: {profile.name} reads '{key}', and no process"
+                    " run writes it on its sources"
+                )
+
     def _check_llms(self) -> None:
         """Every LLM a profile names exists."""
         for profile in list(self._profiles):
             if isinstance(profile.options, UsesLLMOptions):
                 self.llm_profile(profile.options.llm, profile.location)
+
+
+def process_key(entry: ProcessEntry | None, profile: Profile) -> str:
+    """The entry's key, or else the processor's own for its options."""
+    if entry is not None and entry.key is not None:
+        return entry.key
+    return profile.cls.output_key(profile.options)
 
 
 def check_section(
@@ -392,20 +412,16 @@ def check_section(
         raise ConfigError("invalid options:\n" + "\n".join(errors))
 
 
-def ids_of(uses: list[tuple[Entry, Use]]) -> dict[str, Use]:
+def ids_of(uses: list[tuple[ProcessEntry, Use]]) -> dict[str, Use]:
     """The uses of the catalog entries with an id, by id."""
     return {entry.id: use for entry, use in uses if entry.id is not None}
 
 
-def in_default(uses: list[tuple[Entry, Use]]) -> list[Use]:
+def in_default(uses: list[tuple[ProcessEntry, Use]]) -> list[Use]:
     """The uses of the catalog entries the `default` workflow runs."""
-    return [
-        use
-        for entry, use in uses
-        if isinstance(entry, ProcessEntry | RemixEntry) and not entry.skip_default
-    ]
+    return [use for entry, use in uses if not entry.skip_default]
 
 
-def share_sources(a: Workflow, b: Workflow) -> bool:
-    """Whether runs of the two workflows can meet on an item."""
-    return a.name == b.name or bool(set(a.sources) & set(b.sources))
+def share_sources(a: Sequence[str], b: Sequence[str]) -> bool:
+    """Whether two sets of sources meet on an item."""
+    return bool(set(a) & set(b))

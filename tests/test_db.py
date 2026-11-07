@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from newstool.db import (
     Database,
     DBDelivery,
+    DBDocument,
     DBProcessingState,
     DBSource,
     DBSourceItem,
@@ -26,8 +27,11 @@ from newstool.db import (
     ProcessingStatus,
 )
 from newstool.models import (
-    Artifact,
+    AppletResult,
     Delivery,
+    Document,
+    DocumentFilter,
+    EmittedDocument,
     ProcessingScope,
     SourceData,
     SourceItem,
@@ -197,6 +201,23 @@ class UpsertSourceItemsTests(DatabaseTestCase):
         )
 
         self.assertEqual(self.get_item("a1").published_at, first_published_at)
+
+    def test_imported_at_is_the_first_import_whatever_the_publication(self):
+        source = make_source()
+        before = datetime.now(UTC)
+        old = datetime(2020, 1, 1, tzinfo=UTC)
+        self.db.upsert_source_items(
+            [make_item(source, uid="a1", content=b"v1", published_at=old)]
+        )
+        first_imported_at = self.get_item("a1").imported_at
+
+        self.db.upsert_source_items([make_item(source, uid="a1", content=b"v2")])
+
+        self.assertGreaterEqual(first_imported_at, before)
+        self.assertEqual(self.get_item("a1").imported_at, first_imported_at)
+        (item,) = self.db.get_items(ProcessingScope(imported_since=before))
+        self.assertEqual(item.published_at, old)
+        self.assertEqual(self.db.get_items(ProcessingScope(imported_until=before)), [])
 
     def test_data_dict_change_alone_counts_as_a_change(self):
         source = make_source()
@@ -581,221 +602,139 @@ class AnnotationTests(DatabaseTestCase):
         self.assertEqual(self.count(DBProcessingState), 1)
 
 
-class ArtifactTests(DatabaseTestCase):
-    def test_save_replaces_and_get_returns_the_artifact(self):
-        self.db.save_artifact(
-            Artifact("feedgenerator", "feed", "<rss/>", "application/rss+xml")
+class DocumentTests(DatabaseTestCase):
+    NOW = datetime(2026, 11, 6, tzinfo=UTC)
+
+    def emit(
+        self, app: str, *keys: str, output: str = "out", routes: tuple[str, ...] = ()
+    ) -> list[Document]:
+        result = AppletResult(
+            documents=tuple(
+                EmittedDocument(output, key, f"{app} {key}", "text/plain", title=key)
+                for key in keys
+            )
         )
-        first = self.db.get_artifact("feedgenerator", "feed")
-        self.db.save_artifact(
-            Artifact("feedgenerator", "feed", "<rss>2</rss>", "application/rss+xml")
+        return self.db.commit_app_run(app, self.NOW, result, {output: routes})
+
+    def test_find_documents_filters_and_loads_content_on_request(self):
+        self.emit("a", "k1", "k2")
+        self.emit("b", "k1", output="other")
+
+        def keys(**filters) -> list[str]:
+            return [
+                f"{d.app}/{d.key}"
+                for d in self.db.find_documents(DocumentFilter(**filters))
+            ]
+
+        self.assertEqual(keys(), ["a/k1", "a/k2", "b/k1"])
+        self.assertEqual(keys(app="a", key="k2"), ["a/k2"])
+        self.assertEqual(keys(output="other"), ["b/k1"])
+        self.assertEqual(keys(limit=1), ["a/k1"])
+        (without,) = self.db.find_documents(DocumentFilter(app="b"))
+        (with_content,) = self.db.find_documents(
+            DocumentFilter(app="b"), with_content=True
         )
+        self.assertIsNone(without.content)
+        self.assertEqual((with_content.content, with_content.title), ("b k1", "k1"))
 
-        artifact = self.db.get_artifact("feedgenerator", "feed")
-
-        self.assertEqual(artifact.content, "<rss>2</rss>")
-        self.assertEqual(artifact.created_at, first.created_at)
-        self.assertEqual(artifact.id, first.id)
-        self.assertGreaterEqual(artifact.updated_at, first.updated_at)
-        self.assertEqual(self.stored_contents(), {artifact.content_sha256})
-
-    def test_missing_artifact_is_none(self):
-        self.assertIsNone(self.db.get_artifact("feedgenerator", "missing"))
-
-    def test_list_artifacts_returns_metadata_without_content(self):
-        for remixer, name in (
-            ("feedgenerator", "feed"),
-            ("grouping_avglink", "current"),
-        ):
-            self.db.save_artifact(Artifact(remixer, name, f"{name}!", "text/plain"))
-
-        listed = self.db.list_artifacts()
-        only_rss = self.db.list_artifacts("feedgenerator")
+    def test_existing_document_keys(self):
+        self.emit("a", "k1")
 
         self.assertEqual(
-            [(a.remixer, a.name) for a in listed],
-            [("feedgenerator", "feed"), ("grouping_avglink", "current")],
+            self.db.existing_document_keys("a", [("out", "k1"), ("out", "k2")]),
+            {("out", "k1")},
         )
-        self.assertTrue(all(a.content is None for a in listed))
-        self.assertEqual([a.name for a in only_rss], ["feed"])
 
-    def test_list_artifacts_by_names_and_limit(self):
-        for remixer, name in (("feedgenerator", "feed"), ("digest", "a/2026-10-01")):
-            self.db.save_artifact(Artifact(remixer, name, f"{name}!", "text/plain"))
+    def test_deleting_documents_cascades_and_releases_their_contents(self):
+        first, _ = self.emit("a", "k1", "k2", routes=("chat",))
 
-        named = self.db.list_artifacts(names=[("digest", "a/2026-10-01")])
-        limited = self.db.list_artifacts(limit=1)
+        self.assertEqual(self.db.delete_documents([first.id]), 1)
+        self.assertEqual(self.db.delete_documents([]), 0)
 
-        self.assertEqual(
-            [(a.remixer, a.name) for a in named], [("digest", "a/2026-10-01")]
-        )
-        self.assertEqual([a.remixer for a in limited], ["digest"])
+        self.assertEqual([d.key for d in self.db.find_documents()], ["k2"])
+        self.assertEqual(self.count(DBDelivery), 1)
+        self.assertEqual(len(self.stored_contents()), 1)
+
+    def test_one_document_per_app_output_and_key(self):
+        (document,) = self.emit("a", "k1")
+
+        with self.assertRaises(IntegrityError), self.db.session_scope() as sess:
+            sess.add(DBDocument.from_dto(document))
 
 
 class DeliveryTests(DatabaseTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self.source = make_source()
-        self.items = [
-            make_item(
-                self.source,
-                uid=f"d{day}",
-                content=f"c{day}".encode(),
-                published_at=datetime(2026, 10, day, tzinfo=UTC),
+    NOW = datetime(2026, 11, 6, tzinfo=UTC)
+
+    def emit(self, app: str, *keys: str, routes: tuple[str, ...]) -> None:
+        result = AppletResult(
+            documents=tuple(
+                EmittedDocument("out", key, key, "text/plain") for key in keys
             )
-            for day in (3, 1, 2)
-        ]
-        self.db.upsert_source_items(self.items)
-
-    def summarize(self, item: SourceItem) -> None:
-        self.db.record_result(
-            item, "summarize", "summary", ProcessingStatus.DONE, value="S"
         )
+        self.db.commit_app_run(app, self.NOW, result, {"out": routes})
 
-    def test_queue_items_once_in_fifo_order_and_only_finished_upstream(self):
-        self.summarize(self.items[0])
-        self.summarize(self.items[2])
+    def test_deliveries_of_a_sink_in_document_order(self):
+        self.emit("a", "k1", "k2", routes=("chat", "file"))
 
-        queued = self.db.queue_item_deliveries(
-            "telegram", ProcessingScope(), requires="summary"
-        )
-        again = self.db.queue_item_deliveries(
-            "telegram", ProcessingScope(), requires="summary"
-        )
+        rows = self.db.deliveries_of("chat")
 
-        self.assertEqual((queued, again), (2, 0))
-        rows = self.db.get_item_deliveries("telegram")
-        self.assertEqual([item.uid for _, item in rows], ["d2", "d3"])
+        self.assertEqual([document.key for _, document in rows], ["k1", "k2"])
         self.assertTrue(all(row.status == DeliveryStatus.QUEUED for row, _ in rows))
+        self.assertEqual(rows[0][0].document_label, "a/out/k1")
 
-    def test_scope_and_statuses_filter_rows(self):
-        self.db.queue_item_deliveries("telegram", ProcessingScope())
-        (first, _), *_ = self.db.get_item_deliveries("telegram")
+    def test_last_delivered_at_counts_done_rows_of_the_sink_only(self):
+        self.emit("a", "k1", "k2", routes=("chat", "file"))
+        self.assertIsNone(self.db.last_delivered_at("chat"))
+        (first, _), (second, _) = self.db.deliveries_of("chat")
         first.status = DeliveryStatus.DONE
         self.db.save_delivery(first)
+        second.status = DeliveryStatus.ERROR
+        self.db.save_delivery(second)
 
-        done = self.db.get_item_deliveries("telegram", statuses=[DeliveryStatus.DONE])
-        in_scope = self.db.get_item_deliveries(
-            "telegram", ProcessingScope(item_ids=(self.items[0].id,))
-        )
+        self.assertEqual(self.db.last_delivered_at("chat"), first.updated_at)
+        self.assertIsNone(self.db.last_delivered_at("file"))
 
-        self.assertEqual([item.uid for _, item in done], ["d1"])
-        self.assertEqual([item.uid for _, item in in_scope], ["d3"])
-        self.assertEqual(self.db.get_item_deliveries("other"), [])
+    def test_find_deliveries_filters_by_document_sink_and_status(self):
+        self.emit("a", "k1", "k2", routes=("chat",))
+        self.emit("b", "k1", routes=("chat", "file"))
 
-    def test_last_delivered_at_counts_done_rows_of_the_key_only(self):
-        self.assertIsNone(self.db.last_delivered_at("telegram"))
-        self.db.queue_item_deliveries("telegram", ProcessingScope())
-        self.db.queue_item_deliveries("other", ProcessingScope())
-        rows = self.db.get_item_deliveries("telegram")
-        rows[0][0].status = DeliveryStatus.DONE
-        self.db.save_delivery(rows[0][0])
-        rows[1][0].status = DeliveryStatus.ERROR
-        self.db.save_delivery(rows[1][0])
-
-        last = self.db.last_delivered_at("telegram")
-
-        self.assertEqual(last, rows[0][0].updated_at)
-        self.assertIsNotNone(last.tzinfo)
-        self.assertIsNone(self.db.last_delivered_at("other"))
-
-    def test_scope_sources_keep_the_items_of_those_sources(self):
-        self.assertEqual(self.db.get_items(ProcessingScope(sources=())), [])
-        self.assertEqual(
-            len(self.db.get_items(ProcessingScope(sources=("example",)))),
-            len(self.db.get_items()),
-        )
-
-    def test_queue_artifacts_of_the_listed_remixers(self):
-        for remixer, name in (
-            ("digest", "a/1"),
-            ("digest", "a/2"),
-            ("feedgenerator", "feed"),
-        ):
-            self.db.save_artifact(Artifact(remixer, name, name, "text/markdown"))
-
-        named = self.db.queue_artifact_deliveries(
-            "telegram_artifacts", ["digest"], names=[("digest", "a/2")]
-        )
-        rest = self.db.queue_artifact_deliveries(
-            "telegram_artifacts", ["digest"], since=datetime(2026, 1, 1, tzinfo=UTC)
-        )
-
-        self.assertEqual((named, rest), (1, 1))
-        rows = self.db.get_artifact_deliveries("telegram_artifacts")
-        self.assertEqual([artifact.name for _, artifact in rows], ["a/1", "a/2"])
-        self.assertEqual(rows[0][0].artifact_name, "digest/a/1")
-
-    def test_find_deliveries_filters_by_subject_sink_and_status(self):
-        self.db.queue_item_deliveries("w/telegram", ProcessingScope())
-        self.db.save_artifact(Artifact("digest", "a/1", "x", "text/markdown"))
-        self.db.queue_artifact_deliveries("w/telegram_artifacts", ["digest"])
-
-        def found(scope=None, **filters) -> list[tuple[str, int | None, str | None]]:
+        def found(documents=None, **filters) -> list[tuple[str, str]]:
             return [
-                (row.sink, row.item_id, row.artifact_name)
-                for row in self.db.find_deliveries(scope, **filters)
+                (row.sink, row.document_label)
+                for row in self.db.find_deliveries(documents, **filters)
             ]
 
         self.assertEqual(len(found()), 4)
         self.assertEqual(
-            found(ProcessingScope(item_ids=(self.items[1].id,))),
-            [("w/telegram", self.items[1].id, None)],
+            found(DocumentFilter(app="b"), sink="file"), [("file", "b/out/k1")]
         )
-        self.assertEqual(
-            found(artifact_names=[("digest", "a/1")]),
-            [("w/telegram_artifacts", None, "digest/a/1")],
-        )
-        self.assertEqual(
-            len(found(workflow="w", key="telegram", status=DeliveryStatus.QUEUED)), 3
-        )
+        self.assertEqual(len(found(status=DeliveryStatus.QUEUED, sink="chat")), 3)
+        self.assertEqual(found(limit=1), [("chat", "a/out/k1")])
         self.assertEqual(found(status=DeliveryStatus.DONE), [])
 
-    def test_find_deliveries_matches_whole_ledger_key_halves(self):
-        for ledger_key in ("w/telegram", "w2/telegram", "w/telegram2", "w_x/b"):
-            self.db.queue_item_deliveries(
-                ledger_key, ProcessingScope(item_ids=(self.items[0].id,))
-            )
-
-        def sinks(**filters) -> list[str]:
-            return sorted(row.sink for row in self.db.find_deliveries(**filters))
-
-        self.assertEqual(sinks(workflow="w"), ["w/telegram", "w/telegram2"])
-        self.assertEqual(sinks(key="telegram"), ["w/telegram", "w2/telegram"])
-        self.assertEqual(sinks(workflow="w", key="telegram"), ["w/telegram"])
-        # `_` is literal, not a LIKE wildcard.
-        self.assertEqual(sinks(workflow="wax"), [])
-        self.assertEqual(sinks(workflow="w_x"), ["w_x/b"])
-
     def test_added_deliveries_are_stamped_now(self):
+        self.emit("a", "k1", routes=())
+        (document,) = self.db.find_documents()
+
         added = self.db.add_deliveries(
-            [Delivery("w/telegram", DeliveryStatus.DONE, item_id=self.items[0].id)]
+            [Delivery("chat", document.id, DeliveryStatus.DONE)]
         )
 
         (row,) = self.db.find_deliveries()
         self.assertEqual(added, 1)
-        self.assertEqual((row.sink, row.status), ("w/telegram", DeliveryStatus.DONE))
+        self.assertEqual((row.sink, row.status), ("chat", DeliveryStatus.DONE))
         self.assertIsNotNone(row.created_at)
         self.assertEqual(row.created_at, row.updated_at)
 
-    def test_a_row_has_exactly_one_subject(self):
-        with self.assertRaises(IntegrityError), self.db.session_scope() as sess:
-            sess.add(
-                DBDelivery(
-                    sink="telegram",
-                    status="queued",
-                    created_at=datetime.now(UTC),
-                    updated_at=datetime.now(UTC),
-                )
-            )
+    def test_deleting_deliveries_keeps_their_documents(self):
+        self.emit("a", "k1", routes=("chat", "file"))
+        (row,) = self.db.find_deliveries(sink="chat")
 
-    def test_rows_go_with_their_item(self):
-        self.db.queue_item_deliveries("telegram", ProcessingScope())
+        self.assertEqual(self.db.delete_deliveries([row.id]), 1)
+        self.assertEqual(self.db.delete_deliveries([]), 0)
 
-        with self.db.session_scope() as sess:
-            sess.query(DBSourceItem).filter_by(uid="d1").delete()
-
-        self.assertEqual(self.count(DBDelivery), 2)
+        self.assertEqual([d.sink for d in self.db.find_deliveries()], ["file"])
+        self.assertEqual(len(self.db.find_documents()), 1)
 
 
 class DeleteTests(DatabaseTestCase):
@@ -814,41 +753,13 @@ class DeleteTests(DatabaseTestCase):
                 ProcessingStatus.DONE,
                 value=f"S {item.uid}",
             )
-        self.db.queue_item_deliveries("telegram", ProcessingScope())
 
         self.assertEqual(self.db.delete_items([gone.id]), 1)
         self.assertEqual(self.db.delete_items([]), 0)
 
         self.assertEqual([item.uid for item in self.db.get_items()], ["a1"])
         self.assertEqual(self.count(DBProcessingState), 1)
-        self.assertEqual(self.count(DBDelivery), 1)
         self.assertEqual(len(self.stored_contents()), 2)  # a1 content + summary
-
-    def test_deleting_artifacts_cascades_and_releases_their_contents(self):
-        for name in ("a/1", "a/2"):
-            self.db.save_artifact(Artifact("digest", name, name, "text/markdown"))
-        self.db.queue_artifact_deliveries("telegram_artifacts", ["digest"])
-
-        self.assertEqual(self.db.delete_artifacts([("digest", "a/1")]), 1)
-
-        self.assertEqual([a.name for a in self.db.list_artifacts()], ["a/2"])
-        self.assertEqual(self.count(DBDelivery), 1)
-        self.assertEqual(len(self.stored_contents()), 1)
-
-    def test_deleting_deliveries_keeps_their_subjects(self):
-        self.db.upsert_source_items([make_item(make_source(), uid="a1")])
-        self.db.queue_item_deliveries("w/telegram", ProcessingScope())
-        self.db.queue_item_deliveries("w/other", ProcessingScope())
-        (row,) = self.db.find_deliveries(key="telegram")
-
-        self.assertEqual(self.db.delete_deliveries([row.id]), 1)
-        self.assertEqual(self.db.delete_deliveries([]), 0)
-
-        self.assertEqual([d.sink for d in self.db.find_deliveries()], ["w/other"])
-        self.assertEqual(len(self.db.get_items()), 1)
-        self.assertEqual(
-            self.db.queue_item_deliveries("w/telegram", ProcessingScope()), 1
-        )
 
 
 if __name__ == "__main__":

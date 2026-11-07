@@ -1,43 +1,58 @@
-"""Builds an RSS feed from the newest items in scope, newest first, capped at
-`max_items` unless the scope sets its own limit.
-
-Produces one artifact named "feed".
+"""The `feed` applet (decision 0015) builds an RSS feed of the newest items
+of its sources, newest first, capped at `max_items`. Every run emits it
+anew on its `feed` output, keyed by the run's time; a `file` sink
+publishes it.
 """
 
-import dataclasses
-from collections.abc import Iterator
 from datetime import UTC, datetime
+from typing import ClassVar
 from xml.sax.saxutils import escape
 
-from ..models import ProcessingScope, SourceItem
-from ..remixers import BaseRemixer, RemixerType
-from . import PluginOptions, PluginTypes
+from ..applets import (
+    AppletReader,
+    AppletType,
+    BaseApplet,
+    Outputs,
+    SourcesOptions,
+    run_key,
+)
+from ..models import AppletResult, AppletRun, EmittedDocument, SourceItem
+from . import PluginTypes
 
 RFC822 = "%a, %d %b %Y %H:%M:%S %z"
+OUTPUT = "feed"
+CONTENT_TYPE = "application/rss+xml"
 
 
-class Options(PluginOptions):
+class Options(SourcesOptions):
     title: str = "newstool feed"
     link: str | None = None
     description: str | None = None  # the title when unset
     max_items: int = 100
 
 
-class FeedGeneratorRemixer(BaseRemixer):
-    name = "feedgenerator"
+class FeedApplet(BaseApplet):
+    name = "feed"
+    outputs: ClassVar[Outputs] = {OUTPUT: frozenset({CONTENT_TYPE})}
     options_model = Options
     options: Options
 
-    def produce(self, scope: ProcessingScope) -> Iterator[tuple[str, str, str]]:
-        if scope.limit is None:
-            scope = dataclasses.replace(scope, limit=self.options.max_items)
-        yield (
-            "feed",
-            self._build_feed(self.db.get_items(scope, newest_first=True)),
-            "application/rss+xml",
+    def run(self, now: datetime, run: AppletRun, reader: AppletReader) -> AppletResult:
+        items = reader.items(
+            sources=self.options.sources,
+            limit=self.options.max_items,
+            newest_first=True,
         )
+        document = EmittedDocument(
+            output=OUTPUT,
+            key=run_key(now),
+            content=self._build_feed(items, now),
+            content_type=CONTENT_TYPE,
+            title=self.options.title,
+        )
+        return AppletResult(documents=(document,))
 
-    def _build_feed(self, items: list[SourceItem]) -> str:
+    def _build_feed(self, items: list[SourceItem], now: datetime) -> str:
         options = self.options
         entries = "\n".join(self._build_entry(item) for item in items)
         description = options.description or options.title
@@ -47,7 +62,7 @@ class FeedGeneratorRemixer(BaseRemixer):
             f"<title>{escape(options.title)}</title>\n"
             + (f"<link>{escape(options.link)}</link>\n" if options.link else "")
             + f"<description>{escape(description)}</description>\n"
-            + f"<lastBuildDate>{datetime.now(UTC).strftime(RFC822)}</lastBuildDate>\n"
+            + f"<lastBuildDate>{now.astimezone(UTC).strftime(RFC822)}</lastBuildDate>\n"
             + f"{entries}\n"
             + "</channel></rss>\n"
         )
@@ -68,4 +83,4 @@ class FeedGeneratorRemixer(BaseRemixer):
 
 
 def __newstool_plugin__() -> PluginTypes:
-    return [(FeedGeneratorRemixer.name, RemixerType, FeedGeneratorRemixer)]
+    return [(FeedApplet.name, AppletType, FeedApplet)]

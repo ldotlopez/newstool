@@ -1,16 +1,12 @@
-import shutil
-import tempfile
 import unittest
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
 import pydantic
 import requests
 
-from newstool.db import Database, DeliveryStatus, ProcessingStatus
-from newstool.models import SourceData, SourceItem
+from newstool.errors import PluginFailure
+from newstool.models import Document
 from newstool.plugins import Services, googlechat, merge_options
 from newstool.plugins.googlechat import (
     WEBHOOK_KEY,
@@ -20,7 +16,6 @@ from newstool.plugins.googlechat import (
 )
 from newstool.sinks import SinkType
 
-SOURCE = SourceData(id="a", name="A", url="https://a.test/", provider="plaza")
 BLOGGER_IMAGE = (
     "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvX/s72-c/A%20b.png"
 )
@@ -92,48 +87,36 @@ class OptionsTests(unittest.TestCase):
 
 @patch("newstool.plugins.googlechat.requests.post")
 class GoogleChatSinkTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp_dir = Path(tempfile.mkdtemp(prefix="newstool-test-"))
-        self.db = Database(
-            f"sqlite:///{self.tmp_dir}/data.db", self.tmp_dir / "content"
-        )
-        self.add_summarized("h1")
-        self.section = {"channel": "AAAA", "token": "secret"}
-
-    def add_summarized(self, uid: str, key: str = "summary", **data: Any) -> None:
-        item = SourceItem(
-            source=SOURCE,
-            uid=uid,
-            title="A <b> & c",
-            uri="https://a.test/1?a=1&b=2",
-            content=b"<p>1</p>",
-            mimetype="text/html",
-            data=data,
-            published_at=datetime.now(UTC),
-        )
-        self.db.upsert_source_items([item])
-        self.db.record_result(
-            item, "summarize", key, ProcessingStatus.DONE, value=f"S {key}"
-        )
-
-    def deliver(self, **options: Any) -> None:
+    def send(self, document: Document, **options: Any) -> Any:
         sink = GoogleChatSink(
-            webhook_options(self.section, options), Services(db=self.db, fetcher=Mock())
+            webhook_options({"channel": "AAAA", "token": "secret"}, options),
+            Services(db=Mock(), fetcher=Mock()),
         )
-        sink.deliver(key="googlechat")
+        return sink.send(document)
 
-    def tearDown(self) -> None:
-        self.db.close()
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+    @staticmethod
+    def document(image_url: str | None = None) -> Document:
+        return Document(
+            app="items",
+            output="items",
+            key="item:a/h1",
+            content_type="text/plain",
+            content="S summary",
+            title="A <b> & c",
+            url="https://a.test/1?a=1&b=2",
+            image_url=image_url,
+        )
 
-    def test_posts_the_summarized_item_once(self, post: Mock) -> None:
+    @staticmethod
+    def ok(post: Mock) -> None:
         post.return_value = Mock(ok=True)
         post.return_value.json.return_value = {"name": "spaces/AAAA/messages/m1"}
 
-        self.deliver()
-        self.deliver()
+    def test_posts_title_text_and_link_as_a_card(self, post: Mock) -> None:
+        self.ok(post)
 
-        post.assert_called_once()
+        reference = self.send(self.document())
+
         self.assertEqual(
             card_widgets(post.call_args.kwargs["json"]),
             [
@@ -156,80 +139,58 @@ class GoogleChatSinkTests(unittest.TestCase):
                 },
             ],
         )
-        ((row, _),) = self.db.get_item_deliveries("googlechat")
-        self.assertEqual(row.status, DeliveryStatus.DONE)
-        self.assertEqual(row.external_ref, {"message": "spaces/AAAA/messages/m1"})
+        self.assertEqual(reference, {"message": "spaces/AAAA/messages/m1"})
 
-    def test_summary_option_picks_the_annotation(self, post: Mock) -> None:
-        post.return_value = Mock(ok=True)
-        post.return_value.json.return_value = {"name": "spaces/AAAA/messages/m1"}
-        self.add_summarized("h2", key="summary/ca")
+    def test_without_title_or_link_only_the_text(self, post: Mock) -> None:
+        self.ok(post)
 
-        self.deliver(summary="summary/ca")
+        self.send(Document("d", "digest", "k", "text/markdown", "# Week"))
 
-        post.assert_called_once()
-        (paragraph, _) = card_widgets(post.call_args.kwargs["json"])
-        self.assertTrue(paragraph["textParagraph"]["text"].endswith("S summary/ca"))
+        self.assertEqual(
+            card_widgets(post.call_args.kwargs["json"]),
+            [{"textParagraph": {"text": "# Week"}}],
+        )
 
     def test_image_and_link_text(self, post: Mock) -> None:
-        post.return_value = Mock(ok=True)
-        post.return_value.json.return_value = {"name": "spaces/AAAA/messages/m1"}
-        self.add_summarized("h2", image="https://a.test/image.jpg")
-        self.add_summarized("h3", image=BLOGGER_IMAGE)
+        self.ok(post)
 
-        self.deliver(item_url_text="Leer <más>")
+        self.send(self.document("https://a.test/image.jpg"), link_text="Leer <más>")
+        self.send(self.document(BLOGGER_IMAGE))
 
         messages = [card_widgets(call.kwargs["json"]) for call in post.call_args_list]
-        self.assertEqual([len(widgets) for widgets in messages], [2, 3, 3])
         self.assertEqual(
-            messages[1][1]["image"],
+            messages[0][1]["image"],
             {"imageUrl": "https://a.test/image.jpg", "altText": "A <b> & c"},
         )
         self.assertEqual(
-            messages[2][1]["image"]["imageUrl"], chat_image_url(BLOGGER_IMAGE)
+            messages[1][1]["image"]["imageUrl"], chat_image_url(BLOGGER_IMAGE)
         )
-        (button,) = messages[1][2]["buttonList"]["buttons"]
+        (button,) = messages[0][2]["buttonList"]["buttons"]
         self.assertEqual(button["text"], "Leer <más>")
 
-    def test_item_image_off_sends_text_only(self, post: Mock) -> None:
-        post.return_value = Mock(ok=True)
-        post.return_value.json.return_value = {"name": "spaces/AAAA/messages/m1"}
-        self.add_summarized("h2", image="https://a.test/image.jpg")
+    def test_images_off_sends_text_only(self, post: Mock) -> None:
+        self.ok(post)
 
-        self.deliver(item_image=False)
+        self.send(self.document("https://a.test/image.jpg"), images=False)
 
-        self.assertFalse(
-            any(
-                "image" in widget
-                for call in post.call_args_list
-                for widget in card_widgets(call.kwargs["json"])
-            )
-        )
+        widgets = card_widgets(post.call_args.kwargs["json"])
+        self.assertFalse(any("image" in widget for widget in widgets))
 
-    def test_failed_post_stays_failed_without_leaking_the_token(
-        self, post: Mock
-    ) -> None:
+    def test_failed_post_does_not_leak_the_token(self, post: Mock) -> None:
         post.side_effect = requests.ConnectionError("url: ...&token=secret")
 
-        with self.assertLogs("newstool.sinks", "ERROR") as logs:
-            self.deliver()
+        with self.assertRaises(PluginFailure) as raised:
+            self.send(self.document())
 
-        ((row, _),) = self.db.get_item_deliveries("googlechat")
-        self.assertEqual(
-            (row.status, row.last_error),
-            (DeliveryStatus.ERROR, "ConnectionError"),
-        )
-        self.assertNotIn("secret", "\n".join(logs.output))
+        self.assertEqual(str(raised.exception), "ConnectionError")
+        self.assertIsNone(raised.exception.__cause__)
 
-    def test_api_error_is_recorded(self, post: Mock) -> None:
+    def test_api_error_is_a_failure(self, post: Mock) -> None:
         post.return_value = Mock(ok=False)
         post.return_value.json.return_value = {"error": {"message": "bad space"}}
 
-        with self.assertLogs("newstool.sinks", "ERROR"):
-            self.deliver()
-
-        ((row, _),) = self.db.get_item_deliveries("googlechat")
-        self.assertEqual(row.last_error, "bad space")
+        with self.assertRaisesRegex(PluginFailure, "bad space"):
+            self.send(self.document())
 
 
 if __name__ == "__main__":

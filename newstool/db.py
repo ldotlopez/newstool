@@ -1,6 +1,6 @@
 """Persistence: SQLite metadata plus a content-addressed DiskStorage.
 
-Item, annotation and artifact contents live in one `DiskStorage`, keyed by
+Item, annotation and document contents live in one `DiskStorage`, keyed by
 the sha256 of their bytes; rows only hold that key. SQLAlchemy models never
 leave this module: `Database` takes and returns DTOs.
 """
@@ -13,7 +13,7 @@ import enum
 import hashlib
 import logging
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self
@@ -47,8 +47,11 @@ from sqlalchemy.types import TypeDecorator
 
 from .models import (
     Annotation,
-    Artifact,
+    AppletResult,
+    AppletRun,
     Delivery,
+    Document,
+    DocumentFilter,
     ItemKey,
     ProcessingScope,
     SourceData,
@@ -165,12 +168,15 @@ class DBSourceItem(Base):
     # Database._upsert_source_items).
     published_at: Mapped[datetime] = mapped_column(UTCDateTime)
     modified_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    # The first import; never moved (decision 0015).
+    imported_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
     source: Mapped[DBSource] = relationship(back_populates="items")
 
     __table_args__ = (
         UniqueConstraint("source_id", "uid"),
         Index("ix_source_items_source_id_published_at", "source_id", "published_at"),
+        Index("ix_source_items_source_id_imported_at", "source_id", "imported_at"),
         CheckConstraint(
             "length(content_sha256) = 64", name="ck_source_items_content_sha256"
         ),
@@ -189,6 +195,7 @@ class DBSourceItem(Base):
             data=dto.data,
             published_at=dto.published_at,
             modified_at=dto.modified_at,
+            imported_at=dto.imported_at,
         )
 
     def to_dto(self) -> SourceItem:
@@ -202,6 +209,7 @@ class DBSourceItem(Base):
             data=self.data,
             published_at=self.published_at,
             modified_at=self.modified_at,
+            imported_at=self.imported_at,
             id=self.id,
         )
 
@@ -291,48 +299,110 @@ class DBItemAnnotation(Base):
     )
 
 
-class DBArtifact(Base):
-    __tablename__ = "artifacts"
+class DBApp(Base):
+    """An applet instance's run record (decision 0015). No row: it never
+    ran. `state` is the applet's own, opaque to the core."""
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    remixer: Mapped[str] = mapped_column(String(255))
-    name: Mapped[str] = mapped_column(String(255))
-    content_type: Mapped[str] = mapped_column(String(255))
-    content_sha256: Mapped[str] = _sha256_column()
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    __tablename__ = "apps"
 
-    __table_args__ = (UniqueConstraint("remixer", "name"), AUTOINCREMENT)
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    last_started: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    last_success: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[Any] = mapped_column(CustomJSON, nullable=True)
 
     @classmethod
-    def from_dto(cls, dto: Artifact) -> Self:
+    def from_dto(cls, dto: AppletRun) -> Self:
         return cls(
-            remixer=dto.remixer,
-            name=dto.name,
-            content_type=dto.content_type,
-            content_sha256=dto.content_sha256,
-            created_at=dto.created_at,
-            updated_at=dto.updated_at,
+            id=dto.app,
+            last_started=dto.last_started,
+            last_success=dto.last_success,
+            last_error=dto.last_error,
+            state=dto.state,
         )
 
-    def to_dto(self) -> Artifact:
-        return Artifact(
-            remixer=self.remixer,
-            name=self.name,
-            content=None,
+    def to_dto(self) -> AppletRun:
+        return AppletRun(
+            app=self.id,
+            last_started=self.last_started,
+            last_success=self.last_success,
+            last_error=self.last_error,
+            state=self.state,
+        )
+
+    def update(self, dto: AppletRun) -> None:
+        self.last_started = dto.last_started
+        self.last_success = dto.last_success
+        self.last_error = dto.last_error
+        self.state = dto.state
+
+
+class DBDocument(Base):
+    """A document an applet instance emitted; never rewritten (decision
+    0015). Its content lives in storage."""
+
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    app: Mapped[str] = mapped_column(String(255))
+    output: Mapped[str] = mapped_column(String(255))
+    key: Mapped[str] = mapped_column(String(512))
+    content_type: Mapped[str] = mapped_column(String(255))
+    content_sha256: Mapped[str] = _sha256_column()
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    emitted_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+    __table_args__ = (
+        UniqueConstraint("app", "output", "key"),
+        Index("ix_documents_app_emitted_at", "app", "emitted_at"),
+        CheckConstraint(
+            "length(content_sha256) = 64", name="ck_documents_content_sha256"
+        ),
+        AUTOINCREMENT,
+    )
+
+    @classmethod
+    def from_dto(cls, dto: Document) -> Self:
+        return cls(
+            app=dto.app,
+            output=dto.output,
+            key=dto.key,
+            content_type=dto.content_type,
+            content_sha256=dto.content_sha256,
+            title=dto.title,
+            url=dto.url,
+            image_url=dto.image_url,
+            emitted_at=dto.emitted_at,
+        )
+
+    def to_dto(self) -> Document:
+        return Document(
+            app=self.app,
+            output=self.output,
+            key=self.key,
             content_type=self.content_type,
             content_sha256=self.content_sha256,
-            created_at=self.created_at,
-            updated_at=self.updated_at,
+            title=self.title,
+            url=self.url,
+            image_url=self.image_url,
+            emitted_at=self.emitted_at,
             id=self.id,
         )
 
-    def update(self, dto: Artifact) -> None:
-        self.remixer = dto.remixer
-        self.name = dto.name
+    def update(self, dto: Document) -> None:
+        """Documents are immutable once stored; this exists for the DTO
+        contract and is used by no write path."""
+        self.app = dto.app
+        self.output = dto.output
+        self.key = dto.key
         self.content_type = dto.content_type
         self.content_sha256 = dto.content_sha256
-        self.updated_at = dto.updated_at
+        self.title = dto.title
+        self.url = dto.url
+        self.image_url = dto.image_url
+        self.emitted_at = dto.emitted_at
 
 
 class DeliveryStatus(enum.StrEnum):
@@ -343,40 +413,31 @@ class DeliveryStatus(enum.StrEnum):
 
 
 class DBDelivery(Base):
-    """The delivery ledger: one row per (ledger key, subject), the record of an
-    external fact, never regenerated (decision 0007)."""
+    """The delivery ledger: one row per (sink instance, document), the record
+    of an external fact (decision 0015)."""
 
     __tablename__ = "deliveries"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     sink: Mapped[str] = mapped_column(String(255))
-    source_item_id: Mapped[int | None] = mapped_column(
-        ForeignKey("source_items.id", ondelete="CASCADE"), nullable=True
-    )
-    artifact_id: Mapped[int | None] = mapped_column(
-        ForeignKey("artifacts.id", ondelete="CASCADE"), nullable=True
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE")
     )
     status: Mapped[str] = mapped_column(String(50))
     attempts: Mapped[int] = mapped_column(default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     external_ref: Mapped[Any] = mapped_column(CustomJSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
-    artifact: Mapped[DBArtifact | None] = relationship()
+    document: Mapped[DBDocument] = relationship()
 
     __table_args__ = (
-        CheckConstraint(
-            "(source_item_id IS NULL) != (artifact_id IS NULL)",
-            name="ck_deliveries_one_subject",
-        ),
         CheckConstraint(
             "status IN ('queued', 'sending', 'done', 'error')",
             name="ck_deliveries_status",
         ),
-        UniqueConstraint("sink", "source_item_id"),
-        UniqueConstraint("sink", "artifact_id"),
+        UniqueConstraint("sink", "document_id"),
         Index("ix_deliveries_sink_status", "sink", "status"),
         AUTOINCREMENT,
     )
@@ -385,12 +446,10 @@ class DBDelivery(Base):
     def from_dto(cls, dto: Delivery) -> Self:
         return cls(
             sink=dto.sink,
-            source_item_id=dto.item_id,
-            artifact_id=dto.artifact_id,
+            document_id=dto.document_id,
             status=dto.status,
             attempts=dto.attempts,
             last_error=dto.last_error,
-            content_sha256=dto.content_sha256,
             external_ref=dto.external_ref,
             created_at=dto.created_at,
             updated_at=dto.updated_at,
@@ -399,31 +458,25 @@ class DBDelivery(Base):
     def to_dto(self) -> Delivery:
         return Delivery(
             sink=self.sink,
+            document_id=self.document_id,
             status=self.status,
-            item_id=self.source_item_id,
-            artifact_id=self.artifact_id,
             attempts=self.attempts,
             last_error=self.last_error,
-            content_sha256=self.content_sha256,
             external_ref=self.external_ref,
             created_at=self.created_at,
             updated_at=self.updated_at,
-            artifact_name=(
-                f"{self.artifact.remixer}/{self.artifact.name}"
-                if self.artifact is not None
-                else None
+            document_label=(
+                f"{self.document.app}/{self.document.output}/{self.document.key}"
             ),
             id=self.id,
         )
 
     def update(self, dto: Delivery) -> None:
         self.sink = dto.sink
-        self.source_item_id = dto.item_id
-        self.artifact_id = dto.artifact_id
+        self.document_id = dto.document_id
         self.status = dto.status
         self.attempts = dto.attempts
         self.last_error = dto.last_error
-        self.content_sha256 = dto.content_sha256
         self.external_ref = dto.external_ref
         self.created_at = dto.created_at
         self.updated_at = dto.updated_at
@@ -435,6 +488,7 @@ ITEM_SORTS = {
     "id": [DBSourceItem.id],
     "source": [DBSourceItem.source_id],
     "published": [DBSourceItem.published_at],
+    "imported": [DBSourceItem.imported_at],
     "updated": [DBSourceItem.modified_at],
     "title": [DBSourceItem.title],
 }
@@ -448,11 +502,11 @@ ANNOTATION_SORTS = {
     "processor": [DBItemAnnotation.processor, DBItemAnnotation.key],
     "updated": [DBItemAnnotation.updated_at],
 }
-ARTIFACT_SORTS = {
-    "id": [DBArtifact.remixer, DBArtifact.name],
-    "type": [DBArtifact.content_type],
-    "created": [DBArtifact.created_at],
-    "updated": [DBArtifact.updated_at],
+DOCUMENT_SORTS = {
+    "id": [DBDocument.id],
+    "app": [DBDocument.app, DBDocument.output, DBDocument.key],
+    "type": [DBDocument.content_type],
+    "emitted": [DBDocument.emitted_at],
 }
 DELIVERY_SORTS = {
     "id": [DBDelivery.id],
@@ -548,7 +602,7 @@ class Database:
             for column in (
                 DBSourceItem.content_sha256,
                 DBItemAnnotation.content_sha256,
-                DBArtifact.content_sha256,
+                DBDocument.content_sha256,
             ):
                 referenced.update(
                     sha256
@@ -617,6 +671,7 @@ class Database:
                         item,
                         published_at=item.published_at or now,
                         modified_at=item.modified_at or now,
+                        imported_at=now,
                     )
                 )
                 session.add(db_item)
@@ -716,6 +771,10 @@ class Database:
             query = query.filter(DBSourceItem.published_at >= scope.since)
         if scope.until:
             query = query.filter(DBSourceItem.published_at < scope.until)
+        if scope.imported_since:
+            query = query.filter(DBSourceItem.imported_at >= scope.imported_since)
+        if scope.imported_until:
+            query = query.filter(DBSourceItem.imported_at < scope.imported_until)
         if scope.item_ids:
             query = query.filter(DBSourceItem.id.in_(scope.item_ids))
         return query
@@ -1083,8 +1142,8 @@ class Database:
 
     def delete_items(self, item_ids: Iterable[int]) -> int:
         """Delete items with everything that references them (processing
-        state, annotations, deliveries) and release their contents; return
-        how many were deleted."""
+        state, annotations) and release their contents; return how many were
+        deleted. Documents built from them stay."""
         item_ids = list(item_ids)
         if not item_ids:
             return 0
@@ -1101,7 +1160,7 @@ class Database:
                     DBItemAnnotation.source_item_id.in_(item_ids)
                 )
             }
-            # The foreign keys cascade to state, annotations and deliveries.
+            # The foreign keys cascade to state and annotations.
             deleted = (
                 sess.query(DBSourceItem)
                 .filter(DBSourceItem.id.in_(item_ids))
@@ -1110,160 +1169,224 @@ class Database:
         self._release_contents(released)
         return deleted
 
-    # --- Artifacts ---------------------------------------------------------
+    # --- Applet runs -------------------------------------------------------
 
-    def save_artifact(self, artifact: Artifact) -> None:
-        """Create or replace the artifact named (remixer, name)."""
-        if artifact.content is None or artifact.content_sha256 is None:
-            raise ValueError(f"artifact {artifact.remixer}/{artifact.name} is empty")
-        self.contents.set(artifact.content_sha256, artifact.content.encode())
-
-        replaced: set[str] = set()
+    def get_app_run(self, app: str) -> AppletRun:
+        """The instance's run record; an empty one if it never ran."""
         with self.session_scope() as sess:
-            now = datetime.now(UTC)
-            stamped = dataclasses.replace(artifact, created_at=now, updated_at=now)
-            existing = (
-                sess.query(DBArtifact)
-                .filter_by(remixer=artifact.remixer, name=artifact.name)
-                .one_or_none()
-            )
-            if existing is None:
-                sess.add(DBArtifact.from_dto(stamped))
+            row = sess.get(DBApp, app)
+            return row.to_dto() if row is not None else AppletRun(app=app)
+
+    def get_app_runs(self) -> dict[str, AppletRun]:
+        """Every stored run record, by instance id."""
+        with self.session_scope() as sess:
+            return {row.id: row.to_dto() for row in sess.query(DBApp)}
+
+    def start_app_run(self, app: str, started: datetime) -> None:
+        """Record that a run of the instance started, in its own
+        transaction."""
+        with self.session_scope() as sess:
+            row = sess.get(DBApp, app)
+            if row is None:
+                sess.add(DBApp.from_dto(AppletRun(app=app, last_started=started)))
             else:
-                if existing.content_sha256 != artifact.content_sha256:
-                    replaced.add(existing.content_sha256)
-                existing.update(stamped)
-        self._release_contents(replaced)
+                row.last_started = started
 
-    def get_artifact(self, remixer: str, name: str) -> Artifact | None:
+    def fail_app_run(self, app: str, error: str) -> None:
+        """Record a failed run: only its error; state and times stay."""
         with self.session_scope() as sess:
-            db_artifact = (
-                sess.query(DBArtifact)
-                .filter_by(remixer=remixer, name=name)
-                .one_or_none()
+            row = sess.get(DBApp, app)
+            if row is None:
+                sess.add(DBApp.from_dto(AppletRun(app=app, last_error=error)))
+            else:
+                row.last_error = error
+
+    def existing_document_keys(
+        self, app: str, keys: Iterable[tuple[str, str]]
+    ) -> set[tuple[str, str]]:
+        """The `(output, key)` pairs among `keys` the instance already
+        stored."""
+        keys = list(keys)
+        if not keys:
+            return set()
+        with self.session_scope() as sess:
+            rows = sess.query(DBDocument.output, DBDocument.key).filter(
+                DBDocument.app == app,
+                tuple_(DBDocument.output, DBDocument.key).in_(keys),
             )
-            artifact = db_artifact.to_dto() if db_artifact is not None else None
+            return {(output, key) for output, key in rows}
 
-        if artifact is not None and artifact.content_sha256 is not None:
-            artifact.content = self.contents.get(artifact.content_sha256).decode()
-        return artifact
+    def commit_app_run(
+        self,
+        app: str,
+        started: datetime,
+        result: AppletResult,
+        routes: Mapping[str, Sequence[str]],
+    ) -> list[Document]:
+        """Store a successful run in one transaction: its new documents, a
+        `queued` delivery per route of each new document's output, its state,
+        and `last_success = started`. Documents whose key the instance already
+        stored are ignored. Returns the new documents.
 
-    def delete_artifacts(self, names: Iterable[tuple[str, str]]) -> int:
-        """Delete the `(remixer, name)` artifacts with their deliveries and
-        release their contents; return how many were deleted."""
-        names = list(names)
-        if not names:
+        Contents are written first, so a failed commit leaves unused files,
+        never rows pointing at nothing.
+        """
+        documents = [
+            Document.from_emitted(app, emitted) for emitted in result.documents
+        ]
+        for document in documents:
+            assert document.content is not None and document.content_sha256
+            self.contents.set(document.content_sha256, document.content.encode())
+
+        now = datetime.now(UTC)
+        stored: list[Document] = []
+        with self.session_scope() as sess:
+            existing = {
+                (output, key)
+                for output, key in sess.query(DBDocument.output, DBDocument.key).filter(
+                    DBDocument.app == app
+                )
+            }
+            for document in documents:
+                if (document.output, document.key) in existing:
+                    continue
+                row = DBDocument.from_dto(dataclasses.replace(document, emitted_at=now))
+                sess.add(row)
+                sess.flush()
+                sess.add_all(
+                    DBDelivery.from_dto(
+                        Delivery(
+                            sink=sink,
+                            document_id=row.id,
+                            status=DeliveryStatus.QUEUED,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    for sink in routes.get(document.output, ())
+                )
+                stored.append(dataclasses.replace(document, emitted_at=now, id=row.id))
+
+            run = AppletRun(
+                app=app,
+                last_started=started,
+                last_success=started,
+                last_error=None,
+                state=result.state,
+            )
+            row = sess.get(DBApp, app)
+            if row is None:
+                sess.add(DBApp.from_dto(run))
+            else:
+                row.update(run)
+        return stored
+
+    def reset_app(self, app: str, *, with_documents: bool = False) -> int:
+        """Delete the instance's run record; with `with_documents`, also its
+        documents with their deliveries. Returns how many documents were
+        deleted."""
+        with self.session_scope() as sess:
+            sess.query(DBApp).filter(DBApp.id == app).delete(synchronize_session=False)
+            if not with_documents:
+                return 0
+            ids = [
+                document_id
+                for (document_id,) in sess.query(DBDocument.id).filter(
+                    DBDocument.app == app
+                )
+            ]
+        return self.delete_documents(ids)
+
+    # --- Documents ---------------------------------------------------------
+
+    @staticmethod
+    def _apply_document_filter(query: Query, selection: DocumentFilter) -> Query:
+        if selection.app is not None:
+            query = query.filter(DBDocument.app == selection.app)
+        if selection.output is not None:
+            query = query.filter(DBDocument.output == selection.output)
+        if selection.key is not None:
+            query = query.filter(DBDocument.key == selection.key)
+        if selection.since is not None:
+            query = query.filter(DBDocument.emitted_at >= selection.since)
+        if selection.until is not None:
+            query = query.filter(DBDocument.emitted_at < selection.until)
+        if selection.document_ids is not None:
+            query = query.filter(DBDocument.id.in_(selection.document_ids))
+        return query
+
+    def find_documents(
+        self,
+        selection: DocumentFilter | None = None,
+        *,
+        sort: str = "emitted",
+        newest_first: bool = False,
+        with_content: bool = False,
+    ) -> list[Document]:
+        """Documents by a `DOCUMENT_SORTS` key, ascending unless
+        `newest_first`; `limit` keeps the first ones in that order. Contents
+        only `with_content`."""
+        selection = selection or DocumentFilter()
+        columns = [*DOCUMENT_SORTS[sort], DBDocument.id]
+        with self.session_scope() as sess:
+            query = self._apply_document_filter(sess.query(DBDocument), selection)
+            query = query.order_by(
+                *(column.desc() if newest_first else column for column in columns)
+            )
+            if selection.limit:
+                query = query.limit(selection.limit)
+            documents = [row.to_dto() for row in query]
+        if with_content:
+            for document in documents:
+                document.content = self.load_document_content(document)
+        return documents
+
+    def load_document_content(self, document: Document) -> str:
+        """The document's stored content."""
+        if document.content_sha256 is None:
+            raise ValueError(f"document {document.label} has no content reference")
+        return self.contents.get(document.content_sha256).decode()
+
+    def delete_documents(self, document_ids: Iterable[int]) -> int:
+        """Delete these documents with their deliveries and release their
+        contents; return how many."""
+        document_ids = list(document_ids)
+        if not document_ids:
             return 0
         with self.session_scope() as sess:
-            query = sess.query(DBArtifact).filter(
-                tuple_(DBArtifact.remixer, DBArtifact.name).in_(names)
-            )
-            released = {artifact.content_sha256 for artifact in query}
+            query = sess.query(DBDocument).filter(DBDocument.id.in_(document_ids))
+            released = {row.content_sha256 for row in query}
+            # The foreign key cascades to the deliveries.
             deleted = query.delete(synchronize_session=False)
         self._release_contents(released)
         return deleted
 
-    def list_artifacts(
-        self,
-        remixer: str | None = None,
-        *,
-        names: Iterable[tuple[str, str]] | None = None,
-        limit: int | None = None,
-        sort: str = "id",
-    ) -> list[Artifact]:
-        """Artifacts by an `ARTIFACT_SORTS` key, without their content.
-        `names` keeps only these `(remixer, name)` pairs; filters combine."""
-        with self.session_scope() as sess:
-            query = sess.query(DBArtifact).order_by(
-                *ARTIFACT_SORTS[sort], DBArtifact.id
-            )
-            if remixer is not None:
-                query = query.filter(DBArtifact.remixer == remixer)
-            if names is not None:
-                query = query.filter(
-                    tuple_(DBArtifact.remixer, DBArtifact.name).in_(list(names))
-                )
-            if limit:
-                query = query.limit(limit)
-            return [db_artifact.to_dto() for db_artifact in query]
-
     # --- Deliveries --------------------------------------------------------
 
-    def queue_item_deliveries(
-        self, sink: str, scope: ProcessingScope, *, requires: str | None = None
-    ) -> int:
-        """Queue the items in scope that have no row for `sink`; return how
-        many. With `requires`, only items whose run of that annotation key
-        finished on their current content."""
-        now = datetime.now(UTC)
-        with self.session_scope() as sess:
-            recorded = sess.query(DBDelivery.source_item_id).filter(
-                DBDelivery.sink == sink, DBDelivery.source_item_id.is_not(None)
-            )
-            query = sess.query(DBSourceItem.id).filter(DBSourceItem.id.not_in(recorded))
-            if requires is not None:
-                query = self._join_finished(query, requires)
-            query = self._apply_scope(query, scope).order_by(DBSourceItem.published_at)
-            if scope.limit:
-                query = query.limit(scope.limit)
-            item_ids = [item_id for (item_id,) in query]
-            sess.add_all(
-                DBDelivery.from_dto(
-                    Delivery(
-                        sink=sink,
-                        status=DeliveryStatus.QUEUED,
-                        item_id=item_id,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                for item_id in item_ids
-            )
-        return len(item_ids)
-
-    def queue_artifact_deliveries(
+    def deliveries_of(
         self,
-        sink: str,
-        remixers: Iterable[str],
+        sink: str | None = None,
         *,
-        since: datetime | None = None,
-        names: Iterable[tuple[str, str]] | None = None,
-    ) -> int:
-        """Queue the artifacts of `remixers` that have no row for `sink`,
-        created since `since` and named in `names` when given; return how
-        many."""
-        now = datetime.now(UTC)
+        statuses: Iterable[DeliveryStatus] | None = None,
+        delivery_ids: Iterable[int] | None = None,
+    ) -> list[tuple[Delivery, Document]]:
+        """Rows with their documents (no content), oldest document first:
+        the delivery order."""
         with self.session_scope() as sess:
-            recorded = sess.query(DBDelivery.artifact_id).filter(
-                DBDelivery.sink == sink, DBDelivery.artifact_id.is_not(None)
+            query = sess.query(DBDelivery, DBDocument).join(
+                DBDocument, DBDelivery.document_id == DBDocument.id
             )
-            query = sess.query(DBArtifact.id).filter(
-                DBArtifact.remixer.in_(list(remixers)),
-                DBArtifact.id.not_in(recorded),
-            )
-            if since is not None:
-                query = query.filter(DBArtifact.created_at >= since)
-            if names is not None:
-                query = query.filter(
-                    tuple_(DBArtifact.remixer, DBArtifact.name).in_(list(names))
-                )
-            artifact_ids = [artifact_id for (artifact_id,) in query]
-            sess.add_all(
-                DBDelivery.from_dto(
-                    Delivery(
-                        sink=sink,
-                        status=DeliveryStatus.QUEUED,
-                        artifact_id=artifact_id,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                for artifact_id in artifact_ids
-            )
-        return len(artifact_ids)
+            if sink is not None:
+                query = query.filter(DBDelivery.sink == sink)
+            if statuses is not None:
+                query = query.filter(DBDelivery.status.in_(list(statuses)))
+            if delivery_ids is not None:
+                query = query.filter(DBDelivery.id.in_(list(delivery_ids)))
+            query = query.order_by(DBDocument.emitted_at, DBDocument.id)
+            return [(row.to_dto(), document.to_dto()) for row, document in query]
 
     def add_deliveries(self, deliveries: Iterable[Delivery]) -> int:
-        """Store these new ledger rows, stamped now; return how many."""
+        """Store these new rows, stamped now; return how many."""
         now = datetime.now(UTC)
         rows = [
             DBDelivery.from_dto(
@@ -1275,53 +1398,6 @@ class Database:
             sess.add_all(rows)
         return len(rows)
 
-    def get_item_deliveries(
-        self,
-        sink: str,
-        scope: ProcessingScope | None = None,
-        *,
-        statuses: Iterable[DeliveryStatus] | None = None,
-    ) -> list[tuple[Delivery, SourceItem]]:
-        """The sink's rows for items in scope, with their items, oldest item
-        first (the FIFO order)."""
-        scope = scope or ProcessingScope()
-        with self.session_scope() as sess:
-            query = (
-                sess.query(DBDelivery, DBSourceItem)
-                .join(DBSourceItem, DBDelivery.source_item_id == DBSourceItem.id)
-                .filter(DBDelivery.sink == sink)
-            )
-            if statuses is not None:
-                query = query.filter(DBDelivery.status.in_(list(statuses)))
-            query = self._apply_scope(query, scope).order_by(
-                DBSourceItem.published_at, DBSourceItem.id
-            )
-            return [(row.to_dto(), db_item.to_dto()) for row, db_item in query]
-
-    def get_artifact_deliveries(
-        self,
-        sink: str,
-        *,
-        statuses: Iterable[DeliveryStatus] | None = None,
-        names: Iterable[tuple[str, str]] | None = None,
-    ) -> list[tuple[Delivery, Artifact]]:
-        """The sink's rows for artifacts, with their metadata (no content),
-        oldest artifact first."""
-        with self.session_scope() as sess:
-            query = (
-                sess.query(DBDelivery, DBArtifact)
-                .join(DBArtifact, DBDelivery.artifact_id == DBArtifact.id)
-                .filter(DBDelivery.sink == sink)
-            )
-            if statuses is not None:
-                query = query.filter(DBDelivery.status.in_(list(statuses)))
-            if names is not None:
-                query = query.filter(
-                    tuple_(DBArtifact.remixer, DBArtifact.name).in_(list(names))
-                )
-            query = query.order_by(DBArtifact.created_at, DBArtifact.id)
-            return [(row.to_dto(), db_artifact.to_dto()) for row, db_artifact in query]
-
     def save_delivery(self, delivery: Delivery) -> None:
         """Store a row's new state, stamped now, in its own transaction."""
         if delivery.id is None:
@@ -1331,7 +1407,7 @@ class Database:
             sess.get_one(DBDelivery, delivery.id).update(delivery)
 
     def last_delivered_at(self, sink: str) -> datetime | None:
-        """When the ledger key `sink` last delivered anything, if ever."""
+        """When the sink instance last delivered anything, if ever."""
         with self.session_scope() as sess:
             # order_by, not func.max(), which would bypass UTCDateTime.
             row = (
@@ -1347,55 +1423,36 @@ class Database:
 
     def find_deliveries(
         self,
-        scope: ProcessingScope | None = None,
+        documents: DocumentFilter | None = None,
         *,
-        workflow: str | None = None,
-        key: str | None = None,
+        sink: str | None = None,
         status: DeliveryStatus | None = None,
-        artifact_names: Iterable[tuple[str, str]] | None = None,
         delivery_ids: Iterable[int] | None = None,
+        limit: int | None = None,
         sort: str = "id",
     ) -> list[Delivery]:
-        """Ledger rows by a `DELIVERY_SORTS` key (`id` is creation order).
-        `workflow` and `key` are the two halves of the ledger key
-        `<workflow>/<key>`. Item filters in `scope` keep item rows only and
-        `artifact_names` artifact rows only; filters combine and `limit`
-        counts rows."""
-        scope = scope or ProcessingScope()
+        """Rows by a `DELIVERY_SORTS` key (`id` is creation order), of the
+        documents `documents` selects; filters combine and `limit` counts
+        rows."""
+        documents = documents or DocumentFilter()
         with self.session_scope() as sess:
-            query = (
-                sess.query(DBDelivery)
-                .outerjoin(DBSourceItem, DBDelivery.source_item_id == DBSourceItem.id)
-                .outerjoin(DBArtifact, DBDelivery.artifact_id == DBArtifact.id)
+            query = sess.query(DBDelivery).join(
+                DBDocument, DBDelivery.document_id == DBDocument.id
             )
-            query = self._apply_scope(query, scope)
-            # Neither half contains "/" (NAME_PATTERN).
-            if workflow is not None:
-                query = query.filter(
-                    DBDelivery.sink.startswith(f"{workflow}/", autoescape=True)
-                )
-            if key is not None:
-                query = query.filter(
-                    DBDelivery.sink.endswith(f"/{key}", autoescape=True)
-                )
+            query = self._apply_document_filter(query, documents)
+            if sink is not None:
+                query = query.filter(DBDelivery.sink == sink)
             if status is not None:
                 query = query.filter(DBDelivery.status == status)
             if delivery_ids is not None:
                 query = query.filter(DBDelivery.id.in_(list(delivery_ids)))
-            if artifact_names is not None:
-                query = query.filter(
-                    tuple_(DBArtifact.remixer, DBArtifact.name).in_(
-                        list(artifact_names)
-                    )
-                )
             query = query.order_by(*DELIVERY_SORTS[sort], DBDelivery.id)
-            if scope.limit:
-                query = query.limit(scope.limit)
+            if limit:
+                query = query.limit(limit)
             return [row.to_dto() for row in query]
 
     def delete_deliveries(self, delivery_ids: Iterable[int]) -> int:
-        """Delete the ledger rows with these ids; return how many. Their
-        subjects can be queued again."""
+        """Delete the rows with these ids; return how many."""
         delivery_ids = list(delivery_ids)
         if not delivery_ids:
             return 0

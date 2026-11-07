@@ -19,73 +19,77 @@ config.yaml ─► Config ─► Application (app.py) ◄── cli.py, scripts/
                      process                           ▼
                      Processor ◄── Database.get_unprocessed_items / get_content
                         └─► annotations + processing state
-                     remix
-                     Remixer ◄── items, annotations, other artifacts
-                        └─► artifacts
+                     apps run (when due)
+                     Applet ◄── AppletReader: items, annotations, documents
+                        └─► AppletResult: state + emitted documents
+                              └─► Database.commit_app_run: documents,
+                                  a queued delivery per route, run record
                      deliver
-                     Sink ◄── items, artifacts, the ledger
-                        └─► outside world + deliveries (the ledger)
+                     Deliverer (per sink instance) ◄── the ledger
+                        └─► Sink.send(document) ─► outside world
 ```
 
 ## Modules
 
 | Module | Responsibility |
 | :--- | :--- |
-| `app.py` | `Application`, the single entry point: registers the plugin classes, resolves the configuration into a `Catalog`, wires config, HTTP cache and database, builds each profile's object on first use (`_object`), runs the phases one unit at a time, each on its workflow's sources (`import_source`, `run_process`, `run_remix`, `run_delivery`, `send_deliveries`; `sources()`, `process_keys()`, `remix_keys()` and `delivery_keys()` list a workflow's units in configuration order, `workflows` the workflows), answers queries and deletes. The database is private to it. `write_lock`, the exclusive lock every writing command takes. |
-| `cli.py` | Click commands only: the phases (`import`, `process`, `remix`, and `run` for those plus delivery), each for one workflow (`-w`, default `default`), read-only `inspect items\|annotations\|artifacts\|content\|deliveries`, `delete items\|annotations\|artifacts\|deliveries`, `deliveries set-status\|send`; builds an `Application` per invocation, locked for the commands that write, and runs each unit through it with its own progress row. `inspect` and `delete` share their selection options, so `inspect` is `delete`'s dry run. Results go to stdout and progress and logs to stderr, each rich only when it is a terminal (`RICH_STDOUT_*`/`RICH_STDERR_*` from `foundation.clilib`); summaries print after the progress ends. Global logging options and the log handler come from `foundation.clilib` and `foundation.loglib`. |
-| `catalog.py` | `Catalog`: the configuration resolved against the registered classes, at start-up. Every use becomes a `Profile` (class, validated options), every workflow's runs a `Run` (workflow, key, profile), with every check of decision 0010 (sections, ids, keys, what runs read, LLMs). Builds nothing. |
-| `config.py` | Pydantic models for `config.yaml` (log level, `plugins` defaults per type, the catalog: `llms`, `sources`, `processors`, `remixers`, `sinks`; `workflows`, `cache`, `cache_dir`, `storage_dir`); `Config.all_workflows()` adds `default` (the sources without `skip_default`) and `Workflow.ledger_key` names a workflow's delivery records. `Duration`, a length of time as seconds or with a unit suffix (`5m`, `2h`, `3d`), parsed to seconds at load. `Config` is a pydantic-settings `BaseSettings`: `NEWSTOOL_*` variables, then a `.env` next to the config file, then the YAML, then the `ENV_ALIASES` variables (`OLLAMA_HOST`, `OLLAMA_API_KEY`), then defaults (`settings_customise_sources`). `ConfigPath`, a path relative to the config file's directory (the `LoadContext` of the load in progress); `storage_dir` holds `data.db` and `content/` (`database_uri`, `content_dir`). `${VAR}` expansion, in the YAML only, from the environment and a `.env` next to the config file, and the formatting of option errors with their config path. |
-| `models.py` | Domain models: `SourceData` (a configured source), `SourceItemData` (provider output, validated), the DTOs `SourceItem`, `Annotation`, `Artifact` and `Delivery` (each with its database `id`), and `ProcessingScope` (`sources` holds a workflow's). |
+| `app.py` | `Application`, the single entry point: registers the plugin classes, resolves the configuration into a `Catalog`, wires config, HTTP cache and database, builds each profile's object on first use (`_object`), runs import and process one unit at a time on a workflow's sources (`import_source`, `run_process`; `sources()` and `process_keys()` list a workflow's units in configuration order, `workflows` the workflows), runs applet instances (`run_app`, `reset_app`, `app_status`; `app_ids`) and deliveries (`deliver`, `plan_delivery`, `send_deliveries`, `mark_deliveries`; `sink_ids`), answers queries and deletes. The database is private to it. `write_lock`, the exclusive lock every writing command takes. |
+| `cli.py` | Click commands only: the workflow phases (`import`, `process`, and `run` for both), each for one workflow (`-w`, default `default`), `apps run\|reset`, `deliver`, read-only `inspect items\|annotations\|documents\|apps\|content\|deliveries`, `delete items\|annotations\|documents\|deliveries`, `deliveries set-status\|send`; builds an `Application` per invocation, locked for the commands that write, and runs each unit through it with its own progress row. `inspect` and `delete` share their selection options, so `inspect` is `delete`'s dry run. Results go to stdout and progress and logs to stderr, each rich only when it is a terminal (`RICH_STDOUT_*`/`RICH_STDERR_*` from `foundation.clilib`); summaries print after the progress ends. Global logging options and the log handler come from `foundation.clilib` and `foundation.loglib`. |
+| `catalog.py` | `Catalog`: the configuration resolved against the registered classes, at start-up. Every use becomes a `Profile` (class, validated options), every workflow's process runs a `Run` (workflow, key, profile), every applet instance an `AppInstance` (profile, `Schedule`, routes) and every sink instance a profile, with every check of decisions 0010 and 0015 (sections, ids, keys, routes and content types, what runs and applets read, LLMs). Builds nothing. |
+| `config.py` | Pydantic models for `config.yaml` (log level, `plugins` defaults per type, the catalog: `llms`, `sources`, `processors`; `workflows`, the instances `apps` and `sinks`, `cache`, `cache_dir`, `storage_dir`); `Config.all_workflows()` adds `default` (the sources without `skip_default`). `Duration`, a length of time as seconds or with a unit suffix (`5m`, `2h`, `3d`), parsed to seconds at load. `Config` is a pydantic-settings `BaseSettings`: `NEWSTOOL_*` variables, then a `.env` next to the config file, then the YAML, then the `ENV_ALIASES` variables (`OLLAMA_HOST`, `OLLAMA_API_KEY`), then defaults (`settings_customise_sources`). `ConfigPath`, a path relative to the config file's directory (the `LoadContext` of the load in progress); `storage_dir` holds `data.db` and `content/` (`database_uri`, `content_dir`). `${VAR}` expansion, in the YAML only, from the environment and a `.env` next to the config file, and the formatting of option errors with their config path. |
+| `models.py` | Domain models: `SourceData` (a configured source), `SourceItemData` (provider output, validated), the DTOs `SourceItem`, `Annotation`, `Document`, `Delivery` and `AppletRun` (each with its database `id`), what applets return (`EmittedDocument`, `AppletResult`), and the selections `ProcessingScope` (`sources` holds a workflow's; publication and import bounds) and `DocumentFilter`. |
 | `httpclient.py` | `requests` session with browser headers and a `foundation` cache, which `get(url, use_cache=False)` skips. |
 | `errors.py` | How failures reach the user: `PluginFailure`, the exception a plugin raises, with a message written for the user, when it cannot do its job in an expected way; `EXPECTED_ERRORS`, that and the failures of the network, the LLM backend and the database; `describe` (the message of a `PluginFailure`, `Type: message` for any other exception) and `log_failure` (error-level log; the traceback only with debug logging or when the exception is unexpected). |
 | `db.py` | SQLAlchemy models and `Database`, the only code that touches SQLite or the content storage. |
 | `providers.py` | The `Provider`, `PreflightProvider` and `ProviderType` protocols, `BaseProvider` and `IndexSiteProvider`, optional base classes. |
 | `processors.py` | The `Processor` and `ProcessorType` protocols, `ProcessorOptions`, `BaseProcessor`, `SkipItem` and `RunSummary`. |
-| `remixers.py` | The `Remixer` and `RemixerType` protocols and `BaseRemixer`. |
-| `sinks.py` | The `Sink` and `SinkType` protocols, `BaseItemSink`, `BaseArtifactSink`, `DeliveryOptions` and `ArtifactDeliveryOptions`, and `SelectionRequiredError`. |
+| `applets.py` | The `Applet` and `AppletType` protocols, `BaseApplet`, `SourcesOptions`, `Schedule` (when an instance is due), `Requirements`, `AppletReader` (what applets may read), `check_result` and `run_key`. |
+| `sinks.py` | The `Sink` and `SinkType` protocols, `SinkOptions`, `accepts`, and `Deliverer`, the delivery cycle of one sink instance over the ledger. |
 | `llms.py` | The `LLM` and `LLMType` protocols, `LLMUnavailableError` and `strip_code_fence`, for answers wrapped in a code fence. |
-| `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `embed`, `digest`, `grouping` (`singlelink`, `avglink`, `embeddings`), `feedgenerator`, `telegram` (the `telegram` and `telegram_artifacts` sinks) and `googlechat`. `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
-| `scripts/` | The one-shot migrations `migrate_autoincrement.py`, `migrate_telegram_state.py` and `migrate_annotation_keys.sql`. |
+| `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `embed`, the applets `digest`, `grouping` (`singlelink`, `avglink`, `embeddings`), `feed` and `itemfeed`, and the sinks `telegram`, `googlechat` and `filesink` (`file`). `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
+| `scripts/` | The one-shot migrations `migrate_autoincrement.py`, `migrate_applets.py` and `migrate_annotation_keys.sql`. |
 
 ## Plugins
 
 Plugins register classes; the core builds one object per configured use
 (decision 0010). The core knows only the protocols in `providers.py`,
-`processors.py`, `remixers.py`, `sinks.py` and `llms.py`, never a plugin's
+`processors.py`, `applets.py`, `sinks.py` and `llms.py`, never a plugin's
 code:
 
 1. `Application.__init__` registers every module of the `newstool.plugins`
    namespace with `ClassRegister.register_found()`. Each module's
    `__newstool_plugin__()` returns `[(type name, type Protocol, class),
-   ...]`, declared under `ProviderType`, `ProcessorType`, `RemixerType`,
+   ...]`, declared under `ProviderType`, `ProcessorType`, `AppletType`,
    `SinkType` or `LLMType`. `ClassRegister.classes(protocol)` indexes them
    by type name, checks that names are unique per protocol, that each is a
    class (an instance is a `PluginError`) and that it conforms
    (`isinstance(cls, protocol)`, else `ProtocolConformanceError`). A module
    that fails to import fails every command.
 2. `Catalog` resolves the configuration (see *The catalog*): a `Profile`
-   per use, with its options validated, and a `Run` per workflow unit. Every
-   error is a `ConfigError` with its config path, before the database is
-   opened.
+   per use, with its options validated, a `Run` per workflow process unit
+   and an `AppInstance` per applet instance. Every error is a `ConfigError`
+   with its config path, before the database is opened.
 3. A run builds its profile's object on first use, `cls(options,
    services)`, and keeps it for the other runs of the profile.
 
 A type protocol declares `options_model` and `__call__(options, services)`;
-`ProcessorType` adds `output_key(options)` and `required_key(options)`, and
-`RemixerType` and `SinkType` `required_key(options)`, as class methods, so
-keys are worked out without objects. An object keeps its options
+`ProcessorType` adds `output_key(options)` and `required_key(options)`,
+`AppletType` `outputs` (output name to content types) and
+`requirements(options)` (sources and annotation keys), and `SinkType`
+`accepts` (content types), as class attributes or methods, so keys, routes
+and requirements are checked without objects. An object keeps its options
 (`self.options`) and what it takes from `services` (decision 0013):
-providers the `HTTPClient` (`self.fetcher`), processors, remixers and sinks
-the `Database` (`self.db`). Methods receive only what each task needs:
-providers the source, processors, remixers and sinks the scope and the
-run's key. Each protocol has its own method
-(`retrieve_items` or `iter_items`/`retrieve_item`, `process`, `remix`,
-`deliver`). Processors, remixers and
-sinks own their name, a class attribute that records who wrote an
-annotation; entry points register each class under it. Annotations and
-processing state are keyed by the process run's key, artifacts by the
-remix run's and deliveries by the delivery run's (see *Workflows*), never
-by the type name, which is only their default.
+providers the `HTTPClient` (`self.fetcher`), processors the `Database`
+(`self.db`); applets and sinks take no database. Methods receive only what
+each task needs: providers the source, processors the scope and the run's
+key, applets the time, their run record and an `AppletReader`, sinks one
+document. Each protocol has its own method (`retrieve_items` or
+`iter_items`/`retrieve_item`, `process`, `is_due`/`run`, `send`).
+Processors own their name, a class attribute that records who wrote an
+annotation; entry points register each class under its name. Annotations
+and processing state are keyed by the process run's key (see
+*Workflows*), documents and run records by the applet instance's id, and
+deliveries by the sink instance's id, never by the type name.
 
 `services` is what the core shares with objects: `services.db`,
 `services.fetcher`, and `services.llm(name)`, which returns the LLM `name` refers to (an `llms` id or an LLM type; `None`, the
@@ -93,19 +97,20 @@ first `llms` entry), built on first use by `Application._llm`. Objects that
 use one take `UsesLLMOptions` and ask for it in their constructor.
 
 A bundle may register several classes per protocol under different names:
-`grouping` registers its three remixers, `telegram` its two sinks.
+`grouping` registers its three applets.
 
 ### The catalog
 
 `plugins.<type>` holds the defaults of a type's options for every use. It
 builds nothing; `Catalog` checks its keys and each value against the
 type's `options_model` (`check_section`), and rules across options when a
-use is validated. The catalog lists the uses: `llms`, `sources`,
-`processors`, `remixers` and `sinks`, each a type name or `{<type>, id,
-key, options}`. A use's options are `merge_options(section, options)`,
-merged key by key in nested mappings, any other value replacing, validated
-with `options_model`. A rejected option is a `ConfigError` with its path
-(`workflows.<name>.deliver.0.options.chat_id: Field required`).
+use is validated. The catalog lists the uses: `llms`, `sources` and
+`processors`, each a type name or `{<type>, id, key, options}`; `apps` and
+`sinks` list instances, each with a required `id`. A use's options are
+`merge_options(section, options)`, merged key by key in nested mappings,
+any other value replacing, validated with `options_model`. A rejected
+option is a `ConfigError` with its path
+(`sinks.0.options.chat_id: Field required`).
 
 An `id` lets workflows refer to a catalog entry; it cannot be a type's name
 of its kind. A workflow entry is an id, a type name (the type with its
@@ -117,32 +122,23 @@ whether a workflow runs it or not.
 
 `config.all_workflows()` returns `default`, with every source not marked
 `skip_default`, then the `workflows` list. `Catalog` gives `default` the
-catalog's processors and remixers without `skip_default`, in order, and no
-deliveries; the other workflows resolve their entries. Each run is a `Run`
-(workflow, key, profile, location), and every phase method restricts the
-scope to its workflow's sources (`workflow_scope`, `ProcessingScope.sources`).
+catalog's processors without `skip_default`, in order; the other workflows
+resolve their entries. Each run is a `Run` (workflow, key, profile,
+location), and import and process restrict the scope to its workflow's
+sources (`workflow_scope`, `ProcessingScope.sources`). Workflows only
+import and process: applets and sinks are global (see *Applets*).
 
-Identity follows ownership:
-
-- Process runs are keyed `(workflow, key)`, one per key in a workflow. On
-  shared sources, two processor types cannot write one key (each would see
-  the other's `processor_version` and process every item again); the same
-  type with other options gets a warning, since the first run to process an
-  item writes it. Annotations and processing state are per `(item, key)`.
-- Remix runs are keyed by their key, which belongs to one workflow, since
-  an artifact belongs to no source. It is stored as the artifact's
-  `remixer`.
-- Delivery runs are keyed by `Workflow.ledger_key(key)`, `<workflow>/<key>`,
-  stored as the delivery's `sink`. A key is unique within its workflow; `/`
-  is not allowed in workflow names or keys.
-
-Every key a process, remix or delivery run reads (`required_key`) must be written
-by a process run on its workflow's sources, in any workflow, so a workflow
-may deliver what others process.
+Process runs are keyed `(workflow, key)`, one per key in a workflow. On
+shared sources, two processor types cannot write one key (each would see
+the other's `processor_version` and process every item again); the same
+type with other options gets a warning, since the first run to process an
+item writes it. Annotations and processing state are per `(item, key)`.
+Every key a process run reads (`required_key`) must be written by a process
+run on its workflow's sources, in any workflow.
 
 Bundles never import each other. `grouping.embeddings` reads the vectors
 `embed` stores as `<input>_embedding` annotations, the same way every
-grouping remixer reads `tags`.
+grouping applet reads `tags`.
 
 ## Providers
 
@@ -253,16 +249,19 @@ date and fetching an item is expensive, implement `iter_items` and
 
 A class with options sets `options_model` to a `PluginOptions` subclass
 with defaults for the general case, so a use needs no options; its
-constructor takes `(options, services)`. `feedgenerator` and `telegram` are
+constructor takes `(options, services)`. `feed` and `telegram` are
 examples, `grouping` shows a bundle with several classes and `summarize` an
 LLM consumer (`UsesLLMOptions`). Use `pydantic.SecretStr` for secrets, so
-they never show in a `repr` or a traceback. Processors, remixers and sinks
-usually subclass `BaseProcessor` (`process_item(item)`, plus `key` and
-`requires` class attributes, options from `ProcessorOptions`),
-`BaseRemixer` (`produce(scope)`, plus `requires`) or
-`BaseItemSink`/`BaseArtifactSink` (`send(subject)`), read the database
-through `self.db`, set `name` and `options_model` as class attributes
-and are returned as `(cls.name, ProcessorType, cls)`.
+they never show in a `repr` or a traceback. Processors usually subclass
+`BaseProcessor` (`process_item(item)`, plus `key` and `requires` class
+attributes, options from `ProcessorOptions`) and read the database through
+`self.db`. Applets subclass `BaseApplet`: they declare `outputs` and
+`requires`, take their sources from `SourcesOptions`, and implement
+`run(now, run, reader)`, reading only through the `AppletReader` and
+returning an `AppletResult` (see *Applets*). Sinks declare `accepts` and
+implement `send(document)`, with options from `SinkOptions`. Each sets
+`name` and `options_model` as class attributes and is returned as
+`(cls.name, <its type Protocol>, cls)`.
 
 Rules every provider follows:
 
@@ -283,20 +282,22 @@ SQLite tables:
 
 - `sources`: one row per configured source, keyed by its configured `id`.
 - `source_items`: metadata of each item (`uid`, `uri`, `title`, `mimetype`,
-  `content_sha256`, `data`, `published_at`, `modified_at`), unique per
-  `(source_id, uid)`. `uri` is not unique.
+  `content_sha256`, `data`, `published_at`, `modified_at`, `imported_at`),
+  unique per `(source_id, uid)`. `uri` is not unique; `imported_at` is set
+  on creation and never changed.
 - `processing_state`: per item and annotation key, the processor that ran,
   the status (`done`, `error`, `ignored`), attempts, processor version and
   the `content_sha256` the run used.
 - `item_annotations`: per item and key, the processor that wrote it and the
   `content_sha256` of the value (e.g. `markdown`, `summary`, `summary/es`).
-- `artifacts`: remixer outputs, unique per `(remixer, name)`, `remixer`
-  being the remix entry's key, with the `content_sha256` of their content.
-- `deliveries`: the ledger, one row per `(sink, subject)`, `sink` being the
-  deliver entry's ledger key (see *Workflows*), the subject an
-  item or an artifact (two nullable foreign keys, a `CHECK` that exactly
-  one is set), with status, attempts, last error, the subject's
-  `content_sha256` when delivered and an `external_ref` (JSON).
+- `apps`: one row per applet instance that ever ran, keyed by its id:
+  `last_started`, `last_success`, `last_error` and `state` (JSON).
+- `documents`: what applet instances emitted, unique per `(app, output,
+  key)`, with the content type, title, url, image url, `emitted_at` and the
+  `content_sha256` of their content; never updated.
+- `deliveries`: the ledger, one row per `(sink, document_id)`, `sink`
+  being the sink instance's id, with status, attempts, last error and an
+  `external_ref` (JSON).
 
 Every table with an integer id uses `AUTOINCREMENT`, so a deleted id is
 never reused: the CLI selects items and annotations by id (decision 0008).
@@ -308,26 +309,27 @@ SQLAlchemy models never leave `db.py`: `Database` takes and returns DTOs.
 Every SQLite connection gets `SQLITE_PRAGMAS` from a SQLAlchemy `connect`
 listener: foreign keys on, WAL, `busy_timeout`, `synchronous=NORMAL`,
 in-memory temp store. newstool does not use `foundation.dblib`, which is a
-shortcut for code that uses `sqlite3` directly. Item and artifact foreign
-keys are `ON DELETE CASCADE`, so `delete_items` and `delete_artifacts`
-only delete the subjects, then release their contents.
+shortcut for code that uses `sqlite3` directly. Item and document foreign
+keys are `ON DELETE CASCADE`, so `delete_items` and `delete_documents`
+only delete the rows, then release their contents.
 `Base.metadata.create_all` creates missing tables only; it never alters an
 existing schema.
 
 ### Content storage
 
-Item contents, annotation values (as JSON) and artifact contents are stored
+Item contents, annotation values (as JSON) and document contents are stored
 outside SQLite, in one `foundation.storage.DiskStorage` in `content/` under `storage_dir`,
 keyed by the sha256 of the bytes (decision 0004). The database is the only
 record of which row uses which content.
 
-- `SourceItem` and `Artifact` compute `content_sha256` when built with
-  content. Items read back have `content=None`; processors load it with
-  `Database.get_content(item)`.
+- `SourceItem` and `Document` compute `content_sha256` when built with
+  content. Items and documents read back have `content=None`; processors
+  load an item's with `Database.get_content(item)`, applets read documents
+  with their content through the `AppletReader`.
 - Content is written **before** the row that references it, so a crash
   leaves an unused file, never a row pointing at nothing.
 - After the commit, replaced hashes that no row (item, annotation or
-  artifact) references any more are deleted. Identical contents are stored
+  document) references any more are deleted. Identical contents are stored
   once and shared.
 - Two writers running at the same time could delete a content the other
   one has just started to reference. `write_lock` prevents it: every
@@ -368,91 +370,114 @@ The eligibility and retry rules are in spec §4.2; this is where they live:
   processing state of its (item, key), so their runs find the items
   pending. `delete annotations` passes what `find_annotations` selects.
 
-## Remixers
+## Applets
 
-`BaseRemixer.produce(scope)` yields `(name, content,
-content_type)` for the whole scope, regenerated on each run and stored by
-`remix(key=..., scope=...)` as an `Artifact` of the
-entry's key, unique per `(key, name)`. Remixers read items, bulk annotations by key
-(`Database.get_annotation_values`, one query for many items) and other
-remixers' artifacts. The three `grouping` remixers share `GroupingRemixer`
-and differ only in their clustering step: single-link and average-link over
-tag overlap, and single-link over tag overlap blended with the cosine
-similarity of the `embed` vectors (`embeddings`, which reads
-`tags_embedding` or `markdown_embedding` and leaves out items without
-one).
+Decision 0015. `Catalog` builds an `AppInstance` per `apps` entry: its
+profile, a `Schedule` (`every`, `at`, `days` as weekday numbers) and its
+routes, `routes` or the `sink` shorthand turned into `{output: (sink ids)}`.
+At start-up it checks that every routed output exists in the class's
+`outputs`, that every sink exists and `accepts` the output's content types
+(`sinks.accepts`), and that the class's `requirements(options)` name known
+sources and annotation keys some process run writes on one of them.
 
-`digest` writes one markdown artifact per source in scope, named
-`<source id>/<since>_<until>` (YYYY-MM-DD), so each period is delivered
-once. It reads `markdown` of the newest `max_items` items
-per source published since `since` (default: the last `lookback`), cuts each to
-`max_article_chars`, sends them oldest first in one prompt with a
-`context_length` window and prepends a `# <source name>: <since> – <until>`
-title to the model's answer.
+`Application.run_app(app_id, now, force, dry_run)`:
 
-Remixers have no external side effects; that is the sinks' job.
+1. reads the run record (`Database.get_app_run`, an empty `AppletRun` if it
+   never ran) and asks `applet.is_due(now, run, schedule)`;
+   `BaseApplet.is_due` defers to `Schedule.is_due(now, last_success)`.
+   `force` skips it;
+2. commits `last_started` on its own (`start_app_run`);
+3. calls `applet.run(now, run, reader)`, `run` being the record read before
+   the start, and validates the result with `check_result` (declared
+   outputs and content types, no key twice);
+4. stores it with `Database.commit_app_run`: in one transaction, each
+   document whose `(output, key)` the instance has not stored, a `queued`
+   delivery per sink its output is routed to, and the run record with the
+   new state and `last_success = last_started`. Contents are written first.
+   A failure (any exception, logged with `log_failure`) stores only
+   `last_error` (`fail_app_run`).
+
+`dry_run` runs the applet and reports which keys are new
+(`existing_document_keys`) and the state, writing nothing. `apps run` takes
+the write lock, so two of them never overlap. `reset_app` deletes the run
+record, and with `with_documents` the instance's documents (deliveries
+cascade); `app_status` gives each instance's record and
+`Schedule.next_due`, which tries the moments where being due can change
+(`last_success + every`, each day's start and `at`) over the next week.
+
+`AppletReader` is what an applet reads: `items` (by sources, publication
+and import bounds, through `ProcessingScope`), `annotations(items, key)`
+(by item key, one query), `content(item)` and `documents` (any instance's,
+with content). It never exposes the `Database` or another instance's state.
+
+The applets:
+
+- `feed` builds an RSS feed of the newest `max_items` items of its sources,
+  keyed by the run's UTC time (`run_key`), so each run emits a new one.
+- `itemfeed` emits a `text/plain` document per item imported since its
+  cursor (its state, the last run's time) that has its `annotation`, keyed
+  `item:<source>/<uid>`, with the item's title, link and `data["image"]`.
+  The window starts `wait` before the cursor, so an item whose annotation
+  came late is still emitted; keys already stored are ignored. With
+  `since_first_run`, its first run only sets the cursor.
+- `digest` writes one Markdown document per source, keyed
+  `<source id>/<since>_<until>` (YYYY-MM-DD) over the last `lookback`. It
+  reads `markdown` of the newest `max_items` items per source, cuts each to
+  `max_article_chars`, sends them oldest first in one prompt with a
+  `context_length` window and prepends a `# <source name>: <since> –
+  <until>` title to the model's answer.
+- The three `grouping` applets share `GroupingApplet` and differ only in
+  their clustering step: single-link and average-link over tag overlap, and
+  single-link over tag overlap blended with the cosine similarity of the
+  `embed` vectors (`embeddings`, which reads `tags_embedding` or
+  `markdown_embedding` and leaves out items without one). Each run emits one
+  JSON document keyed by its time.
 
 ## Sinks
 
-Decision 0007. `BaseSink.deliver(key=..., scope, artifacts, requeue,
-force)` runs one cycle over the ledger rows of `key`,
-the entry's ledger key:
+Decision 0015. A sink renders and sends one `Document` (`send(document)`,
+returning its external reference); it knows nothing of items, annotations
+or the ledger. `Deliverer(db, sink_id, sink, options)` runs the cycle of
+one sink instance over its rows (`Database.deliveries_of(sink)`, oldest
+document first):
 
-1. queue the candidates: `queue_item_deliveries` or
-   `queue_artifact_deliveries` insert `queued` rows for the subjects in
-   scope without one (by default, those of the last `lookback`; item
-   sinks only take items whose run of their `requires` key finished);
-2. read the sink's `queued`, `error` and `sending` rows with their subjects
-   (`get_item_deliveries`, `get_artifact_deliveries`), in FIFO order; warn
-   about `sending` ones, and pass `queued` ones and `error` ones with
-   attempts left to `select(pending, now)`, which picks what is due, then
-   to `pace`: with an `interval`, only the first one, once the key's last
-   `done` delivery (`last_delivered_at`) is that old; then at most
+1. `plan(now)`: warn about `sending` rows, keep `queued` ones and `error`
+   ones with attempts left (`max_retries`) whose backoff
+   (`backoff_seconds`, as processors) has passed, then `pace`: with an
+   `interval`, only the first one, once the instance's last `done`
+   delivery (`last_delivered_at`) is that old; then at most
    `max_per_run`;
-3. for each selected row: save it `sending`, call `send(subject)`, then
-   save it `done` with the returned `external_ref` and the subject's
-   `content_sha256`, or `error` with one more attempt. Errors are logged
-   with their traceback, so `send` raises without chaining secrets.
+2. `send_rows(rows)`: for each, save it `sending`, load the document's
+   content, call `send`, then save it `done` with the returned
+   `external_ref`, or `error` with one more attempt. Errors are logged with
+   their traceback, so `send` raises without chaining secrets.
 
 Every state change is a `Database.save_delivery(delivery)` in its own
-transaction; eligibility and backoff (`backoff_seconds`, as processors) live
-in the sinks. `BaseItemSink.select` keeps strict FIFO per source: a row
-that is not due holds back the rest of its source. `requeue` turns the
-`error` rows in scope back into `queued`; `force` needs an explicit
-selection (`SelectionRequiredError`), gives the selected subjects a row and
-sends them whatever their state, without pacing.
-`Database.delete_deliveries` drops ledger rows (`delete deliveries`), so
-their subjects can be queued again. Decision 0012: ledger rows are selected
-by id (`Database.find_deliveries(delivery_ids=...)`);
-`Application.set_delivery_status` rewrites the state of rows
-(`deliveries set-status`), and `Application.send_deliveries` groups rows by
-ledger key and calls `deliver(force=True)` once per key with the rows'
-subjects (`deliveries send`). Decision 0014: `Application.mark_deliveries`
-gives the subjects a delivery selects (`BaseSink.subjects`, which rejects
-filters of the other kind with `SubjectKindError`) a row in a given state
-(`BaseSink.new_delivery`, `Database.add_deliveries`), ignoring `lookback`
-and `requires` (`deliveries set-status --sink`); item sinks read the
-annotation with `BaseItemSink.require_annotation`, a `PluginFailure` when
-it is missing.
+transaction. `Application.deliver(sink_id, now)` runs a cycle;
+`plan_delivery` is its dry run. `send_deliveries` groups rows by sink and
+sends them now with `send_rows`, skipping sinks no longer configured.
+`set_delivery_status` rewrites the state of rows, and `mark_deliveries`
+gives the documents routed to a sink (`routed_documents`) a row in a given
+state (`Database.add_deliveries`). `delete_documents` refuses documents
+with rows that are not `done`.
 
-A sink's options are a `DeliveryOptions` subclass (`interval`,
-`max_per_run`, `max_retries`, `lookback`; `ArtifactDeliveryOptions` adds
-`artifacts`, remix keys), and each use builds its own sink object: where
-it delivers is an option. `telegram` bundles two sinks that post through
-`post(bot_token, method, ...)`; each use's `bot_token` and `chat_id`
-default to its type's section, which is optional. `item_image` picks
-`sendPhoto` for items with an image, `item_url_text` and
-`item_url_preview` set the article link's text and whether
-`sendMessage` shows its preview, and `markdown` posts in Telegram's legacy
-`Markdown`, the summary unescaped, instead of HTML. `TelegramSink` reads the annotation its
-`summary` option names (its `required_key`) and
-`TelegramArtifactSink` sends artifacts with `sendDocument`; both record
-`{"chat_id", "message_id"}`, since a message id is only unique in its chat.
-`googlechat` posts summarized items to the webhook of its entry as one
-`cardsV2` card: the title and the annotation its `summary` option names (its
-`required_key`) in a paragraph of Chat's HTML subset, the item's image under
-`item_image`, and a button labelled `item_url_text`. Chat renders no image
+A sink's options are a `SinkOptions` subclass (`interval`, `max_per_run`,
+`max_retries`), plus its destination. `telegram` posts through
+`post(bot_token, method, ...)`; each instance's `bot_token` and `chat_id`
+default to its type's section, which is optional. A document whose whole
+message fits in 4096 characters is posted with `sendMessage`, or
+`sendPhoto` with its image under `images` (the caption cut to 1024); a
+longer one goes as a file with `sendDocument`. `link_text` and
+`link_preview` set the link's text and whether `sendMessage` shows its
+preview, and `markdown` posts in Telegram's legacy `Markdown`, the text
+unescaped, instead of HTML. It records `{"chat_id", "message_id"}`, since a
+message id is only unique in its chat. `googlechat` posts each document to
+its instance's webhook as one `cardsV2` card: the title and text in a
+paragraph of Chat's HTML subset, the image under `images`, and a button
+labelled `link_text` when the document has a link. Chat renders no image
 from `blogger.googleusercontent.com`, so `chat_image_url` asks Blogger for
-the full size and routes it through the `wsrv.nl` proxy. Request
-errors are re-raised `from None` with their class only, since the URLs
-embed the secrets.
+the full size and routes it through the `wsrv.nl` proxy. Request errors are
+re-raised `from None` with their class only, since the URLs embed the
+secrets. `file` writes the content to its `path` (`{app}`, `{output}`,
+`{key}` substituted), through a partial file renamed over the target, and
+records `{"path"}`.

@@ -24,8 +24,9 @@ cache:
   expiration: 6h
 
 # Plugin types and the defaults of their options in every use of the type:
-# the catalog entries and the workflows' own entries below override them
-# (nested mappings key by key; any other value, lists included, whole).
+# the catalog entries, the workflows' own entries and the applet and sink
+# instances below override them (nested mappings key by key; any other
+# value, lists included, whole).
 # Options left out take the type's defaults. A section builds nothing.
 plugins:
   ollama:
@@ -44,16 +45,14 @@ plugins:
   tagger:
     model: gemma4:12b
 
-  feedgenerator:
+  feed:
     title: Castelló news
   digest:                            # sends a week of articles per source
     lookback: 7d
 
-  telegram:                          # summarized items; uses may name their
-    bot_token: ${TELEGRAM_BOT_TOKEN} # own bot and chat
-  telegram_artifacts:                # artifacts, as documents
-    bot_token: ${TELEGRAM_BOT_TOKEN}
-  googlechat:                        # summarized items, by incoming webhook
+  telegram:                          # instances may name their own bot
+    bot_token: ${TELEGRAM_BOT_TOKEN} # and chat
+  googlechat:                        # by incoming webhook
     url: ${GOOGLECHAT_WEBHOOK_URL}   # or `channel` (space id) and `token`
 
 # The catalog: every configured use of a plugin type, with its `options` over
@@ -61,11 +60,11 @@ plugins:
 # runs it. An `id` names an entry so that workflows can refer to it; it
 # cannot be a type's name.
 #
-# The `default` workflow runs, in order, every source, processor and remixer
-# without `skip_default: true`; it delivers nothing. `skip_default` only
-# leaves an entry out of `default`: the workflows that name it still run it.
+# The `default` workflow imports every source and runs every processor
+# without `skip_default: true`. `skip_default` only leaves an entry out of
+# `default`: the workflows that name it still run it.
 
-# LLMs, for the processors and remixers that use one.
+# LLMs, for the processors and applets that use one.
 llms:
   - ollama
 
@@ -132,66 +131,76 @@ processors:
   #     prompt: "Resume en español el siguiente artículo:\n\n"
   #     model: gemma4:27b
 
-# Each remix run saves its artifacts under its key, the remixer's own unless
-# the entry names another; a key belongs to one workflow.
-remixers:
-  - feedgenerator                    # feedgenerator/feed
-  - singlelink
-  - avglink
-  - embeddings
-  - digest                           # digest/<source>/<since>_<until>
-  # - remixer: feedgenerator         # short/feed
-  #   key: short
-  #   options: {title: Headlines, max_items: 10}
+# Workflows, run with `-w NAME` (one cron line each), import and process. A
+# workflow sees only its sources. Entries are catalog ids, type names (the
+# type with its section's options) or entries of the workflow's own, which
+# have no `id`.
+workflows:
+  - name: juntas
+    sources: [juntagobiernolocal]
+    process: [markdownify, summarize]
 
-# Each delivery records what it sent under `<workflow>/<key>`, the key being
-# the sink's name unless the entry names another; keys are unique per
-# workflow. Every sink takes `interval` (time between deliveries, oldest
-# first; default 0), `max_per_run` (default 5), `max_retries` and `lookback`.
-# `delete deliveries` drops records, so the next `run` delivers those subjects
-# again while `lookback` covers them.
+# Sink instances: where documents go and how fast. Every sink takes
+# `interval` (time between deliveries, oldest first; default 0),
+# `max_per_run` (default 5) and `max_retries` (default 3).
 sinks:
-  - sink: telegram                   # summarized items
-    id: telegram-main
+  - id: telegram-main
+    sink: telegram
     options:
       chat_id: ${TELEGRAM_CHAT_ID}
       interval: 30m
-      item_image: true               # the item's image as a photo, if any
-      item_url_text: original article # the link to the article
-      summary: summary               # the annotation posted, e.g. summary/es
-      item_url_preview: false        # Telegram's link preview, text posts only
-      markdown: false                # the summary as Markdown, not plain text
-  - sink: telegram_artifacts
-    id: telegram-digests
+      images: true                   # the document's image as a photo, if any
+      link_text: original article    # the link's text
+      link_preview: false            # Telegram's link preview, text posts only
+      markdown: false                # the text as Markdown, not plain text
+  - id: telegram-juntas
+    sink: telegram
     options:
-      chat_id: ${TELEGRAM_CHAT_ID}
-      artifacts: [digest]
-  - sink: googlechat
-    id: chat-main
+      chat_id: ${TELEGRAM_JUNTAS_CHAT_ID}
+      interval: 30m
+      max_per_run: 1
+  - id: chat-main
+    sink: googlechat
     options:
-      item_image: true               # the item's image in the card, if any
-      item_url_text: original article # the button to the article
-      summary: summary               # the annotation posted, e.g. summary/es
+      images: true
+      link_text: original article
+  # - id: site
+  #   sink: file
+  #   options:
+  #     path: /srv/www/{app}.xml     # {app}, {output}, {key} are replaced
 
-# Workflows, run with `-w NAME` (one cron line each). A workflow sees only its
-# sources. Entries are catalog ids, type names (the type with its section's
-# options) or entries of the workflow's own, which have no `id`. A workflow
-# may only deliver what others process on its sources.
-workflows:
-  - name: main-channels
-    sources:
-      - elperiodicomediterraneo-castello
-      - castelloninformacion-castello
-      - castellonplaza
-      - the-guardian-spain
-    deliver: [telegram-main, telegram-digests, chat-main]
-
-  - name: juntas-channel
-    sources: [juntagobiernolocal]
-    process: [markdownify, summarize]
-    deliver:
-      - sink: telegram
-        options:
-          chat_id: ${TELEGRAM_JUNTAS_CHAT_ID}
-          interval: 30m
-          max_per_run: 1
+# Applet instances, run by `apps run` (one cron line, every few minutes)
+# when due: `every` after their last success, on `days`, once a day from
+# `at` (local time). Each output goes to the sink instances in `routes`;
+# `sink` is the shorthand for an applet with one output. An instance's `id`
+# keys its state and documents: renaming it starts it from scratch.
+apps:
+  - id: main-items                   # each new summarized item, once
+    app: itemfeed
+    options:
+      sources:
+        - elperiodicomediterraneo-castello
+        - castelloninformacion-castello
+        - castellonplaza
+        - the-guardian-spain
+      annotation: summary            # the annotation posted, e.g. summary/es
+    routes:
+      items: [telegram-main, chat-main]
+  - id: juntas-items
+    app: itemfeed
+    options: {sources: [juntagobiernolocal]}
+    sink: telegram-juntas
+  - id: weekly-digest                # Mondays from 07:00
+    app: digest
+    at: "07:00"
+    days: [mon]
+    options: {sources: [castellonplaza]}
+    sink: telegram-main
+  # - id: headlines
+  #   app: feed
+  #   every: 1h
+  #   options: {max_items: 10}
+  #   sink: site
+  # - id: events
+  #   app: avglink
+  #   every: 6h                      # no route: read with `inspect documents`

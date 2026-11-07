@@ -6,258 +6,259 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pydantic
+from sqlalchemy.exc import IntegrityError
 
-from newstool.db import Database, DBDelivery, DeliveryStatus, ProcessingStatus
-from newstool.errors import PluginFailure
-from newstool.models import Artifact, ProcessingScope, SourceData, SourceItem
-from newstool.plugins import Services
-from newstool.processors import RunSummary
-from newstool.sinks import (
-    ArtifactDeliveryOptions,
-    BaseArtifactSink,
-    BaseItemSink,
-    DeliveryOptions,
-    SelectionRequiredError,
-)
+from newstool.db import Database, DeliveryStatus
+from newstool.models import AppletResult, Delivery, Document, EmittedDocument
+from newstool.plugins import Services, filesink, googlechat, telegram
+from newstool.sinks import Deliverer, SinkOptions, accepts
 
-SOURCE_A = SourceData(id="a", name="A", url="https://a.test/", provider="plaza")
-SOURCE_B = SourceData(id="b", name="B", url="https://b.test/", provider="plaza")
+NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
 
 
-class RecordingItemSink(BaseItemSink[DeliveryOptions]):
-    name = "recorder"
-    requires = "summary"
-    options_model = DeliveryOptions
+class RecordingSink:
+    """Records what it sends; fails for the keys in `failing`."""
 
-    def __init__(
-        self, db: Database, failing: set[str] | None = None, **options
-    ) -> None:
-        super().__init__(
-            DeliveryOptions.model_validate(options), Services(db=db, fetcher=Mock())
-        )
+    def __init__(self, failing: set[str] | None = None) -> None:
         self.failing = failing or set()
         self.sent: list[str] = []
 
-    def run(self, **kwargs) -> RunSummary:
-        return self.deliver(key="recorder", **kwargs)
-
-    def send(self, subject: SourceItem) -> dict:
-        if subject.uid in self.failing:
-            raise RuntimeError(f"{subject.uid} rejected")
-        self.sent.append(subject.uid)
+    def send(self, document: Document) -> dict:
+        if document.key in self.failing:
+            raise RuntimeError(f"{document.key} rejected")
+        self.sent.append(document.key)
         return {"message_id": len(self.sent)}
 
 
-class RecordingArtifactSink(BaseArtifactSink[ArtifactDeliveryOptions]):
-    name = "artifact_recorder"
-    options_model = ArtifactDeliveryOptions
-
-    def __init__(self, db: Database, **options) -> None:
-        options = {"artifacts": ["digest"], **options}
-        super().__init__(
-            ArtifactDeliveryOptions.model_validate(options),
-            Services(db=db, fetcher=Mock()),
+def emitted(*keys: str, output: str = "out") -> AppletResult:
+    return AppletResult(
+        documents=tuple(
+            EmittedDocument(output, key, f"text {key}", "text/plain") for key in keys
         )
-        self.sent: list[str] = []
-
-    def run(self, **kwargs) -> RunSummary:
-        return self.deliver(key="artifacts", **kwargs)
-
-    def send(self, subject: Artifact) -> dict:
-        self.sent.append(subject.name)
-        return {"message_id": len(self.sent)}
+    )
 
 
-class SinkTestCase(unittest.TestCase):
+class LedgerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="newstool-test-"))
         self.db = Database(
             f"sqlite:///{self.tmp_dir}/data.db", self.tmp_dir / "content"
         )
-        self.now = datetime.now(UTC)
 
     def tearDown(self) -> None:
         self.db.close()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    def add(
-        self, source: SourceData, uid: str, hours_ago: float, summarized: bool = True
-    ) -> SourceItem:
-        item = SourceItem(
-            source=source,
-            uid=uid,
-            title=uid,
-            uri=f"https://{source.id}.test/{uid}",
-            content=uid.encode(),
-            mimetype="text/html",
-            published_at=self.now - timedelta(hours=hours_ago),
+    def emit(self, *keys: str, app: str = "a", sinks: tuple[str, ...] = ("chat",)):
+        return self.db.commit_app_run(app, NOW, emitted(*keys), {"out": sinks})
+
+    def statuses(self, sink: str = "chat") -> dict[str, str]:
+        return {
+            delivery.document_label.rsplit("/", 1)[1]: delivery.status
+            for delivery in self.db.find_deliveries(sink=sink)
+        }
+
+    def deliverer(self, sink: RecordingSink, **options) -> Deliverer:
+        return Deliverer(self.db, "chat", sink, SinkOptions(**options))
+
+
+class CommitTests(LedgerTestCase):
+    def test_stores_documents_their_deliveries_and_the_run(self) -> None:
+        stored = self.db.commit_app_run(
+            "a",
+            NOW,
+            AppletResult(state={"n": 1}, documents=emitted("k1").documents),
+            {"out": ("chat", "file")},
         )
-        self.db.upsert_source_items([item])
-        if summarized:
-            self.db.record_result(
-                item, "summarize", "summary", ProcessingStatus.DONE, value="S"
-            )
-        return item
 
-    def statuses(self, sink: str = "recorder") -> dict[str, str]:
-        return {item.uid: row.status for row, item in self.db.get_item_deliveries(sink)}
-
-
-class ItemSinkTests(SinkTestCase):
-    def test_delivers_summarized_items_of_the_lookback_window_once(self) -> None:
-        old = self.add(SOURCE_A, "old", hours_ago=30)
-        self.add(SOURCE_A, "new", hours_ago=2)
-        self.add(SOURCE_A, "bare", hours_ago=1, summarized=False)
-        sink = RecordingItemSink(self.db)
-
-        summary = sink.run()
-        sink.run()
-
-        self.assertEqual((summary.done, summary.failed), (1, 0))
-        self.assertEqual(sink.sent, ["new"])
-        ((row, item),) = self.db.get_item_deliveries("recorder")
-        self.assertEqual(row.status, DeliveryStatus.DONE)
-        self.assertEqual(row.external_ref, {"message_id": 1})
-        self.assertEqual(row.content_sha256, item.content_sha256)
-
-        sink.run(scope=ProcessingScope(item_ids=(old.id,)))
-        self.assertEqual(sink.sent, ["new", "old"])
-
-    def test_interval_paces_the_whole_entry_oldest_first(self) -> None:
-        self.add(SOURCE_B, "b1", hours_ago=3)
-        self.add(SOURCE_A, "a1", hours_ago=2)
-        sink = RecordingItemSink(self.db, interval="30m")
-
-        sink.run()
-        sink.run()  # the first delivery is not 30 minutes old yet
-
-        self.assertEqual(sink.sent, ["b1"])
-        ((row, _),) = self.db.get_item_deliveries("recorder", statuses=["done"])
-        row.updated_at = self.now - timedelta(minutes=31)
-        with self.db.session_scope() as sess:  # save_delivery would stamp it now
-            sess.get_one(DBDelivery, row.id).updated_at = row.updated_at
-        sink.run()
-        self.assertEqual(sink.sent, ["b1", "a1"])
-
-    def test_max_per_run_caps_every_run(self) -> None:
-        for number in range(3):
-            self.add(SOURCE_A, f"a{number}", hours_ago=3 - number)
-        sink = RecordingItemSink(self.db, max_per_run=2)
-
-        sink.run()
-        self.assertEqual(sink.sent, ["a0", "a1"])
-        sink.run()
-        self.assertEqual(sink.sent, ["a0", "a1", "a2"])
-
-    def test_options_are_validated(self) -> None:
-        with self.assertRaises(pydantic.ValidationError):
-            RecordingItemSink(self.db, max_per_run=0)
-        with self.assertRaises(pydantic.ValidationError):
-            RecordingItemSink(self.db, chat_id="x")
-
-    def test_a_failure_holds_back_its_source_until_it_is_due(self) -> None:
-        self.add(SOURCE_A, "a1", hours_ago=3)
-        self.add(SOURCE_A, "a2", hours_ago=2)
-        self.add(SOURCE_B, "b1", hours_ago=1)
-        sink = RecordingItemSink(self.db, failing={"a1"})
-
-        with self.assertLogs("newstool.sinks", "ERROR"):
-            summary = sink.run()
-        sink.run()  # a1 is in its backoff: nothing of source a moves
-
-        self.assertEqual((summary.done, summary.failed), (2, 1))
-        self.assertEqual(sink.sent, ["a2", "b1"])
-        self.assertEqual(self.statuses()["a1"], DeliveryStatus.ERROR)
-
-    def test_an_expected_failure_is_logged_without_traceback(self) -> None:
-        self.add(SOURCE_A, "a1", hours_ago=1)
-        sink = RecordingItemSink(self.db, failing={"a1"})
-        sink.send = Mock(side_effect=PluginFailure("a1 rejected"))
-
-        with self.assertLogs("newstool.sinks", "ERROR") as logs:
-            sink.run()
-
-        self.assertTrue(logs.records[0].getMessage().endswith(": a1 rejected"))
-        self.assertIsNone(logs.records[0].exc_info)
-        ((row, _),) = self.db.get_item_deliveries("recorder")
-        self.assertEqual(row.last_error, "a1 rejected")
-
-    def test_exhausted_rows_stay_failed_and_the_queue_moves_on(self) -> None:
-        self.add(SOURCE_A, "a1", hours_ago=3)
-        self.add(SOURCE_A, "a2", hours_ago=2)
-        sink = RecordingItemSink(self.db, failing={"a1", "a2"}, max_retries=1)
-
-        with self.assertLogs("newstool.sinks", "ERROR"):
-            sink.run()
-        sink.failing = set()
-        sink.run()
-
-        self.assertEqual(sink.sent, [])
+        (document,) = stored
         self.assertEqual(
-            self.statuses(), {"a1": DeliveryStatus.ERROR, "a2": DeliveryStatus.ERROR}
+            (document.app, document.output, document.key), ("a", "out", "k1")
+        )
+        self.assertEqual(
+            {d.sink: d.status for d in self.db.find_deliveries()},
+            {"chat": "queued", "file": "queued"},
+        )
+        run = self.db.get_app_run("a")
+        self.assertEqual((run.last_success, run.state), (NOW, {"n": 1}))
+
+    def test_a_key_emitted_again_is_ignored(self) -> None:
+        self.emit("k1")
+
+        stored = self.emit("k1", "k2")
+
+        self.assertEqual([d.key for d in stored], ["k2"])
+        self.assertEqual(len(self.db.find_deliveries()), 2)
+
+    def test_an_output_without_route_stores_its_documents_only(self) -> None:
+        self.emit("k1", sinks=())
+
+        self.assertEqual(len(self.db.find_documents()), 1)
+        self.assertEqual(self.db.find_deliveries(), [])
+
+    def test_a_failed_run_keeps_state_and_success(self) -> None:
+        self.db.commit_app_run("a", NOW, AppletResult(state="kept"), {})
+        later = NOW + timedelta(hours=1)
+        self.db.start_app_run("a", later)
+
+        self.db.fail_app_run("a", "boom")
+
+        run = self.db.get_app_run("a")
+        self.assertEqual(
+            (run.last_started, run.last_success, run.last_error, run.state),
+            (later, NOW, "boom", "kept"),
         )
 
-    def test_requeue_gives_failed_rows_fresh_attempts(self) -> None:
-        self.add(SOURCE_A, "a1", hours_ago=3)
-        sink = RecordingItemSink(self.db, failing={"a1"}, max_retries=1)
+    def test_reset_keeps_documents_unless_asked(self) -> None:
+        self.emit("k1")
+
+        self.assertEqual(self.db.reset_app("a"), 0)
+        self.assertEqual(self.db.get_app_run("a").last_success, None)
+        self.assertEqual(self.emit("k1"), [])  # still stored: ignored
+
+        self.assertEqual(self.db.reset_app("a", with_documents=True), 1)
+        self.assertEqual(self.db.find_deliveries(), [])
+        self.assertEqual([d.key for d in self.emit("k1")], ["k1"])
+
+
+class DelivererTests(LedgerTestCase):
+    def test_sends_queued_rows_oldest_first_once(self) -> None:
+        self.emit("k1")
+        self.emit("k2", "k3")
+        sink = RecordingSink()
+
+        summary = self.deliverer(sink).deliver(NOW)
+        again = self.deliverer(sink).deliver(NOW)
+
+        self.assertEqual(sink.sent, ["k1", "k2", "k3"])
+        self.assertEqual((summary.done, again.done), (3, 0))
+        (first, *_) = self.db.find_deliveries(sink="chat")
+        self.assertEqual(first.external_ref, {"message_id": 1})
+
+    def test_max_per_run_and_interval_pace_the_sink(self) -> None:
+        self.emit("k1", "k2", "k3")
+        sink = RecordingSink()
+
+        self.deliverer(sink, max_per_run=2).deliver(NOW)
+        self.assertEqual(sink.sent, ["k1", "k2"])
+
+        paced = self.deliverer(sink, interval="30m")
+        paced.deliver(datetime.now(UTC))
+        self.assertEqual(sink.sent, ["k1", "k2"])  # the last one was just now
+        paced.deliver(datetime.now(UTC) + timedelta(minutes=31))
+        self.assertEqual(sink.sent, ["k1", "k2", "k3"])
+
+    def test_two_applets_share_the_sink_pacing(self) -> None:
+        self.emit("k1", app="a")
+        self.emit("k2", app="b")
+        sink = RecordingSink()
+
+        self.deliverer(sink, interval="1h").deliver(NOW)
+
+        self.assertEqual(sink.sent, ["k1"])
+
+    def test_failures_retry_with_backoff_and_hold_nothing_back(self) -> None:
+        self.emit("bad", "good")
+        sink = RecordingSink(failing={"bad"})
+
         with self.assertLogs("newstool.sinks", "ERROR"):
-            sink.run()
-        sink.failing = set()
+            summary = self.deliverer(sink).deliver(NOW)
 
-        sink.run(requeue=True)
+        self.assertEqual((summary.done, summary.failed), (1, 1))
+        self.assertEqual(self.statuses(), {"bad": "error", "good": "done"})
+        (failed,) = self.db.find_deliveries(status=DeliveryStatus.ERROR)
+        self.assertEqual((failed.attempts, failed.last_error), (1, "bad rejected"))
 
-        self.assertEqual(sink.sent, ["a1"])
-        self.assertEqual(self.statuses(), {"a1": DeliveryStatus.DONE})
+        self.assertEqual(self.deliverer(sink).plan(datetime.now(UTC)), [])
+        later = datetime.now(UTC) + timedelta(hours=1)
+        self.assertEqual(len(self.deliverer(sink).plan(later)), 1)
+        self.assertEqual(self.deliverer(sink, max_retries=1).plan(later), [])
 
-    def test_interrupted_rows_are_never_retried(self) -> None:
-        self.add(SOURCE_A, "a1", hours_ago=3)
-        self.db.queue_item_deliveries("recorder", ProcessingScope())
-        ((row, _),) = self.db.get_item_deliveries("recorder")
-        row.status = DeliveryStatus.SENDING
-        self.db.save_delivery(row)
-        sink = RecordingItemSink(self.db)
+    def test_sending_rows_are_never_retried(self) -> None:
+        self.emit("k1")
+        (delivery,) = self.db.find_deliveries()
+        delivery.status = DeliveryStatus.SENDING
+        self.db.save_delivery(delivery)
 
-        with self.assertLogs("newstool.sinks", "WARNING") as logs:
-            sink.run()
+        with self.assertLogs("newstool.sinks", "WARNING"):
+            self.assertEqual(self.deliverer(RecordingSink()).plan(NOW), [])
 
-        self.assertEqual(sink.sent, [])
-        self.assertIn("delete deliveries --status sending", logs.output[0])
+    def test_send_rows_sends_whatever_the_state(self) -> None:
+        self.emit("k1")
+        sink = RecordingSink()
+        self.deliverer(sink).deliver(NOW)
 
-    def test_force_resends_the_selected_items_whatever_their_state(self) -> None:
-        item = self.add(SOURCE_A, "a1", hours_ago=3)
-        sink = RecordingItemSink(self.db)
-        sink.run()
+        rows = self.db.deliveries_of("chat")
+        summary = self.deliverer(sink).send_rows(rows)
 
-        with self.assertRaises(SelectionRequiredError):
-            sink.run(force=True)
-        sink.run(scope=ProcessingScope(item_ids=(item.id,)), force=True)
+        self.assertEqual((summary.done, sink.sent), (1, ["k1", "k1"]))
 
-        self.assertEqual(sink.sent, ["a1", "a1"])
-        ((row, _),) = self.db.get_item_deliveries("recorder")
-        self.assertEqual(row.external_ref, {"message_id": 2})
+    def test_rows_reach_the_sink_with_their_content(self) -> None:
+        self.emit("k1")
+        received: list[Document] = []
+        sink = Mock()
+        sink.send.side_effect = lambda document: received.append(document)
+
+        self.deliverer(sink).deliver(NOW)
+
+        self.assertEqual(received[0].content, "text k1")
+
+    def test_one_row_per_sink_and_document(self) -> None:
+        (document,) = self.emit("k1")
+
+        with self.assertRaises(IntegrityError):
+            self.db.add_deliveries(
+                [Delivery(sink="chat", document_id=document.id, status="queued")]
+            )
 
 
-class ArtifactSinkTests(SinkTestCase):
-    def test_delivers_new_artifacts_of_its_remixers_once(self) -> None:
-        self.db.save_artifact(Artifact("digest", "a/1", "# A", "text/markdown"))
-        self.db.save_artifact(Artifact("feedgenerator", "feed", "<rss/>", "text/xml"))
-        sink = RecordingArtifactSink(self.db)
+class AcceptsTests(unittest.TestCase):
+    def test_content_types_must_all_be_accepted(self) -> None:
+        self.assertTrue(accepts(telegram.TelegramSink, {"text/plain"}))
+        self.assertFalse(
+            accepts(googlechat.GoogleChatSink, {"text/plain", "application/json"})
+        )
+        self.assertTrue(accepts(filesink.FileSink, {"application/rss+xml"}))
 
-        sink.run()
-        self.db.save_artifact(Artifact("digest", "a/1", "# A again", "text/markdown"))
-        sink.run()
 
-        self.assertEqual(sink.sent, ["a/1"])
+class FileSinkTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="newstool-test-"))
 
-    def test_force_needs_and_sends_the_named_artifacts(self) -> None:
-        self.db.save_artifact(Artifact("digest", "a/1", "# A", "text/markdown"))
-        sink = RecordingArtifactSink(self.db, lookback=0)
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-        with self.assertRaises(SelectionRequiredError):
-            sink.run(force=True)
-        sink.run(artifacts=(("digest", "a/1"),), force=True)
+    def sink(self, path: str) -> filesink.FileSink:
+        options = filesink.FileOptions(path=path)
+        return filesink.FileSink(options, Services(db=Mock(), fetcher=Mock()))
 
-        self.assertEqual(sink.sent, ["a/1"])
+    def test_writes_and_replaces_the_file(self) -> None:
+        sink = self.sink(str(self.tmp_dir / "out" / "{app}-{output}.xml"))
+        document = Document("news", "feed", "k", "application/rss+xml", "<rss/>")
+
+        sink.send(document)
+        reference = sink.send(
+            Document("news", "feed", "j", "application/rss+xml", "<new/>")
+        )
+
+        target = self.tmp_dir / "out" / "news-feed.xml"
+        self.assertEqual(target.read_text(), "<new/>")
+        self.assertEqual(reference, {"path": str(target)})
+        self.assertEqual(
+            sorted(p.name for p in target.parent.iterdir()), ["news-feed.xml"]
+        )
+
+    def test_key_slashes_become_underscores(self) -> None:
+        sink = self.sink(str(self.tmp_dir / "{key}.md"))
+
+        sink.send(Document("d", "digest", "s/2026-10-01", "text/markdown", "# S"))
+
+        self.assertTrue((self.tmp_dir / "s_2026-10-01.md").exists())
+
+    def test_path_must_be_absolute_and_use_known_fields(self) -> None:
+        for path in ("relative.xml", "/x/{name}.xml"):
+            with self.subTest(path=path), self.assertRaises(pydantic.ValidationError):
+                filesink.FileOptions(path=path)
 
 
 if __name__ == "__main__":

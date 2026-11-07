@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from datetime import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -115,8 +116,14 @@ class ConfigTests(unittest.TestCase):
             Config.from_text(duplicated)
 
     def test_unknown_sections_are_rejected(self) -> None:
-        # `process`, `remix` and `deliver` were the default workflow's runs.
-        for section in ("pipelines: []\n", "process: []\n", "deliver: []\n"):
+        # `process`, `remix` and `deliver` were the default workflow's runs;
+        # `remixers` was replaced by `apps` (decision 0015).
+        for section in (
+            "pipelines: []\n",
+            "process: []\n",
+            "deliver: []\n",
+            "remixers: []\n",
+        ):
             with self.subTest(section=section), self.assertRaises(ConfigError):
                 Config.from_text(section)
 
@@ -169,10 +176,39 @@ class ConfigTests(unittest.TestCase):
             Config.from_text(
                 "processors:\n  - {processor: summarize, id: a}\n"
                 "  - {processor: tagger, id: a}\n"
-                "remixers:\n  - {remixer: digest, id: a}\n"
+                "apps:\n  - {app: digest, id: a}\n"
+            )
+        with self.assertRaisesRegex(ConfigError, "apps: id.s. d used twice"):
+            Config.from_text(
+                "apps:\n  - {app: digest, id: d}\n  - {app: feed, id: d}\n"
             )
         with self.assertRaisesRegex(ConfigError, "invalid id 'A b'"):
             Config.from_text("sinks:\n  - {sink: telegram, id: A b}\n")
+
+    def test_apps_and_sinks_need_an_id(self) -> None:
+        for section in ("apps:\n  - {app: feed}\n", "sinks:\n  - {sink: file}\n"):
+            with self.subTest(section=section), self.assertRaises(ConfigError):
+                Config.from_text(section)
+
+    def test_app_schedule_and_routes(self) -> None:
+        config = Config.from_text(
+            "apps:\n  - {id: weekly, app: digest, every: 1d, at: '07:30',"
+            " days: [mon, fri], routes: {digest: [tg]}}\n"
+        )
+
+        (entry,) = config.apps
+        self.assertEqual(entry.every, 86400)
+        self.assertEqual(entry.at, time(7, 30))
+        self.assertEqual(entry.days, ["mon", "fri"])
+        self.assertEqual(entry.routes, {"digest": ["tg"]})
+
+    def test_app_takes_sink_or_routes_and_known_weekdays(self) -> None:
+        for app in (
+            "{id: a, app: feed, sink: s, routes: {feed: [s]}}",
+            "{id: a, app: feed, days: [monday]}",
+        ):
+            with self.subTest(app=app), self.assertRaises(ConfigError):
+                Config.from_text(f"apps:\n  - {app}\n")
 
     def test_workflow_entries_are_references_or_entries_of_its_own(self) -> None:
         config = Config.from_text(
@@ -188,16 +224,23 @@ class ConfigTests(unittest.TestCase):
     def test_workflow_entries_have_no_id_nor_skip_default(self) -> None:
         for entry in (
             "{processor: summarize, id: s}",
-            "{remixer: digest, skip_default: true}",
+            "{processor: summarize, skip_default: true}",
         ):
-            section = "remix" if "remixer" in entry else "process"
             with (
                 self.subTest(entry=entry),
                 self.assertRaisesRegex(ConfigError, "only catalog entries do"),
             ):
                 Config.from_text(
                     SOURCE + f"workflows:\n  - name: w\n    sources: [plaza]\n"
-                    f"    {section}: [{entry}]\n"
+                    f"    process: [{entry}]\n"
+                )
+
+    def test_workflows_have_no_remix_nor_deliver(self) -> None:
+        for section in ("remix", "deliver"):
+            with self.subTest(section=section), self.assertRaises(ConfigError):
+                Config.from_text(
+                    SOURCE + "workflows:\n  - name: w\n    sources: [plaza]\n"
+                    f"    {section}: [feed]\n"
                 )
 
     def test_default_workflow_has_the_sources_without_skip_default(self) -> None:
@@ -208,7 +251,7 @@ class ConfigTests(unittest.TestCase):
 
         (default,) = config.all_workflows()
         self.assertEqual((default.name, default.sources), ("default", ["plaza"]))
-        self.assertEqual((default.process, default.deliver), ([], []))
+        self.assertEqual(default.process, [])
 
     def test_unconfigured_source_has_clear_error(self) -> None:
         with self.assertRaisesRegex(ConfigError, "source 'missing' is not configured"):

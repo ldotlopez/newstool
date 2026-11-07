@@ -11,21 +11,21 @@ import requests
 from click.testing import CliRunner
 from foundation.storage import EntryNotFoundError
 
-from newstool.app import MarkSummary
+from newstool.app import AppReport, DeleteSummary, MarkSummary
 from newstool.cli import cli
 from newstool.config import ConfigError
 from newstool.db import DeliveryStatus
 from newstool.errors import PluginFailure
 from newstool.models import (
     Annotation,
-    Artifact,
     Delivery,
+    Document,
+    DocumentFilter,
     ProcessingScope,
     SourceData,
     SourceItem,
 )
 from newstool.processors import RunSummary
-from newstool.sinks import SubjectKindError
 
 SOURCE = SourceData(
     id="plaza", name="Plaza", url="https://plaza.test/", provider="plaza"
@@ -46,14 +46,14 @@ class ExternalErrorTests(unittest.TestCase):
         self.addCleanup(logger.setLevel, logger.level)
         logger.setLevel(logging.WARNING)
 
-    def remix_failing_with(self, error: Exception):
+    def process_failing_with(self, error: Exception):
         app = Mock()
-        app.remix_keys.return_value = ["digest"]
-        app.run_remix.side_effect = error
-        return invoke(app, "remix")
+        app.process_keys.return_value = ["summary"]
+        app.run_process.side_effect = error
+        return invoke(app, "process")
 
     def test_external_failure_is_a_message_without_traceback(self) -> None:
-        result = self.remix_failing_with(requests.ConnectionError("llm down"))
+        result = self.process_failing_with(requests.ConnectionError("llm down"))
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("Error: ConnectionError: llm down", result.output)
@@ -62,19 +62,19 @@ class ExternalErrorTests(unittest.TestCase):
     def test_external_failure_keeps_its_traceback_with_debug(self) -> None:
         logging.getLogger("newstool").setLevel(logging.DEBUG)
 
-        result = self.remix_failing_with(requests.ConnectionError("llm down"))
+        result = self.process_failing_with(requests.ConnectionError("llm down"))
 
         self.assertIsInstance(result.exception, requests.ConnectionError)
 
     def test_plugin_failure_is_a_message_without_traceback(self) -> None:
-        result = self.remix_failing_with(PluginFailure("empty digest"))
+        result = self.process_failing_with(PluginFailure("empty digest"))
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("Error: empty digest", result.output)
         self.assertIsInstance(result.exception, SystemExit)
 
     def test_other_failures_keep_their_traceback(self) -> None:
-        result = self.remix_failing_with(ValueError("bug?"))
+        result = self.process_failing_with(ValueError("bug?"))
 
         self.assertIsInstance(result.exception, ValueError)
 
@@ -138,70 +138,125 @@ class CommandTests(unittest.TestCase):
         )
         self.assertIn("markdown", result.output)
 
-    def test_remix_runs_one_or_every_remixer(self) -> None:
+    def test_apps_run_runs_every_instance_then_delivers(self) -> None:
         app = Mock()
-        app.remix_keys.return_value = ["feedgenerator", "digest"]
-        app.run_remix.return_value = ["feed"]
+        app.app_ids = ["news", "digest"]
+        app.sink_ids = ["site"]
+        app.run_app.side_effect = lambda app_id, now, **kwargs: AppReport(
+            app_id, due=app_id == "news", new=(("feed", "k"),)
+        )
+        app.deliver.return_value = RunSummary(done=1)
+        app.unconfigured_pending.return_value = {}
 
-        self.assertEqual(invoke(app, "remix", "feedgenerator").exit_code, 0)
-        self.assertEqual(invoke(app, "remix").exit_code, 0)
+        result = invoke(app, "apps", "run", "--force")
 
+        self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
-            app.run_remix.call_args_list,
+            [(c.args[0], c.kwargs) for c in app.run_app.call_args_list],
             [
-                call("feedgenerator", scope=ProcessingScope()),
-                call("feedgenerator", scope=ProcessingScope()),
-                call("digest", scope=ProcessingScope()),
+                ("news", {"force": True, "dry_run": False}),
+                ("digest", {"force": True, "dry_run": False}),
             ],
         )
+        app.deliver.assert_called_once()
+        self.assertIn("news\tyes\t1\t0", result.stdout)
+        self.assertIn("digest\tno\t-\t-", result.stdout)
+        self.assertIn("site\t1\t0", result.stdout)
+
+    def test_apps_run_dry_run_shows_documents_and_delivers_nothing(self) -> None:
+        app = Mock()
+        app.run_app.return_value = AppReport(
+            "news",
+            due=True,
+            new=(("feed", "k1"),),
+            ignored=(("feed", "k0"),),
+            state={"cursor": "c"},
+        )
+
+        result = invoke(app, "apps", "run", "--app", "news", "--dry-run")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.app_instance.assert_called_once_with("news")
+        self.assertEqual(app.run_app.call_args.kwargs["dry_run"], True)
+        app.deliver.assert_not_called()
+        self.assertIn("news\tfeed\tk1\tnew", result.stdout)
+        self.assertIn("news\tfeed\tk0\talready stored", result.stdout)
+        self.assertIn('news\t{"cursor": "c"}', result.stdout)
+
+    def test_apps_run_exits_with_error_when_an_applet_failed(self) -> None:
+        app = Mock()
+        app.app_ids = ["news"]
+        app.sink_ids = []
+        app.run_app.return_value = AppReport("news", due=True, error="broken")
+        app.unconfigured_pending.return_value = {}
+
+        result = invoke(app, "apps", "run")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("1 failure(s)", result.output)
+
+    def test_apps_reset(self) -> None:
+        app = Mock()
+        app.reset_app.return_value = 3
+
+        result = invoke(app, "apps", "reset", "news", "--with-documents")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.reset_app.assert_called_once_with(
+            "news", with_documents=True, dry_run=False
+        )
+        self.assertIn("Reset news; 3 document(s) deleted", result.output)
+
+    def test_deliver_sends_for_the_named_sinks(self) -> None:
+        app = Mock()
+        app.deliver.return_value = RunSummary(done=2, failed=1)
+        app.unconfigured_pending.return_value = {"gone": 4}
+
+        with self.assertLogs("newstool", "WARNING") as logs:
+            result = invoke(app, "deliver", "--sink", "chat")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(app.deliver.call_args.args[0], "chat")
+        self.assertIn("1 delivery(ies) failed", result.output)
+        self.assertIn("gone: not configured, 4 pending", logs.output[0])
 
     def test_writing_commands_take_the_write_lock(self) -> None:
         app = Mock()
-        app.remix_keys.return_value = []
+        app.process_keys.return_value = []
 
         with patch("newstool.cli.Application", return_value=app):
-            result = CliRunner().invoke(cli, ["remix"])
+            result = CliRunner().invoke(cli, ["process"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.lock.assert_called_once_with()
 
     def test_run_goes_on_after_a_failed_phase_and_exits_with_error(self) -> None:
         app = Mock()
-        app.sources.return_value = []
-        app.process_keys.return_value = ["summary"]
-        app.run_process.side_effect = RuntimeError("llm down")
-        app.remix_keys.return_value = ["feedgenerator"]
-        app.run_remix.return_value = ["feed"]
-        app.delivery_keys.return_value = ["telegram"]
-        app.run_delivery.return_value = RunSummary(done=1)
+        app.sources.return_value = [SOURCE]
+        app.import_source.return_value = []
+        app.process_keys.side_effect = RuntimeError("llm down")
 
         with self.assertLogs("newstool", "ERROR"):
             result = invoke(app, "run")
 
         self.assertEqual(result.exit_code, 1)
-        app.run_remix.assert_called_once_with("feedgenerator")
-        app.run_delivery.assert_called_once_with("telegram", workflow="default")
         self.assertIn("1 failure(s)", result.output)
         # Summaries are results: stdout only, after the progress rows.
-        self.assertIn("Remix", result.stdout)
-        self.assertIn("Deliver", result.stdout)
-        self.assertNotIn("Remix", result.stderr)
+        self.assertIn("Import", result.stdout)
+        self.assertNotIn("Import", result.stderr)
 
     def test_run_runs_the_named_workflow(self) -> None:
         app = Mock()
         app.sources.return_value = [SOURCE]
         app.import_source.return_value = []
         app.process_keys.return_value = []
-        app.remix_keys.return_value = []
-        app.delivery_keys.return_value = []
 
         result = invoke(app, "run", "--workflow", "juntas")
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.sources.assert_called_once_with("juntas")
         app.process_keys.assert_called_once_with(workflow="juntas")
-        app.remix_keys.assert_called_once_with("juntas")
-        app.delivery_keys.assert_called_once_with("juntas")
+        app.run_app.assert_not_called()
 
     def test_user_errors_are_reported_without_traceback(self) -> None:
         app = Mock()
@@ -262,11 +317,11 @@ class LogLevelTests(unittest.TestCase):
         config_path = self.config_dir / "config.yaml"
         config_path.write_text(config)
         app = Mock()
-        app.remix_keys.return_value = []
+        app.process_keys.return_value = []
         with patch("newstool.cli.Application", return_value=app):
             result = CliRunner().invoke(
                 cli,
-                ["-c", str(config_path), *args, "remix"],
+                ["-c", str(config_path), *args, "process"],
                 env={"NEWSTOOL_LOG_LEVEL": env},
             )
         self.assertEqual(result.exit_code, 0, result.output)
@@ -445,96 +500,100 @@ class InspectCommandTests(unittest.TestCase):
             ],
         )
 
-    def test_artifacts_lists_metadata(self) -> None:
+    def test_documents_lists_metadata(self) -> None:
         app = Mock()
-        app.list_artifacts.return_value = [
-            Artifact(
-                "feedgenerator", "feed", None, "application/rss+xml", updated_at=NOW
-            )
+        app.find_documents.return_value = [
+            Document("news", "feed", "k1", "application/rss+xml", emitted_at=NOW, id=3)
         ]
 
-        result = invoke(app, "inspect", "artifacts", "--remixer", "feedgenerator")
+        result = invoke(app, "inspect", "documents", "--app", "news")
 
         self.assertEqual(result.exit_code, 0, result.output)
-        app.list_artifacts.assert_called_once_with(
-            "feedgenerator", names=None, limit=None, sort="updated"
+        app.find_documents.assert_called_once_with(
+            DocumentFilter(app="news"), sort="emitted", with_content=False
         )
-        self.assertIn("feedgenerator/feed", result.output)
-        self.assertIn("application/rss+xml", result.output)
-        app.get_artifact.assert_not_called()
+        self.assertIn("3\tnews\tfeed\tk1\tapplication/rss+xml", result.output)
 
-    def test_one_artifact_prints_content_to_stdout_and_metadata_to_stderr(
+    def test_one_document_prints_content_to_stdout_and_metadata_to_stderr(
         self,
     ) -> None:
         app = Mock()
-        listed = Artifact("digest", "a/2026-10-01_2026-10-08", None, "text/markdown")
-        app.list_artifacts.return_value = [listed]
-        app.get_artifact.return_value = Artifact(
-            "digest", listed.name, "# Week", "text/markdown", updated_at=NOW
-        )
+        app.find_documents.return_value = [
+            Document(
+                "weekly",
+                "digest",
+                "a/2026-10-01_2026-10-08",
+                "text/markdown",
+                "# Week",
+                emitted_at=NOW,
+                id=4,
+            )
+        ]
 
-        result = invoke(
-            app, "inspect", "artifacts", "--artifact", "digest/a/2026-10-01_2026-10-08"
-        )
+        result = invoke(app, "inspect", "documents", "--document", "4")
 
         self.assertEqual(result.exit_code, 0, result.output)
-        app.list_artifacts.assert_called_once_with(
-            None,
-            names=(("digest", "a/2026-10-01_2026-10-08"),),
-            limit=None,
-            sort="updated",
-        )
+        self.assertTrue(app.find_documents.call_args.kwargs["with_content"])
         self.assertEqual(result.stdout, "# Week")
-        self.assertIn("digest/a/2026-10-01_2026-10-08 · text/markdown", result.stderr)
+        self.assertIn(
+            "4 · weekly/digest/a/2026-10-01_2026-10-08 · text/markdown", result.stderr
+        )
 
-    def test_missing_artifact_is_an_error(self) -> None:
+    def test_missing_document_is_an_error(self) -> None:
         app = Mock()
-        app.list_artifacts.return_value = []
+        app.find_documents.return_value = []
 
-        result = invoke(app, "inspect", "artifacts", "--artifact", "feedgenerator/nope")
+        result = invoke(app, "inspect", "documents", "--document", "9")
 
         self.assertEqual(result.exit_code, 1)
-        self.assertIn("no artifact feedgenerator/nope in the selection", result.output)
+        self.assertIn("no document 9 in the selection", result.output)
 
-    def test_deliveries_show_their_subject_and_state(self) -> None:
+    def test_delete_documents_reports_the_refused(self) -> None:
+        app = Mock()
+        app.find_documents.return_value = [
+            Document("news", "feed", "k", "text/plain", id=1),
+            Document("news", "feed", "j", "text/plain", id=2),
+        ]
+        app.delete_documents.return_value = DeleteSummary(deleted=1, refused=[2])
+
+        result = invoke(app, "delete", "documents", "--app", "news")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Refused document 2", result.stderr)
+        self.assertIn("Deleted 1 document(s)", result.stdout)
+        self.assertEqual(invoke(Mock(), "delete", "documents").exit_code, 2)
+
+    def test_deliveries_show_their_document_and_state(self) -> None:
         app = Mock()
         app.find_deliveries.return_value = [
             Delivery(
-                "telegram",
+                "chat",
+                3,
                 "error",
-                item_id=7,
                 attempts=2,
                 updated_at=NOW,
                 last_error="chat not found",
-            ),
-            Delivery(
-                "telegram_artifacts",
-                "done",
-                artifact_id=1,
-                updated_at=NOW,
-                artifact_name="digest/a/1",
+                document_label="items/items/item:a/1",
             ),
         ]
 
         result = invoke(
-            app, "inspect", "deliveries", "--sink", "telegram", "--status", "error"
+            app, "inspect", "deliveries", "--sink", "chat", "--status", "error"
         )
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.find_deliveries.assert_called_once_with(
-            ProcessingScope(),
-            workflow=None,
-            sink="telegram",
+            DocumentFilter(),
+            sink="chat",
             status=DeliveryStatus.ERROR,
-            artifact_names=None,
             delivery_ids=None,
+            limit=None,
             sort="updated",
         )
-        self.assertIn("item 7", result.output)
-        self.assertIn("digest/a/1", result.output)
+        self.assertIn("3 items/items/item:a/1", result.output)
         self.assertIn("chat not", result.output)
 
-    def test_set_status_with_a_sink_marks_the_selected_subjects(self) -> None:
+    def test_set_status_with_a_sink_marks_the_selected_documents(self) -> None:
         app = Mock()
         app.mark_deliveries.return_value = MarkSummary(created=3, kept=2)
 
@@ -542,40 +601,36 @@ class InspectCommandTests(unittest.TestCase):
             app,
             "deliveries",
             "set-status",
-            "-w",
-            "channel",
             "--sink",
-            "telegram",
-            "--source",
-            "plaza",
+            "chat",
+            "--app",
+            "items",
             "--as",
             "done",
         )
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.mark_deliveries.assert_called_once_with(
-            "telegram",
+            "chat",
             DeliveryStatus.DONE,
-            ProcessingScope(source="plaza"),
-            (),
-            workflow="channel",
+            DocumentFilter(app="items"),
             overwrite=False,
             dry_run=False,
         )
         self.assertIn("Marked 3 delivery(ies) as done: 3 new, 0 changed", result.stdout)
         self.assertIn("Left 2 existing delivery(ies)", result.stderr)
 
-    def test_set_status_all_with_a_sink_marks_every_subject(self) -> None:
+    def test_set_status_all_with_a_sink_marks_every_routed_document(self) -> None:
         app = Mock()
         app.mark_deliveries.return_value = MarkSummary(created=1)
 
-        args = ("deliveries", "set-status", "-w", "channel", "--sink", "telegram")
+        args = ("deliveries", "set-status", "--sink", "chat")
         result = invoke(app, *args, "--all", "--as", "queued", "--dry-run")
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
             app.mark_deliveries.call_args.kwargs,
-            {"workflow": "channel", "overwrite": False, "dry_run": True},
+            {"overwrite": False, "dry_run": True},
         )
         self.assertIn("Would mark 1 delivery(ies)", result.stdout)
 
@@ -583,44 +638,38 @@ class InspectCommandTests(unittest.TestCase):
         app = Mock()
         app.find_deliveries.return_value = []
         app.set_delivery_status.return_value = 0
-        args = ("deliveries", "set-status", "-w", "channel", "--sink", "telegram")
+        args = ("deliveries", "set-status", "--sink", "chat")
 
         result = invoke(app, *args, "--status", "error", "--as", "queued")
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.mark_deliveries.assert_not_called()
-        self.assertEqual(app.find_deliveries.call_args.kwargs["workflow"], "channel")
+        self.assertEqual(app.find_deliveries.call_args.kwargs["sink"], "chat")
 
     def test_set_status_usage_errors(self) -> None:
         app = Mock()
         set_status = ("deliveries", "set-status", "--as", "done")
         for args in (
-            ("--sink", "telegram", "--all"),  # no -w
-            ("-w", "channel", "--overwrite", "--item", "1"),  # no --sink
-            ("-w", "channel", "--sink", "t", "--overwrite", "--delivery", "1"),
-            ("-w", "channel", "--sink", "t", "--all", "--item", "1"),
-            ("-w", "channel"),  # no selection
+            ("--overwrite", "--document", "1"),  # no --sink
+            ("--sink", "t", "--overwrite", "--delivery", "1"),
+            ("--sink", "t", "--all", "--document", "1"),
+            (),  # no selection
         ):
             with self.subTest(args=args):
                 self.assertEqual(invoke(app, *set_status, *args).exit_code, 2)
         app.mark_deliveries.assert_not_called()
         app.set_delivery_status.assert_not_called()
 
-    def test_a_kind_mismatch_is_a_message(self) -> None:
+    def test_send_needs_a_selection_and_exits_with_error_on_failure(self) -> None:
         app = Mock()
-        app.mark_deliveries.side_effect = SubjectKindError("not --artifact")
-        args = ("deliveries", "set-status", "-w", "c", "--sink", "telegram")
+        app.find_deliveries.return_value = [Delivery("chat", 3, "done", id=5)]
+        app.send_deliveries.return_value = {"chat": RunSummary(failed=1)}
 
-        result = invoke(app, *args, "--artifact", "digest/a", "--as", "done")
+        self.assertEqual(invoke(app, "deliveries", "send").exit_code, 2)
+        result = invoke(app, "deliveries", "send", "--delivery", "5")
 
         self.assertEqual(result.exit_code, 1)
-        self.assertIn("not --artifact", result.output)
-
-    def test_malformed_artifact_id_is_a_usage_error(self) -> None:
-        result = invoke(Mock(), "inspect", "artifacts", "--artifact", "feedgenerator")
-
-        self.assertEqual(result.exit_code, 2)
-        self.assertIn("'feedgenerator' is not <remixer>/<name>", result.output)
+        app.send_deliveries.assert_called_once_with(app.find_deliveries.return_value)
 
 
 if __name__ == "__main__":

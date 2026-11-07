@@ -1,6 +1,6 @@
 # 0014: Ledger rows by subject and the workflow in delivery commands
 
-- **Status:** accepted
+- **Status:** superseded by 0015
 - **Date:** 2026-10-30
 - **Revises:** 0012 (`set-status` only changes existing rows, `--sink`
   takes the ledger key, a subject without a row is delivered only by `run`)

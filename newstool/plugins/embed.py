@@ -1,5 +1,5 @@
 """Embeds the item's tags or markdown with an LLM, for the `embeddings`
-grouping remixer."""
+grouping applet."""
 
 from typing import Literal
 

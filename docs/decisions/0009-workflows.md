@@ -8,7 +8,9 @@
   and delivers nothing; entries are catalog references or the workflow's
   own; `default: false` is `skip_default: true`; every ledger key is
   `<workflow>/<key>`; other options for a process key on shared sources
-  are a warning, other processor types an error)
+  are a warning, other processor types an error); 2026-11-06, by 0015
+  (workflows keep only `sources` and `process`; `remix` and `deliver`
+  entries and ledger keys are removed)
 
 ## Context
 

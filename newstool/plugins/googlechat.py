@@ -1,9 +1,9 @@
-"""The `googlechat` sink posts summarized items (title, the `summary` option's
-annotation, link and image, see `WebhookOptions`) as a card to a
-Google Chat space through an incoming webhook, given either as its `url` or
-as its `channel` (space id) and `token`, in the `plugins` section (the
-default) or in each use. What was delivered is in the ledger
-(`inspect deliveries`), so nothing is ever posted twice unless forced.
+"""The `googlechat` sink posts the documents routed to it (title, text, link
+and image, see `WebhookOptions`) as a card to a Google Chat space through an
+incoming webhook, given either as its `url` or as its `channel` (space id)
+and `token`, in the `plugins` section (the default) or in each instance.
+What was delivered is in the ledger (`inspect deliveries`), so nothing is
+ever posted twice unless forced.
 """
 
 import html
@@ -16,9 +16,9 @@ import requests
 from pydantic import SecretStr
 
 from ..errors import PluginFailure
-from ..models import SourceItem
-from ..sinks import BaseItemSink, DeliveryOptions, SinkType
-from . import PluginTypes
+from ..models import Document
+from ..sinks import SinkOptions, SinkType
+from . import PluginTypes, Services
 
 # The API key Google puts in every incoming webhook URL; only the token is secret.
 WEBHOOK_KEY = "AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI"
@@ -47,45 +47,44 @@ def chat_image_url(image_url: str) -> str:
 
 
 def build_card(
-    title: str,
-    summary: str,
-    uri: str,
+    title: str | None,
+    text: str,
+    uri: str | None,
     link_text: str = "original article",
     image_url: str | None = None,
 ) -> dict[str, Any]:
-    """The message: title and summary, the image if any, and a link button."""
+    """The message: title (if any) and text, the image if any, and a link
+    button if there is a link."""
     # The paragraph is Chat's HTML subset, so the text must escape `<>&`.
-    text = html.escape(summary, quote=False).replace("\n", "<br>")
-    widgets: list[dict[str, Any]] = [
-        {
-            "textParagraph": {
-                "text": f"<b>{html.escape(title, quote=False)}</b><br><br>{text}"
-            }
-        }
-    ]
+    body = html.escape(text, quote=False).replace("\n", "<br>")
+    if title:
+        body = f"<b>{html.escape(title, quote=False)}</b><br><br>{body}"
+    widgets: list[dict[str, Any]] = [{"textParagraph": {"text": body}}]
     if image_url is not None:
         widgets.append(
-            {"image": {"imageUrl": chat_image_url(image_url), "altText": title}}
+            {"image": {"imageUrl": chat_image_url(image_url), "altText": title or ""}}
         )
-    widgets.append(
-        {
-            "buttonList": {
-                "buttons": [{"text": link_text, "onClick": {"openLink": {"url": uri}}}]
+    if uri:
+        widgets.append(
+            {
+                "buttonList": {
+                    "buttons": [
+                        {"text": link_text, "onClick": {"openLink": {"url": uri}}}
+                    ]
+                }
             }
-        }
-    )
+        )
     return {
         "cardsV2": [{"cardId": "item", "card": {"sections": [{"widgets": widgets}]}}]
     }
 
 
-class WebhookOptions(DeliveryOptions):
+class WebhookOptions(SinkOptions):
     url: SecretStr | None = None
     channel: str | None = None
     token: SecretStr | None = None
-    item_image: bool = True  # the item's image, when it has one, in the card
-    item_url_text: str = "original article"
-    summary: str = "summary"  # the annotation key posted as the summary
+    images: bool = True  # the document's image, when it has one, in the card
+    link_text: str = "original article"
 
     @pydantic.model_validator(mode="after")
     def url_or_channel_and_token(self) -> Self:
@@ -106,24 +105,24 @@ class WebhookOptions(DeliveryOptions):
         )
 
 
-class GoogleChatSink(BaseItemSink[WebhookOptions]):
+class GoogleChatSink:
     name = "googlechat"
     options_model = WebhookOptions
+    accepts = frozenset({"text/plain", "text/markdown"})
 
-    @classmethod
-    def required_key(cls, options: WebhookOptions) -> str:
-        return options.summary
+    def __init__(self, options: WebhookOptions, services: Services) -> None:
+        self.options = options
 
-    def send(self, subject: SourceItem) -> dict[str, str]:
+    def send(self, document: Document) -> dict[str, str]:
         options = self.options
-        image = subject.data.get("image")
-        if not (options.item_image and isinstance(image, str) and image.strip()):
+        image = document.image_url
+        if not (options.images and image and image.strip()):
             image = None
         message = build_card(
-            subject.title,
-            str(self.require_annotation(subject, options.summary)),
-            subject.uri,
-            options.item_url_text,
+            document.title,
+            document.content or "",
+            document.url,
+            options.link_text,
             image,
         )
         try:

@@ -1,6 +1,6 @@
 # 0007: Sinks and the delivery ledger
 
-- **Status:** accepted
+- **Status:** superseded by 0015
 - **Date:** 2026-10-20
 - **Supersedes:** 0005
 - **Amends:** 0003 (a fourth plugin type and phase)

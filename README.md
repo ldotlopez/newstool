@@ -5,23 +5,26 @@ from them: markdown copies, LLM summaries and tags, event groupings, RSS
 feeds and digests, and Telegram posts. It was written for local news (Castelló), but any
 site can be added with a provider.
 
-It works in four phases:
+It works in two stages:
 
-1. **import**: each configured **source** (a website) is fetched with its
-   **provider**, and every article becomes an **item**. Re-importing an
-   unchanged article does nothing; a changed one is updated in place.
-2. **process**: **processors** add **annotations** to each item (its markdown,
-   a summary, tags, the Telegram message it was posted as...).
-3. **remix**: **remixers** combine many items into **artifacts** (an RSS feed,
-   a list of events...).
-4. **deliver**: **sinks** send items or artifacts to the outside world (a
-   Telegram chat...) and record each **delivery**, so nothing is sent twice.
+1. **Workflows** import and process:
+   - **import**: each configured **source** (a website) is fetched with its
+     **provider**, and every article becomes an **item**. Re-importing an
+     unchanged article does nothing; a changed one is updated in place.
+   - **process**: **processors** add **annotations** to each item (its
+     markdown, a summary, tags...).
+2. **Applets** build and deliver: each configured **applet instance** runs
+   when it is due (every hour, Mondays at 7:00...), reads what is stored,
+   and emits **documents** (an RSS feed, a weekly digest, a message per new
+   summarized item...). Each output of an instance is routed to **sinks**,
+   which send its documents to the outside world (a Telegram chat, a file a
+   web server serves...) and record each **delivery**, so nothing is sent
+   twice.
 
-Providers, processors, remixers and sinks come from **plugins**, which are
-enabled in the configuration. A **workflow** says which sources to use and
-what to process, remix and deliver from them; the configuration's root keys
-are the `default` workflow, and `workflows` adds more (e.g. one source posted
-to its own Telegram chat).
+Providers, processors, applets and sinks come from **plugins**. A
+**workflow** says which sources to import and what to process on them; the
+configuration's root keys are the `default` workflow, and `workflows` adds
+more. Applets and sinks belong to no workflow.
 
 ## Requirements
 
@@ -56,8 +59,6 @@ plugins:                             # defaults of each type's options
     model: gemma4:12b
   telegram:
     bot_token: ${TELEGRAM_BOT_TOKEN}
-  feedgenerator:
-    title: Castelló news
 
 llms:                                # the first serves those that name none
   - ollama
@@ -73,16 +74,13 @@ processors:                          # the `default` workflow runs them in order
   - summarize
   - tagger
 
-remixers:
-  - feedgenerator
+sinks:                               # where documents go
+  - {id: main-chat, sink: telegram, options: {chat_id: "${TELEGRAM_CHAT_ID}", interval: 30m}}
+  - {id: site, sink: file, options: {path: "/srv/www/{app}.xml"}}
 
-sinks:                               # delivered by workflows only
-  - {sink: telegram, id: main-chat, options: {chat_id: "${TELEGRAM_CHAT_ID}"}}
-
-workflows:
-  - name: channel
-    sources: [castellonplaza]
-    deliver: [main-chat]
+apps:                                # run by `apps run`, when due
+  - {id: items, app: itemfeed, sink: main-chat}
+  - {id: headlines, app: feed, every: 1h, options: {title: Castelló news}, sink: site}
 ```
 
 A source's `id` identifies its items: its `url` and `provider` can change
@@ -122,19 +120,19 @@ TELEGRAM_CHAT_ID=...
 
 ### Plugin types and the catalog
 
-Plugins provide **types**: providers, processors, remixers, sinks and LLMs,
+Plugins provide **types**: providers, processors, applets, sinks and LLMs,
 each with a name (listed below). `plugins.<type>` holds the defaults of a
 type's options for every use of it; the missing ones take the defaults
 listed below, and unknown or invalid ones are rejected with their path
 (`plugins.summarize.max_retries: ...`). A section builds nothing.
 
-The **catalog** lists the uses: `llms`, `sources`, `processors`,
-`remixers` and `sinks`. An entry is a type name, or a type with `id`, `key`
-and `options`. Its options override its type's section, merged key by key
-in nested mappings (any other value, lists included, replaces). `id` names
-the entry so workflows can refer to it, and cannot be a type's name.
-Everything in the catalog is checked at start-up, whether a workflow runs
-it or not; an object is built only when a run needs it.
+The **catalog** lists the uses: `llms`, `sources` and `processors`. An
+entry is a type name, or a type with `id`, `key` and `options`. Its options
+override its type's section, merged key by key in nested mappings (any
+other value, lists included, replaces). `id` names the entry so workflows
+can refer to it, and cannot be a type's name. Everything configured is
+checked at start-up, whether it runs or not; an object is built only when
+a run needs it.
 
 Every processor run writes one annotation **key**, the processor's own
 unless the entry names another with `key` (lowercase words, optionally in
@@ -158,38 +156,66 @@ An entry that gives its type an option it does not take fails every command
 at start-up with the option's path
 (`processors.1.options.temperature: Extra inputs are not permitted`).
 
-Remixer and sink entries work the same way. A remix run saves its
-artifacts under its key (default: the remixer's name), so a remixer can run
-twice with different options; a remix key belongs to one workflow. A
-delivery records what it sent under its key (default: the sink's name),
-unique within its workflow, so a sink can post to several places:
+### Applets and sinks
+
+`apps` and `sinks` list **instances**, each with a required `id`, its type
+(`app:` or `sink:`) and `options` over the type's section. They belong to
+no workflow.
+
+A **sink instance** is a destination with its own pacing: where to deliver
+(a chat, a webhook, a file) and how fast (`interval`, `max_per_run`). Two
+instances of one type can post to different places.
+
+An **applet instance** decides when it runs and what it emits:
+
+- **When:** `every` (a duration after its last successful run), `at`
+  (`"HH:MM"`, local time: once a day from then) and `days` (weekdays,
+  `[mon, fri]`). They combine; without any, it runs on every `apps run`.
+  `days` is not `on`, which YAML reads as `true`.
+- **What it reads:** its options say which sources (`sources`, default
+  every source) and what else; an applet keeps a state of its own between
+  runs (a cursor, the last period it covered), so it can emit only what is
+  new.
+- **Where it goes:** each applet has named **outputs**; `routes` sends each
+  to sink instances, and `sink` is the shorthand for an applet with one
+  output. An output without a route keeps its documents for other applets
+  to read.
 
 ```yaml
-remixers:
-  - feedgenerator                    # artifacts `feedgenerator/...`
-  - remixer: feedgenerator           # artifacts `short/...`
-    key: short
-    options: {title: Headlines, max_items: 10}
-
 sinks:
-  - {sink: telegram, id: main-chat}  # the section's chat_id
-  - sink: telegram
-    id: politics
-    key: telegram-politics
-    options: {chat_id: "-1001234", interval: 30m, max_per_run: 1}
-  - sink: telegram_artifacts
-    id: digests
-    options: {artifacts: [digest]}
+  - {id: chat, sink: telegram, options: {chat_id: "-1001234", interval: 30m}}
+  - {id: politics, sink: telegram, options: {chat_id: "-1009876", max_per_run: 1}}
+  - {id: site, sink: file, options: {path: "/srv/www/{app}.xml"}}
+
+apps:
+  - id: items                        # each new summarized item, once
+    app: itemfeed
+    sink: chat
+  - id: politics-es
+    app: itemfeed
+    options: {sources: [juntas], annotation: summary/es}
+    sink: politics
+  - id: weekly                       # Mondays at 7:00
+    app: digest
+    at: "07:00"
+    days: [mon]
+    routes: {digest: [chat]}
+  - {id: headlines, app: feed, every: 1h, options: {max_items: 10}, sink: site}
 ```
+
+At start-up, a route to an unknown output or sink, or to a sink that does
+not accept the output's content (an RSS feed to Telegram), is an error, and
+so is an applet that reads an unknown source or an annotation no process
+run writes on its sources.
 
 ### Workflows
 
-The `default` workflow uses every source and runs every catalog processor
-and remixer, in order, except those with `skip_default: true`; it delivers
-nothing. `workflows` lists more, each with the ids of its sources and its
-runs: a catalog `id`, a type name (the type with its section's options) or
-an entry of its own, without `id`. A reference runs the entry as it is; to
-change an option, write an entry of the workflow's own.
+The `default` workflow uses every source and runs every catalog processor,
+in order, except those with `skip_default: true`. `workflows` lists more,
+each with the ids of its sources and its process runs: a catalog `id`, a
+type name (the type with its section's options) or an entry of its own,
+without `id`. A reference runs the entry as it is; to change an option,
+write an entry of the workflow's own.
 
 ```yaml
 sources:
@@ -197,48 +223,37 @@ sources:
   - {id: juntas, name: Juntas, provider: csjuntasgobierno, url: ..., skip_default: true}
 
 workflows:
-  - name: main-channel               # delivers what `default` processes
-    sources: [castellonplaza]
-    deliver: [main-chat, digests]
-  - name: juntas-channel
+  - name: juntas
     sources: [juntas]
-    process: [markdownify, summarize]
-    deliver:
-      - sink: telegram
-        options: {chat_id: "-1009876", interval: 30m, max_per_run: 1}
+    process: [markdownify, summary-es]
 ```
 
 `skip_default` only leaves an entry out of `default`: the workflows that
-name it still run it. Commands run `default` unless given `-w/--workflow
-NAME`, so each workflow is its own cron line (`newstool run -w
-juntas-channel`). A workflow only touches its sources: `import` fetches
-them, and `process`, `remix` and its deliveries see only their items.
+name it still run it. `import`, `process` and `run` run `default` unless
+given `-w/--workflow NAME`, so each workflow is its own cron line
+(`newstool run -w juntas`), and `apps run` another one, every few minutes.
+A workflow only touches its sources.
 
 Annotations belong to items. Within a workflow a key is written by one run;
 on sources that workflows share, one processor type writes it, and other
 options for it only get a warning (the first run to process an item writes
 it). Every key a run reads must be written by a process run on its
-workflow's sources, in any workflow, so a workflow may deliver what others
-process. A remix key belongs to one workflow, since artifacts belong to no
-source. A workflow's deliveries are recorded as `<workflow>/<key>`: the
-same item delivered by two workflows is sent by each, and renaming a
-workflow or a delivery key starts its record from scratch, so its last
-`lookback` is sent again (`max_per_run` limits how many at once).
-Ids, workflow names and remix and deliver keys use lowercase letters,
-digits, `_` and `-`; `default` is reserved.
+workflow's sources, in any workflow. Ids, workflow names and output names
+use lowercase letters, digits, `_` and `-`; `default` is reserved.
 
 `summarize`, `tagger`, `embed` and `digest` use an LLM: `llm` names an
 `llms` entry by `id`, or an LLM type (with its section's options), and
 defaults to the first `llms` entry; `model` defaults to that LLM's default
 model. A name that resolves to no LLM, or an LLM consumer with `llms`
 empty, fails every command at start-up. Everything else works without an
-LLM, but `grouping` and `telegram` read the tags and summaries those
+LLM, but `grouping` and `itemfeed` read the tags and summaries those
 processors write.
 
 Changing a type's or an entry's options never regenerates existing
-annotations; use `process --force` for that. In the catalog, what is stored
-is keyed by a source's `id` and a run's `key`: renaming any other `id`
-changes nothing stored.
+annotations; use `process --force` for that. What is stored is keyed by a
+source's `id`, a process run's `key`, and an applet or sink instance's
+`id`: renaming an applet instance starts it from scratch, and renaming a
+sink instance starts its deliveries anew.
 
 ## Usage
 
@@ -250,15 +265,22 @@ uv run newstool -c config.yaml import
 uv run newstool -c config.yaml process
 uv run newstool -c config.yaml process markdownify --source castellonplaza --limit 20
 
-# Run every remix run of the workflow in order, or just one, by key
-uv run newstool -c config.yaml remix
-uv run newstool -c config.yaml remix feedgenerator --since 2026-10-01
-
-# Run import, process, remix and deliver in turn (e.g. from cron)
+# Run import and process in turn (e.g. from cron), for a workflow with -w
 uv run newstool -c config.yaml run
+uv run newstool -c config.yaml run -w juntas
 
-# The same, for another workflow (every phase command takes -w)
-uv run newstool -c config.yaml run -w juntas-channel
+# Run the applet instances that are due, then deliver (cron, every few minutes)
+uv run newstool -c config.yaml apps run
+uv run newstool -c config.yaml apps run --app weekly --force
+uv run newstool -c config.yaml apps run --dry-run
+
+# Deliver what is pending, without running applets
+uv run newstool -c config.yaml deliver
+uv run newstool -c config.yaml deliver --sink chat --dry-run
+
+# Start an applet instance from scratch, optionally dropping its documents
+uv run newstool -c config.yaml apps reset items
+uv run newstool -c config.yaml apps reset weekly --with-documents
 
 # Inspect what is stored (read-only), as a table or --format json
 uv run newstool -c config.yaml inspect items --source castellonplaza --limit 20
@@ -267,48 +289,46 @@ uv run newstool -c config.yaml inspect content --sha256 <sha256> > item.html
 uv run newstool -c config.yaml inspect annotations --item 4127
 uv run newstool -c config.yaml inspect annotations --annotation 512
 uv run newstool -c config.yaml inspect annotations --key summary/telegram/es
-uv run newstool -c config.yaml inspect artifacts
-uv run newstool -c config.yaml inspect artifacts --artifact feedgenerator/feed > feed.xml
-uv run newstool -c config.yaml inspect deliveries --sink telegram --status error
-uv run newstool -c config.yaml inspect deliveries -w main-channels
+uv run newstool -c config.yaml inspect apps
+uv run newstool -c config.yaml inspect documents --app weekly
+uv run newstool -c config.yaml inspect documents --document 31 > digest.md
+uv run newstool -c config.yaml inspect deliveries --sink chat --status error
 
-# Change the state of one workflow's ledger rows, or send them now
-uv run newstool -c config.yaml deliveries set-status -w main-channels --as queued --status error
-uv run newstool -c config.yaml deliveries set-status -w main-channels --as done --delivery 31
-uv run newstool -c config.yaml deliveries set-status -w main-channels --as queued --all
-uv run newstool -c config.yaml deliveries send -w main-channels --delivery 31
+# Change the state of ledger rows, or send them now
+uv run newstool -c config.yaml deliveries set-status --as queued --status error
+uv run newstool -c config.yaml deliveries set-status --as done --delivery 31
+uv run newstool -c config.yaml deliveries send --delivery 31
 
-# Mark what a new delivery must not send, without sending it
-uv run newstool -c config.yaml deliveries set-status -w main-channels --sink telegram-main --all --as done --dry-run
-uv run newstool -c config.yaml deliveries set-status -w main-channels --sink telegram-main --all --as done
+# Queue documents emitted before a route existed, or mark them as sent
+uv run newstool -c config.yaml deliveries set-status --sink chat --app weekly --as queued
+uv run newstool -c config.yaml deliveries set-status --sink chat --all --as done --dry-run
 
 # Delete, without asking: the same options as inspect select what goes
 uv run newstool -c config.yaml delete items --item 4127
 uv run newstool -c config.yaml delete annotations --processor summarize --source castellonplaza
 uv run newstool -c config.yaml delete annotations --key summary/telegram/es
-uv run newstool -c config.yaml delete artifacts --artifact digest/castellonplaza/2026-10-01_2026-10-08
-uv run newstool -c config.yaml delete deliveries -w main-channels --sink telegram-main --item 4127
-uv run newstool -c config.yaml delete deliveries -w main-channels --all
+uv run newstool -c config.yaml delete documents --app headlines --until 2026-10-01
+uv run newstool -c config.yaml delete deliveries --sink chat --document 31
+uv run newstool -c config.yaml delete deliveries --sink chat --all
 ```
 
 Items and annotations are selected by their numeric id, which `inspect`
-shows; artifacts by `<remix key>/<name>`, and deliveries by the numeric id
-`inspect deliveries` shows (`--delivery`), or by their workflow (`-w`)
-and delivery key (`--sink`), the two halves of the ledger key
-`<workflow>/<key>`. `process`, `remix`,
-`inspect` and `delete` accept `--source` (a source id), `--since`,
-`--until`, `--item` (repeatable) and `--limit`; `inspect` and `delete` add
-`--processor`, `--key` and `--annotation` for annotations,
-`--remixer`, `--artifact` and `--limit` for artifacts, and `--artifact`,
-`--delivery` (repeatable), `-w`, `--sink` and `--status` for deliveries. Filters combine; an
-id that the selection does not return is an error.
+shows; documents and deliveries too (`--document`, `--delivery`).
+`process`, `inspect items|annotations` and `delete items|annotations`
+accept `--source` (a source id), `--since`, `--until` (publication),
+`--item` (repeatable) and `--limit`; `inspect` and `delete` add
+`--processor`, `--key` and `--annotation` for annotations. Documents are
+selected by `--app`, `--output`, `--key`, `--since` and `--until`
+(emission), `--document` and `--limit`, and deliveries by the same plus
+`--sink`, `--delivery` and `--status`. Filters combine; an id that the
+selection does not return is an error.
 
-`inspect` and `delete` sort with `--sort` (default `updated`), always
-ascending, so dates go oldest first; the sort also decides which rows
-`--limit` keeps. The keys: `id`, `source`, `published`, `updated` and
-`title` for items; `id`, `item`, `processor` and `updated` for
-annotations; `id`, `type`, `created` and `updated` for artifacts; `id`,
-`sink`, `status` and `updated` for deliveries.
+`inspect` and `delete` sort with `--sort` (default `updated`, `emitted` for
+documents), always ascending, so dates go oldest first; the sort also
+decides which rows `--limit` keeps. The keys: `id`, `source`, `published`,
+`imported`, `updated` and `title` for items; `id`, `item`, `processor` and
+`updated` for annotations; `id`, `app`, `type` and `emitted` for
+documents; `id`, `sink`, `status` and `updated` for deliveries.
 
 `inspect items` lists each item's annotations as `<id> <processor>.<key>`;
 one `--item` shows all its fields, a row per annotation, and the
@@ -316,51 +336,58 @@ one `--item` shows all its fields, a row per annotation, and the
 to stdout as is.
 `inspect annotations` shows a one-line preview per key, and one
 `--annotation` prints its full value (text as is, the rest as JSON).
-`inspect artifacts` loads contents only for `--artifact`, and one
-`--artifact` writes the content to stdout and its metadata to stderr, so it
-can be redirected. `--format json` prints full records.
+`inspect documents` loads contents only for `--document`, and one
+`--document` writes the content to stdout and its metadata to stderr, so
+it can be redirected. `inspect apps` shows each instance's schedule, last
+run, last success, next due time (local time) and last error.
+`--format json` prints full records.
+
+`apps run` runs every instance that is due (`--app`, repeatable, limits
+it; `--force` runs them whether due or not), then delivers what is pending
+for every sink. A failing instance is reported and the others still run;
+its state is kept, so its next run covers what the failed one did not. The
+exit status is non-zero if anything failed. `--dry-run` runs the applets
+and shows the documents they would emit (new, or already stored) and their
+new state, storing and delivering nothing. `apps reset ID` forgets an
+instance's state and run times; its documents stay, so what it emits again
+under their keys is not sent again, unless `--with-documents` deletes them
+and their deliveries too.
 
 `delete` never asks, so run `inspect` with the same options first. A
 selection with no filter or id is refused. Deleting an item takes its
-processing state, annotations and deliveries with it, and an item still in
-its source's index comes back on the next `import` with a new id.
+processing state and annotations with it, and an item still in its
+source's index comes back on the next `import` with a new id.
 `delete annotations` deletes exactly what `inspect annotations` lists with
 the same options (by processor, key such as `summary/telegram/es`, id or
 item), each with its processing state, so the run that wrote the key
-processes the item again. `delete deliveries` drops the ledger rows of the
-workflow `-w` names, or every row of it (or of `--sink`) with `--all` and
-no other filter; the next `run` delivers those subjects
-again while its `lookback` covers them. Items and
-artifacts with deliveries are skipped with a warning unless `--force`,
-which deletes their deliveries too, so they can be delivered again.
+processes the item again. `delete documents` deletes documents with their
+deliveries, and refuses those with a delivery that is not `done`. Deleting
+a document frees its key: an applet that emits it again stores and
+delivers it again. `delete deliveries` drops ledger rows, or every row (of
+`--sink`) with `--all` and no other filter.
 
-`deliveries set-status`, `deliveries send` and `delete deliveries` act on
-one workflow, which `-w` must name; `inspect deliveries` takes `-w` as an
-optional filter, and there `--sink` without it shows that delivery key in
-every workflow. They take the selection of `inspect deliveries` and need
-at least one filter or id, so run `inspect` first.
+`deliveries set-status`, `deliveries send` and `delete deliveries` take the
+selection of `inspect deliveries` and need at least one filter or id, so
+run `inspect` first.
 
 `set-status --as queued|done|error` sets the state of deliveries:
-`queued` also gives fresh attempts, so the next `run` sends them, and
+`queued` also gives fresh attempts, so the next delivery sends them, and
 `done` records a delivery you settled by hand.
 
-- With `--sink` and subject filters (`--source`, `--since`, `--until`,
-  `--item`, `--artifact`), or `--all` for every subject of the delivery,
-  each selected subject without a row gets one in that state, whatever the
-  `lookback` or the annotation the sink requires; `--limit` counts
-  subjects. Existing rows are left as they are, with a warning, unless
-  `--overwrite`. A filter of the other kind (`--artifact` for an item
-  delivery) is an error. Queuing an item without its required annotation
-  warns: it fails until the annotation exists, holding back its source.
-  `--all --as done` before the first `run` of a new delivery keeps it from
-  posting what is already stored.
+- With `--sink` and document filters (`--app`, `--output`, `--key`,
+  `--since`, `--until`, `--document`), or `--all` for every document routed
+  to that sink, each selected document routed to it without a row gets one
+  in that state; `--limit` counts documents. Existing rows are left as they
+  are, with a warning, unless `--overwrite`. A route added to an existing
+  output only delivers documents emitted afterwards: `--as queued` sends
+  older ones too.
 - Otherwise, or with `--delivery` or `--status`, it changes the selected
-  rows; `--all` alone changes every row of the workflow.
+  rows; `--all` alone changes every row.
 
 `--dry-run` counts what would change without changing it. `send` sends the
 selected rows now, whatever their state (`done` ones too), with no backoff
-or pacing, and exits non-zero if one fails; a row whose delivery is no
-longer in the configuration is skipped with a warning. It creates no rows.
+or pacing, and exits non-zero if one fails; a row whose sink is no longer
+in the configuration is skipped with a warning. It creates no rows.
 
 Global options: `--log-level LEVEL` (also accepts specs such as
 `info,db:debug`), and `-v`/`-q`, repeatable, to raise or lower it one step
@@ -373,14 +400,15 @@ database, disk) are reported as `Type: message`; the traceback is shown only
 with debug logging (`-vv`). Unexpected errors always show it.
 
 Results (tables, `inspect` output, contents, `--help`, and the summaries of
-`run`, `import`, `process` and `remix`) go to stdout; progress and
-logs go to stderr. Each stream is rich only when it is a terminal, so
-`newstool run > summary.txt` keeps the progress rows on screen and writes
-tab-separated tables, and with stderr redirected (cron) there is no progress
-and logs are one plain line per record. The progress shows a row per phase
-in `run` and a row per source, processor, remixer or sink while it runs.
-Set `DISABLE_RICH=1` (or `RICH_DISABLED=1`), or `TERM=dumb`, for plain
-output on both streams; `NO_COLOR=1` only drops the colors.
+`run`, `import`, `process`, `apps run` and `deliver`) go to stdout;
+progress and logs go to stderr. Each stream is rich only when it is a
+terminal, so `newstool run > summary.txt` keeps the progress rows on screen
+and writes tab-separated tables, and with stderr redirected (cron) there is
+no progress and logs are one plain line per record. The progress shows a
+row per phase in `run` and a row per source, processor, applet or sink
+while it runs. Set `DISABLE_RICH=1` (or `RICH_DISABLED=1`), or
+`TERM=dumb`, for plain output on both streams; `NO_COLOR=1` only drops the
+colors.
 
 ### How `process` behaves
 
@@ -473,8 +501,8 @@ entry. Every processor takes `max_retries` (default 3), and `summarize`,
 `tagger` and `embed` take `llm` (see above) and `model`; `summarize` takes
 `prompt` (followed by the article's markdown) and `embed` takes `input`
 (`tags`, the default, or `markdown`; one entry per input). Consumers read annotations by key:
-`telegram` and `googlechat` read `summary` (or their `summary` option's
-key), `grouping` reads `tags` and
+`itemfeed` reads `summary` (or its `annotation` option's key), `grouping`
+reads `tags` and
 `<embedding>_embedding`, and `digest` and `search` read `markdown`.
 
 ### LLMs
@@ -487,120 +515,119 @@ Options of `ollama`: `api_base` (default `http://localhost:11434`),
 `api_key`, `chat_model` (default `gemma4:12b`) and `embed_model` (default
 `mxbai-embed-large:latest`).
 
-### Remixers
+### Applets
 
-| Plugin | Remixer | Artifact | Does |
-| :--- | :--- | :--- | :--- |
-| `feedgenerator` | `feedgenerator` | `feed` | RSS feed of the newest items in scope |
-| `grouping` | `singlelink` | `current` | Clusters tagged items into events (single-link over tag overlap) |
-| `grouping` | `avglink` | `current` | Clusters tagged items into events (average-link over tag overlap) |
-| `grouping` | `embeddings` | `current` | Clusters tagged items by tag overlap blended with the similarity of their `tags_embedding` or `markdown_embedding` (single-link) |
-| `digest` | `digest` | `<source id>/<since>_<until>` | Markdown digest of the highlights of each source in scope, written with an LLM from `markdown` |
+| Plugin | Applet | Output (content type) | Document keys | Does |
+| :--- | :--- | :--- | :--- | :--- |
+| `itemfeed` | `itemfeed` | `items` (`text/plain`) | `item:<source>/<uid>` | One document per newly imported item with its `annotation`: the annotation as text, with the item's title, link and image |
+| `feed` | `feed` | `feed` (`application/rss+xml`) | the run's time | RSS feed of the newest items of its sources |
+| `digest` | `digest` | `digest` (`text/markdown`) | `<source id>/<since>_<until>` | Markdown digest of the highlights of each source over the last `lookback`, written with an LLM from `markdown` |
+| `grouping` | `singlelink` | `groups` (`application/json`) | the run's time | Clusters tagged items into events (single-link over tag overlap) |
+| `grouping` | `avglink` | `groups` (`application/json`) | the run's time | Clusters tagged items into events (average-link over tag overlap) |
+| `grouping` | `embeddings` | `groups` (`application/json`) | the run's time | Clusters tagged items by tag overlap blended with the similarity of their `tags_embedding` or `markdown_embedding` (single-link) |
 
-Options, in the type's section as defaults or per entry. Lengths of time,
-here and in every other option, are seconds or a number with a unit suffix:
-`90s`, `5m`, `2h`, `3d`, `1h30m`.
+Options, in the type's section as defaults or per instance. Every applet
+takes `sources` (the source ids it reads; default every source). Lengths
+of time, here and in every other option, are seconds or a number with a
+unit suffix: `90s`, `5m`, `2h`, `3d`, `1h30m`.
 
+- `itemfeed`: `annotation` (the key emitted as the text, default
+  `summary`), `since_first_run` (default true: its first run only starts
+  counting, so what is already stored is not sent) and `wait` (default 1d:
+  an item imported up to this long before a run is still emitted once its
+  annotation exists).
+- `feed`: `title` (default `newstool feed`), `link`, `description`
+  (default: the title), `max_items` (default 100). Route it to a `file`
+  sink to publish it.
 - `digest`: `llm` and `model` (see above), `lookback` (default 7d: the
-  scope when it sets no `--since`), `max_items` (newest items per source, default
+  period each run covers), `max_items` (newest items per source, default
   50), `max_article_chars` (each article's markdown is cut to this, default
   3000) and `context_length` (the model's context window in tokens, default
-  32768). Meant for one source: `remix digest --source <id>` for the last
-  week, or `--since`/`--until` for another period. Each period is its own
-  artifact (dates as `YYYY-MM-DD`), so `inspect artifacts --remixer digest`
-  (the entry's key) lists them and rebuilding a period overwrites it.
-- `feedgenerator`: `title` (default `newstool feed`), `link`, `description`
-  (default: the title), `max_items` (default 100).
+  32768). Schedule it for its period (`days: [mon]`, `at: "07:00"`); a
+  second run over the same period emits nothing new.
 - `singlelink`, `avglink` and `embeddings`: `min_score` (default 0.3), `tau` (time
-  decay, default 24h; `null` disables it), `lookback` (default 7d: the scope
-  when it sets no `--since`). `embeddings` adds `embedding` (`tags` or
+  decay, default 24h; `null` disables it), `lookback` (default 7d: the
+  items each run groups). `embeddings` adds `embedding` (`tags` or
   `markdown`, default `tags`) and `embedding_weight` (0 to 1, default 0.5).
-  Items without the annotations a remixer reads are left out of its groups,
+  Items without the annotations an applet reads are left out of its groups,
   so `embeddings` needs `process` to have run `embed` with that input first.
 
-Artifacts are rebuilt each time their remixer runs, so between runs they can
-lag behind the stored items. Remixers never act outside newstool.
+Applets never act outside newstool: they emit documents, and sinks deliver
+them. A document is never rewritten; one emitted again under the same key
+is ignored. Documents are kept until `delete documents` removes them.
 
 ### Sinks
 
-| Plugin | Sink | Delivers |
-| :--- | :--- | :--- |
-| `telegram` | `telegram` | Summarized items (title, summary, link) to a Telegram chat |
-| `telegram` | `telegram_artifacts` | The artifacts of the remix keys in `artifacts` (e.g. `[digest]`), as documents |
-| `googlechat` | `googlechat` | Summarized items to a Google Chat space, by incoming webhook |
+| Plugin | Sink | Accepts | Delivers |
+| :--- | :--- | :--- | :--- |
+| `telegram` | `telegram` | `text/plain`, `text/markdown` | Documents to a Telegram chat: as a message (title, text, link, image) when it fits, else as a file |
+| `googlechat` | `googlechat` | `text/plain`, `text/markdown` | Documents to a Google Chat space, by incoming webhook, as a card |
+| `filesink` | `file` | anything | Writes each document to a file, replacing it |
 
-Every sink takes `interval` (time between its deliveries,
-default 0: no pacing), `max_per_run` (deliveries per run at most, default
-5), `max_retries` (default 3) and `lookback` (default 24h).
-`telegram` adds `item_image` (post the item's image, when it has one, as a
-photo with the text as its caption; default true), `item_url_text` (the
-text of the link to the article, default `original article`),
-`item_url_preview` (let Telegram show the link's preview on messages
-without an image, default false), `summary` (the annotation key posted
-as the summary, e.g. `summary/es`; default `summary`) and `markdown`
-(post in Telegram's legacy Markdown, the summary unescaped so that its
+Every sink takes `interval` (time between its deliveries, default 0: no
+pacing), `max_per_run` (deliveries per run at most, default 5) and
+`max_retries` (default 3).
+`telegram` adds `images` (post the document's image, when it has one, as a
+photo with the text as its caption; default true), `link_text` (the text of
+the link, default `original article`), `link_preview` (let Telegram show the
+link's preview on messages without an image, default false) and `markdown`
+(post in Telegram's legacy Markdown, the text unescaped so that its
 formatting renders, instead of HTML-escaped text; default false). Telegram
-refuses a post whose Markdown does not parse, such as a lone `_` or `*`.
-`telegram_artifacts` adds `artifacts` (remix keys, default none).
+refuses a post whose Markdown does not parse, such as a lone `_` or `*`. A
+document longer than a message (4096 characters, such as a digest) goes as
+a file, its title as the caption.
 
-Every `telegram` and `telegram_artifacts` use needs a `bot_token` and a
-`chat_id`, its own or its type's section's (`telegram` and
-`telegram_artifacts` have one each), which hold their defaults and are
-optional: uses can post with different bots, and a workflow can give its
-entries both with no section at all. The `googlechat` section or entry gives
-the webhook as `url`, or as `channel` (the space id) and `token`. Each item
-goes as a card: title and summary, then the image if any, then a button to
-the article. It takes `item_image` (show the item's image, when it has one;
-default true), `item_url_text` (the button's text) and `summary`, as
+Every `telegram` instance needs a `bot_token` and a `chat_id`, its own or
+its type's section's, which holds their defaults and is optional: instances
+can post with different bots. The `googlechat` section or instance gives
+the webhook as `url`, or as `channel` (the space id) and `token`. Each
+document goes as a card: title and text, then the image if any, then a
+button to the link if any. It takes `images` and `link_text`, as
 `telegram`'s; Chat has no link preview to control. Chat shows no image
 hosted at `blogger.googleusercontent.com`, so those go at full size through
-the `wsrv.nl` image proxy, which sees their URLs.
+the `wsrv.nl` image proxy, which sees their URLs. `file` takes `path`, an
+absolute path (`~` allowed) where `{app}`, `{output}` and `{key}` are
+replaced by the document's (`/` in a key becomes `_`); the file is
+replaced whole, never left half-written.
 
 ```yaml
 plugins:
   telegram:
     bot_token: ${TELEGRAM_BOT_TOKEN}
     chat_id: ${TELEGRAM_CHAT_ID}
-  telegram_artifacts:
-    bot_token: ${TELEGRAM_BOT_TOKEN}
-    chat_id: ${TELEGRAM_CHAT_ID}
   googlechat:
     url: ${GOOGLECHAT_WEBHOOK_URL}
 sinks:
-  - {sink: telegram, id: chat, options: {interval: 30m}}
-  - {sink: telegram_artifacts, id: digests, options: {artifacts: [digest]}}
-  - {sink: googlechat, id: space}
-workflows:
-  - {name: channels, sources: [castellonplaza], deliver: [chat, digests, space]}
+  - {id: chat, sink: telegram, options: {interval: 30m}}
+  - {id: space, sink: googlechat}
+apps:
+  - {id: items, app: itemfeed, routes: {items: [chat, space]}}
 ```
 
-How delivery (the last phase of `run`) behaves:
+How delivery behaves:
 
-- Each run queues what is new, then delivers what is due. New means the
-  subjects of the last `lookback` without a delivery yet; `telegram` only
-  queues items whose `summary` run finished. Run `run` periodically, e.g.
-  from cron every few minutes.
-- Items go out oldest first. With an `interval`, an entry delivers one
-  subject once its last delivery is that old, whatever the source; without
-  one, every due subject, up to `max_per_run` per run.
-- A failed delivery is retried like a processor's, holding back the rest of
-  its source until it succeeds or runs out of attempts.
-- Nothing is delivered twice by the same entry. `delete deliveries` drops
-  ledger rows, so the next run queues those subjects again while they are
-  within its `lookback`.
+- Each document an applet emits is queued for every sink its output is
+  routed to. `apps run` delivers after running the applets, and `deliver`
+  on its own.
+- A sink instance delivers oldest first, whatever applet emitted them. With
+  an `interval`, it delivers one document once its last delivery is that
+  old; without one, every pending document, up to `max_per_run` per run.
+  Two applets routed to one chat share its pace.
+- A failed delivery is retried like a processor's; it holds nothing else
+  back.
+- Nothing is delivered twice to the same sink instance.
 - A delivery is marked `sending` before the call. If a run is interrupted
   there, its outcome is unknown and it is never retried on its own: check
-  the chat, then settle it with `deliveries set-status -w WORKFLOW --as
-  done|queued --delivery ID` (the id `inspect deliveries` shows), or leave
-  it.
-- `inspect deliveries` shows the ledger: each row's id, subject, state,
-  attempts and last error.
+  the chat, then settle it with `deliveries set-status --as done|queued
+  --delivery ID` (the id `inspect deliveries` shows), or leave it.
+- `inspect deliveries` shows the ledger: each row's id, sink, document,
+  state, attempts and last error.
 
 ## Data and backups
 
 Everything lives in `storage_dir`: the SQLite database (`data.db`) and the
 content directory (`content/`), which holds article contents, annotation
-values and artifacts. Back up both together. The database runs in
+values and documents. Back up both together. The database runs in
 WAL mode, so back it up with SQLite's backup API (or with no process using
 it), not by copying `data.db` alone.
 
@@ -611,19 +638,24 @@ databases (back up first):
 
 - `scripts/migrate_autoincrement.py -c config.yaml`: ids that are never
   reused, which `--item` and `--annotation` rely on.
-- `scripts/migrate_telegram_state.py -c config.yaml`: turns the old
-  `telegram/state` artifact into deliveries. Run it before the first
-  `run`, or the last `lookback` is posted again.
 - `sqlite3 -bail data.db < scripts/migrate_annotation_keys.sql`: keys
   processing state and annotations by annotation key,
   keeping every row and id. Run it before the first `process` on the new
   schema.
+- `scripts/migrate_applets.py -c config.yaml`: applets (decision 0015).
+  Adds each item's import date (its publication date, for the items
+  already stored), and drops the remixers' artifacts and the old delivery
+  history. `itemfeed` instances start counting on their first run, so
+  nothing already posted is posted again.
 
 The plugin catalog (decision 0010) needs a new database and a rewritten
-configuration: `process`, `remix` and `deliver` move to `processors`,
-`remixers` and `sinks` (or to workflows), deliveries to named workflows,
-`default: false` becomes `skip_default: true`, LLMs are listed in `llms`,
-and `plugins.telegram` splits into `telegram` and `telegram_artifacts`.
+configuration: `process` moves to `processors` (or to workflows),
+`default: false` becomes `skip_default: true` and LLMs are listed in
+`llms`. Applets (decision 0015) need a rewritten configuration too:
+`remixers` and the workflows' `remix` and `deliver` become `apps` with
+routes to `sinks` instances; the `telegram` and `googlechat` item sinks
+become an `itemfeed` instance routed to them, and `telegram_artifacts`
+becomes a route from the digest's output to a `telegram` instance.
 
 Commands that write take a lock next to the database (`data.db.lock`), so
 a second one fails at once instead of running alongside the first.
@@ -631,7 +663,7 @@ a second one fails at once instead of running alongside the first.
 ## Known limitations
 
 - The same article in two sources is stored, and processed, twice.
-- Items of a removed source still appear in artifacts unless the remixer
+- Items of a removed source still appear in documents unless the applet
   filters them out.
 
 ## Scripting
@@ -642,9 +674,10 @@ Other tools use `Application`, the same core the CLI uses:
 from pathlib import Path
 
 from newstool.app import Application
+from newstool.models import DocumentFilter
 
 with Application.from_config_file(Path("config.yaml"), create_schema=False) as app:
-    feed = app.get_artifact("feedgenerator", "feed")  # None if it doesn't exist
+    feeds = app.find_documents(DocumentFilter(app="headlines"), with_content=True)
 ```
 
 Code that writes takes `app.lock()` first.

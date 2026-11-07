@@ -6,8 +6,9 @@ import re
 import string
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
+from datetime import time
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import platformdirs
@@ -28,9 +29,11 @@ from .models import SourceData
 
 # The workflow built from the catalog (`Config.default_workflow`).
 DEFAULT_WORKFLOW = "default"
-# Ids, workflow names, and remix and delivery keys, which form ledger keys as
-# `<workflow>/<key>`.
+# Ids (of catalog entries, applet and sink instances), workflow names and
+# output names.
 NAME_PATTERN = re.compile(r"[a-z0-9_-]+")
+# `days` of an applet instance, Monday first.
+type Weekday = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 OLLAMA_PORT = 11434
 
 
@@ -195,93 +198,72 @@ class ProcessEntry(Entry):
         return self.processor
 
 
-class RemixEntry(Entry):
-    """A remixer run, its artifacts under `key` (default: the remixer's
-    name), which belongs to one workflow: artifacts are not per source."""
+class SinkEntry(Entry):
+    """A sink instance (decision 0015): where documents routed to it go, and
+    how fast. Applet instances name it by `id` in their routes."""
 
-    remixer: str
-    key: str | None = None
-    skip_default: bool = False  # catalog only: left out of `default`
-
-    @pydantic.model_validator(mode="before")
-    @classmethod
-    def from_name(cls, value: Any) -> Any:
-        """A bare type name is the type with its section's options."""
-        return {"remixer": value} if isinstance(value, str) else value
-
-    @property
-    def type_name(self) -> str:
-        return self.remixer
-
-
-class DeliveryEntry(Entry):
-    """A sink run, its ledger rows under `key` (default: the sink's name),
-    which is unique within its workflow."""
-
+    id: str
     sink: str
-    key: str | None = None
-
-    @pydantic.model_validator(mode="before")
-    @classmethod
-    def from_name(cls, value: Any) -> Any:
-        """A bare type name is the type with its section's options."""
-        return {"sink": value} if isinstance(value, str) else value
 
     @property
     def type_name(self) -> str:
         return self.sink
 
 
+class AppEntry(Entry):
+    """An applet instance (decision 0015). `every`, `at` and `days` say when
+    it is due; `routes` sends each of its outputs to sink instances, and
+    `sink` is the shorthand for an applet with a single output."""
+
+    id: str
+    app: str
+    every: Duration = 0
+    at: time | None = None  # local time
+    # Not `on`, which YAML 1.1 (PyYAML) reads as the boolean true.
+    days: list[Weekday] = []
+    sink: str | None = None
+    routes: dict[str, list[str]] = {}
+
+    @pydantic.model_validator(mode="after")
+    def sink_or_routes(self) -> AppEntry:
+        if self.sink is not None and self.routes:
+            raise ValueError(f"app '{self.id}': set either `sink` or `routes`")
+        return self
+
+    @property
+    def type_name(self) -> str:
+        return self.app
+
+
 class Workflow(pydantic.BaseModel):
-    """Which sources to use and what to run on them, in phase order. A
-    string refers to a catalog entry by `id`, or else to a type with its
-    section's options; a mapping is an entry of the workflow's own.
-    `default`, built from the catalog, has no entries of its own."""
+    """Which sources to import and what to process on them. A string refers
+    to a catalog entry by `id`, or else to a type with its section's
+    options; a mapping is an entry of the workflow's own. `default`, built
+    from the catalog, has no entries of its own."""
 
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
     name: str
     sources: list[str]  # source ids
     process: list[str | ProcessEntry] = []
-    remix: list[str | RemixEntry] = []
-    deliver: list[str | DeliveryEntry] = []
 
     @pydantic.model_validator(mode="after")
     def entries_are_valid(self) -> Workflow:
         if not NAME_PATTERN.fullmatch(self.name):
             raise ValueError(f"invalid workflow name '{self.name}'")
-        own: list[tuple[str, int, Entry]] = [
-            *own_entries("process", self.process),
-            *own_entries("remix", self.remix),
-            *own_entries("deliver", self.deliver),
-        ]
-        for section, index, entry in own:
+        for index, entry in enumerate(self.process):
+            if isinstance(entry, str):
+                continue
             if entry.id is not None:
                 raise ValueError(
-                    f"workflow '{self.name}': {section}.{index} has an id;"
+                    f"workflow '{self.name}': process.{index} has an id;"
                     " only catalog entries do"
                 )
-        for section, index, entry in own:
-            if isinstance(entry, ProcessEntry | RemixEntry) and entry.skip_default:
+            if entry.skip_default:
                 raise ValueError(
-                    f"workflow '{self.name}': {section}.{index} sets"
+                    f"workflow '{self.name}': process.{index} sets"
                     " skip_default; only catalog entries do"
                 )
         return self
-
-    def ledger_key(self, key: str) -> str:
-        """Where a delivery key's rows live: its workflow asked for them."""
-        return f"{self.name}/{key}"
-
-
-def own_entries(
-    section: str, entries: Sequence[str | Entry]
-) -> list[tuple[str, int, Entry]]:
-    """The `(section, index, entry)` of a workflow section's own entries."""
-    return [
-        (section, index, entry)
-        for index, entry in enumerate(entries)
-        if not isinstance(entry, str)
-    ]
 
 
 class LoadEnvSettingsSource(EnvSettingsSource):
@@ -331,10 +313,12 @@ class Config(BaseSettings):
     llms: list[LLMEntry] = []
     sources: list[SourceData] = []
     processors: list[ProcessEntry] = []
-    remixers: list[RemixEntry] = []
-    sinks: list[DeliveryEntry] = []
     # Workflows, run by name; a list, since YAML drops duplicate keys.
     workflows: list[Workflow] = []
+    # Global instances (decision 0015): applets, run by `apps run`, and the
+    # sinks their outputs are routed to.
+    apps: list[AppEntry] = []
+    sinks: list[SinkEntry] = []
     cache: CacheConfig = CacheConfig()
     # Where the HTTP cache lives.
     cache_dir: ConfigPath = pydantic.Field(
@@ -377,7 +361,7 @@ class Config(BaseSettings):
         catalog: dict[str, Sequence[Entry]] = {
             "llms": self.llms,
             "processors": self.processors,
-            "remixers": self.remixers,
+            "apps": self.apps,
             "sinks": self.sinks,
         }
         for section, entries in catalog.items():
@@ -404,8 +388,7 @@ class Config(BaseSettings):
 
     def default_workflow(self) -> Workflow:
         """The `default` workflow: the sources without `skip_default`. Its
-        runs are the catalog's processors and remixers without it; it
-        delivers nothing."""
+        runs are the catalog's processors without it."""
         return Workflow(
             name=DEFAULT_WORKFLOW,
             sources=[source.id for source in self.sources if not source.skip_default],

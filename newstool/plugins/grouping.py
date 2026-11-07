@@ -1,7 +1,8 @@
-"""Groups tagged items into events. Every remixer produces one JSON
-artifact, "current", where every item in scope belongs to exactly one
-group, singletons included; items without the annotations a remixer reads
-are left out.
+"""Groups tagged items into events (decision 0015). Every run of these
+applets emits one JSON document on its `groups` output, keyed by the run's
+time, where every item published in the last `lookback` belongs to exactly
+one group, singletons included; items without the annotations an applet
+reads are left out.
 
 - `singlelink`: connected components over the pairwise tag-overlap graph.
   Two items join the moment any pairwise score between them clears
@@ -24,27 +25,41 @@ import json
 import logging
 import math
 from abc import abstractmethod
-from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from itertools import combinations
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import pydantic
 
+from ..applets import (
+    AppletReader,
+    AppletType,
+    BaseApplet,
+    Outputs,
+    Requirements,
+    SourcesOptions,
+    run_key,
+)
 from ..config import Duration
-from ..models import ItemKey, ProcessingScope, SourceItem
-from ..remixers import BaseRemixer, RemixerType
-from . import PluginOptions, PluginTypes
+from ..models import (
+    AppletResult,
+    AppletRun,
+    EmittedDocument,
+    ItemKey,
+    SourceItem,
+)
+from . import PluginTypes
 
 LOGGER = logging.getLogger(__name__)
 
-ARTIFACT_NAME = "current"
+OUTPUT = "groups"
+CONTENT_TYPE = "application/json"
 
 
-class GroupingOptions(PluginOptions):
+class GroupingOptions(SourcesOptions):
     min_score: float = 0.3
     tau: Duration | None = 24 * 3600  # time decay; None disables it
-    lookback: Duration = 7 * 86400  # scope when it sets no `since`
+    lookback: Duration = 7 * 86400  # the items each run groups
 
 
 class EmbeddingsOptions(GroupingOptions):
@@ -218,51 +233,64 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-class GroupingRemixer(BaseRemixer):
+class GroupingApplet(BaseApplet):
     """Groups the tagged items of the last `lookback` into events."""
 
-    requires = "tags"
+    outputs: ClassVar[Outputs] = {OUTPUT: frozenset({CONTENT_TYPE})}
+    requires = ("tags",)
     options_model = GroupingOptions
     options: GroupingOptions
 
-    def produce(self, scope: ProcessingScope) -> Iterator[tuple[str, str, str]]:
+    def run(self, now: datetime, run: AppletRun, reader: AppletReader) -> AppletResult:
         options = self.options
-        if scope.since is None:
-            scope = dataclasses.replace(
-                scope, since=datetime.now(UTC) - timedelta(seconds=options.lookback)
-            )
-
-        items = self.db.get_items(scope)
-        tags = self.db.get_annotation_values(items, key="tags")
-        scored = tagged_items(items, tags)
+        items = reader.items(
+            sources=options.sources,
+            published_since=now - timedelta(seconds=options.lookback),
+            published_until=now,
+        )
+        scored = tagged_items(items, reader.annotations(items, "tags"))
         if not scored:
-            LOGGER.info(f"{self.name}: no tagged items in scope - nothing to group")
-            return
+            LOGGER.info(
+                f"{self.name}: no tagged items in the period - nothing to group"
+            )
+            return AppletResult()
 
         payload = {
-            "generated_at": datetime.now(UTC).isoformat(),
+            "generated_at": now.isoformat(),
             "params": {"algorithm": self.name, **options.model_dump()},
-            "groups": self.group(scored),
+            "groups": self.group(scored, reader),
         }
-        yield ARTIFACT_NAME, json.dumps(payload, indent=2), "application/json"
+        document = EmittedDocument(
+            output=OUTPUT,
+            key=run_key(now),
+            content=json.dumps(payload, indent=2),
+            content_type=CONTENT_TYPE,
+        )
+        return AppletResult(documents=(document,))
 
     @abstractmethod
-    def group(self, items: list[ScoredItem]) -> list[dict[str, Any]]:
+    def group(
+        self, items: list[ScoredItem], reader: AppletReader
+    ) -> list[dict[str, Any]]:
         """Cluster the items; return one payload dict per group, largest first."""
 
 
-class SingleLinkRemixer(GroupingRemixer):
+class SingleLinkApplet(GroupingApplet):
     name = "singlelink"
 
-    def group(self, items: list[ScoredItem]) -> list[dict[str, Any]]:
+    def group(
+        self, items: list[ScoredItem], reader: AppletReader
+    ) -> list[dict[str, Any]]:
         scores = build_score_matrix(items, self.options.tau)
         return single_link_groups(items, scores, self.options.min_score)
 
 
-class AverageLinkRemixer(GroupingRemixer):
+class AverageLinkApplet(GroupingApplet):
     name = "avglink"
 
-    def group(self, items: list[ScoredItem]) -> list[dict[str, Any]]:
+    def group(
+        self, items: list[ScoredItem], reader: AppletReader
+    ) -> list[dict[str, Any]]:
         matrix = build_score_matrix(items, self.options.tau)
         clusters = average_link_cluster(matrix, min_score=self.options.min_score)
 
@@ -283,10 +311,17 @@ class AverageLinkRemixer(GroupingRemixer):
         ]
 
 
-class EmbeddingsRemixer(GroupingRemixer):
+class EmbeddingsApplet(GroupingApplet):
     name = "embeddings"
     options_model = EmbeddingsOptions
     options: EmbeddingsOptions
+
+    @classmethod
+    def requirements(cls, options: EmbeddingsOptions) -> Requirements:
+        sources = tuple(options.sources) if options.sources is not None else None
+        return Requirements(
+            sources=sources, keys=("tags", f"{options.embedding}_embedding")
+        )
 
     @staticmethod
     def score(
@@ -305,12 +340,12 @@ class EmbeddingsRemixer(GroupingRemixer):
             a.item.published_at, b.item.published_at, options.tau
         )
 
-    def group(self, items: list[ScoredItem]) -> list[dict[str, Any]]:
+    def group(
+        self, items: list[ScoredItem], reader: AppletReader
+    ) -> list[dict[str, Any]]:
         options = self.options
         embedding_key = f"{options.embedding}_embedding"
-        vectors = self.db.get_annotation_values(
-            [scored.item for scored in items], key=embedding_key
-        )
+        vectors = reader.annotations([scored.item for scored in items], embedding_key)
         embedded = [scored for scored in items if scored.item.key in vectors]
         if skipped := len(items) - len(embedded):
             LOGGER.info(f"{self.name}: {skipped} item(s) without {embedding_key}")
@@ -325,5 +360,5 @@ class EmbeddingsRemixer(GroupingRemixer):
 
 
 def __newstool_plugin__() -> PluginTypes:
-    remixers = [SingleLinkRemixer, AverageLinkRemixer, EmbeddingsRemixer]
-    return [(remixer.name, RemixerType, remixer) for remixer in remixers]
+    applets = [SingleLinkApplet, AverageLinkApplet, EmbeddingsApplet]
+    return [(applet.name, AppletType, applet) for applet in applets]

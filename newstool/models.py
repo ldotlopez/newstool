@@ -91,6 +91,8 @@ class SourceItem:
     data: JsonCompatible = dataclasses.field(default_factory=dict)
     published_at: datetime | None = None
     modified_at: datetime | None = None
+    # Set by the database on the item's first import, never changed.
+    imported_at: datetime | None = None
     # The database id: None until saved. A local handle, not the identity.
     id: int | None = None
 
@@ -110,47 +112,125 @@ class SourceItem:
         return hash(self.key)
 
 
-@dataclasses.dataclass(slots=True)
-class Artifact:
-    """A remixer output derived from many items (an RSS feed, a newsletter).
+@dataclasses.dataclass(frozen=True, slots=True)
+class EmittedDocument:
+    """What an applet emits on one of its outputs (decision 0015). `key` is
+    the applet's and deterministic, so emitting it again is ignored;
+    `title`, `url` and `image_url` are for the sinks that use them."""
 
-    Unique per (remixer, name), where `remixer` holds the remix run's
-    key (by default the remixer's name); the timestamps are set by the
-    database.
-    """
-
-    remixer: str
-    name: str
-    content: str | None
+    output: str
+    key: str
+    content: str
     content_type: str
+    title: str | None = None
+    url: str | None = None
+    image_url: str | None = None
+
+
+@dataclasses.dataclass(slots=True)
+class Document:
+    """A stored emitted document, never rewritten: unique per (app, output,
+    key), where `app` is the applet instance's id. `content` is None unless
+    loaded; `emitted_at` is set by the database."""
+
+    app: str
+    output: str
+    key: str
+    content_type: str
+    content: str | None = None
     content_sha256: str | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    title: str | None = None
+    url: str | None = None
+    image_url: str | None = None
+    emitted_at: datetime | None = None
     id: int | None = None
 
     def __post_init__(self) -> None:
         if self.content is not None:
             self.content_sha256 = hashlib.sha256(self.content.encode()).hexdigest()
 
+    @classmethod
+    def from_emitted(cls, app: str, emitted: EmittedDocument) -> Document:
+        return cls(
+            app=app,
+            output=emitted.output,
+            key=emitted.key,
+            content_type=emitted.content_type,
+            content=emitted.content,
+            title=emitted.title,
+            url=emitted.url,
+            image_url=emitted.image_url,
+        )
+
+    @property
+    def label(self) -> str:
+        """How logs and tables name it."""
+        return f"{self.app}/{self.output}/{self.key}"
+
 
 @dataclasses.dataclass(slots=True)
 class Delivery:
-    """A record of delivering one subject, an item or an artifact
-    (decision 0007). `status` is a `db.DeliveryStatus`. `sink` holds the
-    ledger key: `<workflow>/<key>`, or the bare key in `default`."""
+    """A record of delivering one document to one sink instance (decision
+    0015). `status` is a `db.DeliveryStatus`."""
 
-    sink: str
+    sink: str  # the sink instance's id
+    document_id: int
     status: str
-    item_id: int | None = None
-    artifact_id: int | None = None
     attempts: int = 0
     last_error: str | None = None
-    content_sha256: str | None = None  # the subject's content when delivered
     external_ref: JsonCompatible = None  # e.g. {"message_id": ...}
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    artifact_name: str | None = None  # "<remixer>/<name>", read back only
+    document_label: str | None = None  # "<app>/<output>/<key>", read back only
     id: int | None = None
+
+
+@dataclasses.dataclass(slots=True)
+class AppletRun:
+    """An applet instance's run record: when it last started and succeeded,
+    its last error, and its opaque state. Never run: all None."""
+
+    app: str
+    last_started: datetime | None = None
+    last_success: datetime | None = None
+    last_error: str | None = None
+    state: JsonCompatible = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AppletResult:
+    """What a successful applet run returns: its new state and what it
+    emits."""
+
+    state: JsonCompatible = None
+    documents: tuple[EmittedDocument, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DocumentFilter:
+    """Which documents an operation applies to; unset fields do not
+    restrict, and they combine. Times bound `emitted_at`."""
+
+    app: str | None = None
+    output: str | None = None
+    key: str | None = None
+    since: datetime | None = None  # emitted_at >=
+    until: datetime | None = None  # emitted_at <
+    document_ids: tuple[int, ...] | None = None
+    limit: int | None = None
+
+    def is_set(self) -> bool:
+        """Whether it names anything but a limit."""
+        return any(
+            (
+                self.app,
+                self.output,
+                self.key,
+                self.since,
+                self.until,
+                self.document_ids,
+            )
+        )
 
 
 @dataclasses.dataclass(slots=True)
@@ -174,5 +254,7 @@ class ProcessingScope:
     sources: tuple[str, ...] | None = None  # source ids: a workflow's
     since: datetime | None = None  # published_at >=
     until: datetime | None = None  # published_at <
+    imported_since: datetime | None = None  # imported_at >=
+    imported_until: datetime | None = None  # imported_at <
     item_ids: tuple[int, ...] | None = None  # database ids
     limit: int | None = None

@@ -1,4 +1,4 @@
-"""The digest remixer with a stub LLM: no server needed."""
+"""The digest applet with a stub LLM: no server needed."""
 
 import shutil
 import tempfile
@@ -7,17 +7,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
+from newstool.applets import AppletReader, AppletType
 from newstool.db import Database, ProcessingStatus
 from newstool.llms import LLMUnavailableError
-from newstool.models import ProcessingScope, SourceData, SourceItem
+from newstool.models import AppletRun, EmittedDocument, SourceData, SourceItem
 from newstool.plugins import Services, digest
-from newstool.remixers import RemixerType
 
 SOURCE = SourceData(id="s", name="S", url="https://s.test/", provider="plaza")
 OTHER_SOURCE = SourceData(id="o", name="O", url="https://o.test/", provider="plaza")
+# A week after 2026-10-01.
+NOW = datetime(2026, 10, 8, tzinfo=UTC)
 
 
-class DigestRemixerTests(unittest.TestCase):
+class DigestAppletTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="newstool-test-"))
         self.db = Database(
@@ -45,13 +47,14 @@ class DigestRemixerTests(unittest.TestCase):
             )
 
     def digest(
-        self, scope: ProcessingScope, response: str = "Week.", **options
-    ) -> tuple[Mock, list[tuple[str, str, str]]]:
+        self, now: datetime = NOW, response: str = "Week.", **options
+    ) -> tuple[Mock, tuple[EmittedDocument, ...]]:
         llm = Mock()
         llm.prompt.return_value = response
         services = Services(db=self.db, fetcher=Mock(), llm_factory=lambda name: llm)
-        remixer = digest.DigestRemixer(digest.DigestOptions(**options), services)
-        return llm, list(remixer.produce(scope))
+        applet = digest.DigestApplet(digest.DigestOptions(**options), services)
+        result = applet.run(now, AppletRun(app="d"), AppletReader(self.db))
+        return llm, result.documents
 
     def test_digests_newest_items_with_markdown_oldest_first(self) -> None:
         self.add_item(SOURCE, 1, "Body 1")
@@ -59,27 +62,24 @@ class DigestRemixerTests(unittest.TestCase):
         self.add_item(SOURCE, 3, None)
         self.add_item(SOURCE, 4, "Body 4")
 
-        llm, artifacts = self.digest(
-            ProcessingScope(
-                since=datetime(2026, 10, 1, tzinfo=UTC),
-                until=datetime(2026, 10, 8, tzinfo=UTC),
-            ),
+        llm, documents = self.digest(
             response="```markdown\nWeek.\n```",
             model="writer",
             max_items=2,
             max_article_chars=6,
         )
 
+        (document,) = documents
         self.assertEqual(
-            artifacts,
-            [
-                (
-                    "s/2026-10-01_2026-10-08",
-                    "# S: 2026-10-01 – 2026-10-08\n\nWeek.\n",
-                    "text/markdown",
-                )
-            ],
+            (document.output, document.key, document.content, document.content_type),
+            (
+                "digest",
+                "s/2026-10-01_2026-10-08",
+                "# S: 2026-10-01 – 2026-10-08\n\nWeek.\n",
+                "text/markdown",
+            ),
         )
+        self.assertEqual(document.title, "S: 2026-10-01 – 2026-10-08")
         (prompt,), kwargs = llm.prompt.call_args
         self.assertEqual(kwargs, {"model": "writer", "context_length": 32768})
         self.assertTrue(
@@ -89,35 +89,30 @@ class DigestRemixerTests(unittest.TestCase):
             )
         )
 
-    def test_one_digest_per_source_unless_scoped_to_one(self) -> None:
+    def test_one_digest_per_source_unless_given_sources(self) -> None:
         self.add_item(SOURCE, 1, "Body")
         self.add_item(OTHER_SOURCE, 2, "Body")
-        since = datetime(2026, 10, 1, tzinfo=UTC)
 
-        _, artifacts = self.digest(ProcessingScope(since=since))
-        self.assertEqual(
-            sorted(name.split("/")[0] for name, _, _ in artifacts), ["o", "s"]
-        )
+        _, documents = self.digest()
+        self.assertEqual(sorted(d.key.split("/")[0] for d in documents), ["o", "s"])
 
-        _, artifacts = self.digest(ProcessingScope(source="o", since=since))
-        ((name, _, _),) = artifacts
-        self.assertTrue(name.startswith("o/2026-10-01_"))
+        _, documents = self.digest(sources=["o"])
+        (document,) = documents
+        self.assertEqual(document.key, "o/2026-10-01_2026-10-08")
 
-    def test_nothing_in_scope_produces_nothing(self) -> None:
+    def test_nothing_in_the_period_emits_nothing(self) -> None:
         self.add_item(SOURCE, 1, "Body")
 
-        llm, artifacts = self.digest(ProcessingScope(), lookback="7d")
+        llm, documents = self.digest(now=datetime(2026, 11, 1, tzinfo=UTC))
 
-        self.assertEqual(artifacts, [])
+        self.assertEqual(documents, ())
         llm.prompt.assert_not_called()
 
     def test_empty_response_is_an_error(self) -> None:
         self.add_item(SOURCE, 1, "Body")
 
         with self.assertRaises(ValueError):
-            self.digest(
-                ProcessingScope(since=datetime(2026, 10, 1, tzinfo=UTC)), response=" "
-            )
+            self.digest(response=" ")
 
 
 class DigestPluginTests(unittest.TestCase):
@@ -130,18 +125,18 @@ class DigestPluginTests(unittest.TestCase):
             return llm
 
         ((name, protocol, cls),) = digest.__newstool_plugin__()
-        remixer = cls(
+        applet = cls(
             digest.DigestOptions(llm="writer"),
             Services(db=Mock(), fetcher=Mock(), llm_factory=factory),
         )
 
-        self.assertEqual((name, protocol), ("digest", RemixerType))
-        self.assertIs(remixer.llm, llm)
+        self.assertEqual((name, protocol), ("digest", AppletType))
+        self.assertIs(applet.llm, llm)
         self.assertEqual(requested, ["writer"])
 
     def test_cannot_be_built_without_an_llm(self) -> None:
         with self.assertRaises(LLMUnavailableError):
-            digest.DigestRemixer(
+            digest.DigestApplet(
                 digest.DigestOptions(), Services(db=Mock(), fetcher=Mock())
             )
 

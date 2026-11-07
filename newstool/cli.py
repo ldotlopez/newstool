@@ -28,20 +28,20 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.syntax import Syntax
 from rich.table import Table
 
-from .app import Application, LockedError
+from .app import Application, AppReport, LockedError
+from .applets import WEEKDAYS, Schedule
 from .config import DEFAULT_WORKFLOW, Config, ConfigError
 from .consts import PACKAGE_NAME
 from .db import (
     ANNOTATION_SORTS,
-    ARTIFACT_SORTS,
     DELIVERY_SORTS,
+    DOCUMENT_SORTS,
     ITEM_SORTS,
     DeliveryStatus,
 )
 from .errors import EXPECTED_ERRORS, describe, log_failure
-from .models import Delivery, ProcessingScope, SourceItem
+from .models import Delivery, DocumentFilter, ProcessingScope, SourceItem
 from .processors import RunSummary
-from .sinks import SelectionRequiredError, SubjectKindError
 
 # Help goes to stdout: rich only when stdout is a terminal.
 click = plain_click if RICH_STDOUT_DISABLED else rich_click
@@ -49,13 +49,7 @@ click = plain_click if RICH_STDOUT_DISABLED else rich_click
 LOGGER = logging.getLogger(PACKAGE_NAME)
 
 # Errors a user can fix (bad config, unknown plugin...): reported without a traceback.
-USER_ERRORS = (
-    ConfigError,
-    PluginError,
-    LockedError,
-    SelectionRequiredError,
-    SubjectKindError,
-)
+USER_ERRORS = (ConfigError, PluginError, LockedError)
 
 
 def report_user_errors[**P, R](command: Callable[P, R]) -> Callable[P, R]:
@@ -187,17 +181,51 @@ def scope_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
     return wrapper
 
 
-def parse_artifact_ids(
-    ctx: click.Context, param: click.Parameter, values: tuple[str, ...]
-) -> tuple[tuple[str, str], ...]:
-    """`<remixer>/<name>` values as pairs; the name may contain slashes."""
-    pairs = []
-    for value in values:
-        remixer, _, name = value.partition("/")
-        if not remixer or not name:
-            raise click.BadParameter(f"'{value}' is not <remixer>/<name>")
-        pairs.append((remixer, name))
-    return tuple(pairs)
+def document_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
+    """Add --app/--output/--key/--since/--until/--document/--limit, passed to
+    the command as `documents`."""
+
+    @click.option("--app", "app_id", default=None, help="Only this applet instance's")
+    @click.option("--output", default=None, help="Only this output's")
+    @click.option("--key", default=None, help="Only the documents with this key")
+    @click.option(
+        "--since", type=click.DateTime(), default=None, help="Emitted at or after (UTC)"
+    )
+    @click.option(
+        "--until", type=click.DateTime(), default=None, help="Emitted before (UTC)"
+    )
+    @click.option(
+        "--document",
+        "document_ids",
+        type=int,
+        multiple=True,
+        help="Document id (repeatable)",
+    )
+    @click.option("--limit", type=int, default=None, help="At most this many")
+    @functools.wraps(command)
+    def wrapper(
+        *args: Any,
+        app_id: str | None,
+        output: str | None,
+        key: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        document_ids: tuple[int, ...],
+        limit: int | None,
+        **kwargs: Any,
+    ) -> R:
+        documents = DocumentFilter(
+            app=app_id,
+            output=output,
+            key=key,
+            since=since.replace(tzinfo=UTC) if since else None,
+            until=until.replace(tzinfo=UTC) if until else None,
+            document_ids=document_ids or None,
+            limit=limit,
+        )
+        return command(*args, documents=documents, **kwargs)
+
+    return wrapper
 
 
 workflow_option = click.option(
@@ -208,12 +236,8 @@ workflow_option = click.option(
     help="The workflow to run",
 )
 
-artifact_ids_option = click.option(
-    "--artifact",
-    "artifact_ids",
-    multiple=True,
-    callback=parse_artifact_ids,
-    help="Artifact as <remix key>/<name> (repeatable)",
+dry_run_option = click.option(
+    "--dry-run", is_flag=True, help="Show what would be done, changing nothing"
 )
 
 
@@ -272,21 +296,30 @@ def print_process(summaries: dict[str, RunSummary]) -> int:
     return sum(s.failed for s in summaries.values())
 
 
-def print_remix(produced: dict[str, list[str]]) -> int:
-    """Print the remix summary; remixers report no failures."""
+def print_apps(reports: dict[str, AppReport]) -> int:
+    """Print the applet runs' summary; return how many failed."""
     print_table(
-        "Remix",
-        ["Remix", "Artifacts"],
-        [[name, ", ".join(names) or "-"] for name, names in produced.items()],
+        "Apps",
+        ["App", "Due", "New", "Already stored", "Error"],
+        [
+            [
+                name,
+                "yes" if r.due else "no",
+                len(r.new) if r.due else "-",
+                len(r.ignored) if r.due else "-",
+                r.error or "",
+            ]
+            for name, r in reports.items()
+        ],
     )
-    return 0
+    return sum(1 for r in reports.values() if r.error)
 
 
 def print_deliver(summaries: dict[str, RunSummary]) -> int:
     """Print the deliver summary; return how many deliveries failed."""
     print_table(
         "Deliver",
-        ["Delivery", "Delivered", "Failed"],
+        ["Sink", "Delivered", "Failed"],
         [[name, s.done, s.failed] for name, s in summaries.items()],
     )
     return sum(s.failed for s in summaries.values())
@@ -337,32 +370,13 @@ def process_cmd(
     print_process(summaries)
 
 
-@cli.command("remix")
-@click.argument("key", required=False)
-@workflow_option
-@scope_options
-@click.pass_context
-@report_user_errors
-def remix_cmd(
-    ctx: click.Context, key: str | None, workflow: str, scope: ProcessingScope
-) -> None:
-    """Run the remix run KEY, or every one of the workflow in order."""
-    app = app_from_context(ctx, write=True)
-    with progress_rows() as progress:
-        produced = run_each(
-            progress,
-            [key] if key else app.remix_keys(workflow),
-            lambda name: app.run_remix(name, scope=scope),
-        )
-    print_remix(produced)
-
-
 @cli.command("run")
 @workflow_option
 @click.pass_context
 @report_user_errors
 def run_cmd(ctx: click.Context, workflow: str) -> None:
-    """Run the workflow's import, process, remix and deliver in turn.
+    """Run the workflow's import and process in turn; `apps run` runs the
+    applets and delivers.
 
     A failure is logged and the next phase still runs; the exit status is
     non-zero if anything failed.
@@ -385,22 +399,6 @@ def run_cmd(ctx: click.Context, workflow: str) -> None:
                 lambda key: app.run_process(key, workflow=workflow),
             ),
             print_process,
-        ),
-        (
-            "remix",
-            lambda progress: run_each(
-                progress, app.remix_keys(workflow), app.run_remix
-            ),
-            print_remix,
-        ),
-        (
-            "deliver",
-            lambda progress: run_each(
-                progress,
-                app.delivery_keys(workflow),
-                lambda key: app.run_delivery(key, workflow=workflow),
-            ),
-            print_deliver,
         ),
     ]
     results = []
@@ -515,8 +513,8 @@ def annotation_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
 
 
 def delivery_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
-    """Add the item scope, --artifact, --delivery, -w, --sink and --status,
-    which select ledger rows."""
+    """Add the document filters, --delivery, --sink and --status, which
+    select ledger rows."""
     command = click.option(
         "--status",
         type=click.Choice([status.value for status in DeliveryStatus]),
@@ -524,12 +522,7 @@ def delivery_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
         help="Only deliveries in this state",
     )(command)
     command = click.option(
-        "--sink",
-        default=None,
-        help="Only this delivery key's deliveries (<workflow>/<key> in the ledger)",
-    )(command)
-    command = click.option(
-        "-w", "--workflow", default=None, help="Only this workflow's deliveries"
+        "--sink", default=None, help="Only this sink instance's deliveries"
     )(command)
     command = click.option(
         "--delivery",
@@ -538,52 +531,41 @@ def delivery_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
         multiple=True,
         help="Delivery id (repeatable)",
     )(command)
-    return scope_options(artifact_ids_option(command))
+    return document_options(command)
 
 
 def select_deliveries(
     app: Application,
-    scope: ProcessingScope,
-    artifact_ids: tuple[tuple[str, str], ...],
+    documents: DocumentFilter,
     delivery_ids: tuple[int, ...],
-    workflow: str | None,
     sink: str | None,
     status: str | None,
     sort: str,
 ) -> list[Delivery]:
-    """The ledger rows the `delivery_options` select; an explicit delivery id
-    outside the selection is an error."""
+    """The ledger rows the `delivery_options` select, `--limit` counting
+    rows; an explicit delivery id outside the selection is an error."""
     deliveries = app.find_deliveries(
-        scope,
-        workflow=workflow,
+        dataclasses.replace(documents, limit=None),
         sink=sink,
         status=DeliveryStatus(status) if status else None,
-        artifact_names=artifact_ids or None,
         delivery_ids=delivery_ids or None,
+        limit=documents.limit,
         sort=sort,
     )
-    check_found("delivery", delivery_ids, (d.id for d in deliveries))
+    if documents.limit is None:
+        check_found("delivery", delivery_ids, (d.id for d in deliveries))
     return deliveries
 
 
-def artifact_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
-    """Add --remixer/--artifact/--limit, which select artifacts."""
-    command = click.option(
-        "--limit", type=int, default=None, help="At most this many artifacts"
-    )(command)
-    command = artifact_ids_option(command)
-    return click.option(
-        "--remixer", default=None, help="Only this remix key's artifacts"
-    )(command)
-
-
-def sort_option(keys: Iterable[str]) -> Callable[[Callable], Callable]:
-    """--sort among `keys`, oldest (or smallest) first; `updated` by default.
-    It also decides which rows --limit keeps."""
+def sort_option(
+    keys: Iterable[str], default: str = "updated"
+) -> Callable[[Callable], Callable]:
+    """--sort among `keys`, oldest (or smallest) first; `default` when not
+    given. It also decides which rows --limit keeps."""
     return click.option(
         "--sort",
         type=click.Choice(sorted(keys)),
-        default="updated",
+        default=default,
         show_default=True,
         help="Sort key, ascending (oldest first for dates)",
     )
@@ -614,8 +596,8 @@ def inspect_group() -> None:
 
 def print_item(item: SourceItem, annotations: list[tuple[int, str, str]]) -> None:
     """One item as field/value rows, one row per annotation."""
-    dates = (item.published_at, item.modified_at)
-    published, modified = (f"{d:%Y-%m-%d %H:%M}" if d else "" for d in dates)
+    dates = (item.published_at, item.modified_at, item.imported_at)
+    published, modified, imported = (f"{d:%Y-%m-%d %H:%M}" if d else "" for d in dates)
     print_table(
         f"Item {item.id}",
         ["Field", "Value"],
@@ -626,6 +608,7 @@ def print_item(item: SourceItem, annotations: list[tuple[int, str, str]]) -> Non
             ["URI", item.uri],
             ["Published", published],
             ["Modified", modified],
+            ["Imported", imported],
             ["Mimetype", item.mimetype],
             ["Content", f"inspect content --sha256 {item.content_sha256}"],
             ["Data", format_value(item.data)],
@@ -670,6 +653,7 @@ def inspect_items_cmd(
                     "data": item.data,
                     "published_at": item.published_at,
                     "modified_at": item.modified_at,
+                    "imported_at": item.imported_at,
                     "annotations": [
                         {"id": annotation_id, "processor": processor, "key": key}
                         for annotation_id, processor, key in annotations.get(
@@ -764,74 +748,128 @@ def inspect_annotations_cmd(
         )
 
 
-@inspect_group.command("artifacts")
-@artifact_options
-@sort_option(ARTIFACT_SORTS)
+@inspect_group.command("documents")
+@document_options
+@sort_option(DOCUMENT_SORTS, "emitted")
 @format_option
 @click.pass_context
 @report_user_errors
-def inspect_artifacts_cmd(
-    ctx: click.Context,
-    remixer: str | None,
-    artifact_ids: tuple[tuple[str, str], ...],
-    limit: int | None,
-    sort: str,
-    output_format: str,
+def inspect_documents_cmd(
+    ctx: click.Context, documents: DocumentFilter, sort: str, output_format: str
 ) -> None:
-    """Stored artifacts. Contents are loaded only for --artifact.
+    """Documents the applet instances emitted. Contents are loaded only for
+    --document.
 
-    One --artifact in table format prints its content to stdout and its
+    One --document in table format prints its content to stdout and its
     metadata to stderr, so it can be redirected.
     """
     app = app_from_context(ctx)
-    artifacts = app.list_artifacts(
-        remixer, names=artifact_ids or None, limit=limit, sort=sort
-    )
-    if limit is None:
-        check_found(
-            "artifact",
-            (f"{r}/{n}" for r, n in artifact_ids),
-            (f"{a.remixer}/{a.name}" for a in artifacts),
-        )
-    if artifact_ids:
-        artifacts = [app.get_artifact(a.remixer, a.name) for a in artifacts]
+    with_content = bool(documents.document_ids)
+    found = app.find_documents(documents, sort=sort, with_content=with_content)
+    if documents.limit is None:
+        check_found("document", documents.document_ids or (), (d.id for d in found))
 
     if output_format == "json":
         records = []
-        for artifact in artifacts:
-            record = {
-                "id": f"{artifact.remixer}/{artifact.name}",
-                "remixer": artifact.remixer,
-                "name": artifact.name,
-                "content_type": artifact.content_type,
-                "created_at": artifact.created_at,
-                "updated_at": artifact.updated_at,
-            }
-            if artifact_ids:
-                record["content"] = artifact.content
+        for document in found:
+            record = dataclasses.asdict(document)
+            if not with_content:
+                del record["content"]
             records.append(record)
         print_json(records)
-    elif len(artifact_ids) == 1:
-        (artifact,) = artifacts
+    elif len(documents.document_ids or ()) == 1 and found:
+        (document,) = found
         click.echo(
-            f"{artifact.remixer}/{artifact.name} · {artifact.content_type} · "
-            f"updated {artifact.updated_at:%Y-%m-%d %H:%M}",
+            f"{document.id} · {document.label} · {document.content_type} · "
+            f"emitted {document.emitted_at:%Y-%m-%d %H:%M}",
             err=True,
         )
-        print_content(artifact.content, artifact.content_type)
+        print_content(document.content or "", document.content_type)
     else:
         print_table(
-            "Artifacts",
-            ["ID", "Type", "Updated"],
+            "Documents",
+            ["ID", "App", "Output", "Key", "Type", "Emitted", "Title"],
             [
                 [
-                    f"{a.remixer}/{a.name}",
-                    a.content_type,
-                    f"{a.updated_at:%Y-%m-%d %H:%M}",
+                    d.id,
+                    d.app,
+                    d.output,
+                    d.key,
+                    d.content_type,
+                    f"{d.emitted_at:%Y-%m-%d %H:%M}",
+                    d.title or "",
                 ]
-                for a in artifacts
+                for d in found
             ],
         )
+
+
+def format_seconds(seconds: float) -> str:
+    """A duration as the config writes it: `3d`, `2h`, `5m` or `90s`."""
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds and seconds % size == 0:
+            return f"{int(seconds // size)}{unit}"
+    return f"{seconds:g}s"
+
+
+def describe_schedule(schedule: Schedule) -> str:
+    """The schedule as the config writes it; `always` when unrestricted."""
+    parts = []
+    if schedule.every:
+        parts.append(f"every {format_seconds(schedule.every)}")
+    if schedule.days:
+        parts.append("days " + ",".join(WEEKDAYS[day] for day in sorted(schedule.days)))
+    if schedule.at is not None:
+        parts.append(f"at {schedule.at:%H:%M}")
+    return " ".join(parts) or "always"
+
+
+def format_time(moment: datetime | None) -> str:
+    return f"{moment.astimezone():%Y-%m-%d %H:%M}" if moment else ""
+
+
+@inspect_group.command("apps")
+@format_option
+@click.pass_context
+@report_user_errors
+def inspect_apps_cmd(ctx: click.Context, output_format: str) -> None:
+    """The applet instances: their schedule, last runs and next due time,
+    in local time."""
+    statuses = app_from_context(ctx).app_status(datetime.now(UTC))
+    if output_format == "json":
+        print_json(
+            [
+                {
+                    "id": status.instance.id,
+                    "app": status.instance.profile.name,
+                    "schedule": describe_schedule(status.instance.schedule),
+                    "routes": dict(status.instance.routes),
+                    "last_started": status.run.last_started,
+                    "last_success": status.run.last_success,
+                    "last_error": status.run.last_error,
+                    "next_due": status.next_due,
+                    "state": status.run.state,
+                }
+                for status in statuses
+            ]
+        )
+        return
+    print_table(
+        "Apps",
+        ["ID", "App", "Schedule", "Last started", "Last success", "Next due", "Error"],
+        [
+            [
+                status.instance.id,
+                status.instance.profile.name,
+                describe_schedule(status.instance.schedule),
+                format_time(status.run.last_started),
+                format_time(status.run.last_success),
+                format_time(status.next_due),
+                preview(status.run.last_error or ""),
+            ]
+            for status in statuses
+        ],
+    )
 
 
 @inspect_group.command("content")
@@ -839,7 +877,7 @@ def inspect_artifacts_cmd(
 @click.pass_context
 @report_user_errors
 def inspect_content_cmd(ctx: click.Context, sha256: str) -> None:
-    """Stored content (of an item, annotation or artifact) as is, to stdout."""
+    """Stored content (of an item, annotation or document) as is, to stdout."""
     try:
         content = app_from_context(ctx).get_stored_content(sha256)
     except EntryNotFoundError as e:
@@ -855,29 +893,16 @@ def inspect_content_cmd(ctx: click.Context, sha256: str) -> None:
 @report_user_errors
 def inspect_deliveries_cmd(
     ctx: click.Context,
-    scope: ProcessingScope,
-    artifact_ids: tuple[tuple[str, str], ...],
+    documents: DocumentFilter,
     delivery_ids: tuple[int, ...],
-    workflow: str | None,
     sink: str | None,
     status: str | None,
     sort: str,
     output_format: str,
 ) -> None:
-    """The delivery ledger; --limit counts rows.
-
-    Item filters keep item deliveries, --artifact artifact deliveries.
-    Without -w, --sink shows that key in every workflow.
-    """
+    """The delivery ledger; --limit counts rows."""
     deliveries = select_deliveries(
-        app_from_context(ctx),
-        scope,
-        artifact_ids,
-        delivery_ids,
-        workflow,
-        sink,
-        status,
-        sort,
+        app_from_context(ctx), documents, delivery_ids, sink, status, sort
     )
 
     if output_format == "json":
@@ -886,12 +911,12 @@ def inspect_deliveries_cmd(
 
     print_table(
         "Deliveries",
-        ["ID", "Sink", "Subject", "Status", "Attempts", "Updated", "Error"],
+        ["ID", "Sink", "Document", "Status", "Attempts", "Updated", "Error"],
         [
             [
                 d.id,
                 d.sink,
-                f"item {d.item_id}" if d.item_id is not None else d.artifact_name,
+                f"{d.document_id} {d.document_label}",
                 d.status,
                 d.attempts,
                 f"{d.updated_at:%Y-%m-%d %H:%M}",
@@ -904,13 +929,6 @@ def inspect_deliveries_cmd(
 
 # --- Deletion ---------------------------------------------------------------
 
-force_delete_option = click.option(
-    "--force",
-    is_flag=True,
-    help="Also delete what has deliveries, and their ledger rows, so it can be"
-    " delivered again",
-)
-
 
 def require_selection(*filters: object, action: str = "delete") -> None:
     """Refuse a selection that names no filter or id: it would match all."""
@@ -918,42 +936,25 @@ def require_selection(*filters: object, action: str = "delete") -> None:
         raise click.UsageError(f"name a filter or an id to select what to {action}")
 
 
-def require_workflow(workflow: str | None) -> str:
-    """Commands that change the ledger act on one workflow, named."""
-    if workflow is None:
-        raise click.UsageError("name the workflow with -w/--workflow")
-    return workflow
-
-
-def subject_filters(
-    scope: ProcessingScope, artifact_ids: tuple[tuple[str, str], ...]
-) -> tuple[object, ...]:
-    """The filters of a `delivery_options` selection that name subjects."""
-    return (scope.source, scope.since, scope.until, scope.item_ids, artifact_ids)
-
-
 def delivery_filters(
-    scope: ProcessingScope,
-    artifact_ids: tuple[tuple[str, str], ...],
+    documents: DocumentFilter,
     delivery_ids: tuple[int, ...],
     sink: str | None,
     status: str | None,
 ) -> tuple[object, ...]:
     """What a `delivery_options` selection names, for `require_selection`."""
-    return (*subject_filters(scope, artifact_ids), delivery_ids, sink, status)
+    return (documents.is_set(), delivery_ids, sink, status)
 
 
 def check_all_rows(
     all_rows: bool,
-    scope: ProcessingScope,
-    artifact_ids: tuple[tuple[str, str], ...],
+    documents: DocumentFilter,
     delivery_ids: tuple[int, ...],
     status: str | None,
 ) -> None:
-    """`--all` takes -w and --sink only."""
-    filters = (*subject_filters(scope, artifact_ids), delivery_ids, status)
-    if all_rows and any(filters):
-        raise click.UsageError("--all takes no filter or id but -w and --sink")
+    """`--all` takes --sink only."""
+    if all_rows and (documents.is_set() or delivery_ids or status):
+        raise click.UsageError("--all takes no filter or id but --sink")
 
 
 @cli.group("delete")
@@ -965,31 +966,20 @@ def delete_group() -> None:
 @delete_group.command("items")
 @scope_options
 @sort_option(ITEM_SORTS)
-@force_delete_option
 @click.pass_context
 @report_user_errors
-def delete_items_cmd(
-    ctx: click.Context, scope: ProcessingScope, sort: str, force: bool
-) -> None:
-    """Delete items with their processing state, annotations and deliveries.
+def delete_items_cmd(ctx: click.Context, scope: ProcessingScope, sort: str) -> None:
+    """Delete items with their processing state and annotations.
 
-    Items with deliveries are skipped unless --force. An item still in its
-    source's index comes back on the next import, with a new id.
+    An item still in its source's index comes back on the next import, with
+    a new id. Documents built from them stay.
     """
     require_selection(scope.source, scope.since, scope.until, scope.item_ids)
     app = app_from_context(ctx, write=True)
     items = app.get_items(scope, sort=sort)
     if scope.limit is None:
         check_found("item", scope.item_ids or (), (item.id for item in items))
-
-    delivered: set[int | None] = set()
-    if items and not force:
-        selected = ProcessingScope(item_ids=tuple(item.id for item in items))
-        delivered = {d.item_id for d in app.find_deliveries(selected)}
-        for item_id in sorted(delivered):
-            click.echo(f"Skipped item {item_id}: it has deliveries (--force)", err=True)
-
-    deleted = app.delete_items(item.id for item in items if item.id not in delivered)
+    deleted = app.delete_items(item.id for item in items)
     click.echo(f"Deleted {deleted} item(s)")
 
 
@@ -1034,56 +1024,31 @@ def delete_annotations_cmd(
     click.echo(f"Deleted {deleted} annotation(s); their items are pending again")
 
 
-@delete_group.command("artifacts")
-@artifact_options
-@sort_option(ARTIFACT_SORTS)
-@force_delete_option
+@delete_group.command("documents")
+@document_options
+@sort_option(DOCUMENT_SORTS, "emitted")
 @click.pass_context
 @report_user_errors
-def delete_artifacts_cmd(
-    ctx: click.Context,
-    remixer: str | None,
-    artifact_ids: tuple[tuple[str, str], ...],
-    limit: int | None,
-    sort: str,
-    force: bool,
+def delete_documents_cmd(
+    ctx: click.Context, documents: DocumentFilter, sort: str
 ) -> None:
-    """Delete artifacts with their deliveries; the next run of their
-    remixer rebuilds them.
+    """Delete documents with their deliveries.
 
-    Artifacts with deliveries are skipped unless --force.
+    A document with a delivery that is not `done` is refused. Deleting a
+    document frees its key: an applet that emits it again stores it anew.
     """
-    require_selection(remixer, artifact_ids)
+    require_selection(documents.is_set())
     app = app_from_context(ctx, write=True)
-    artifacts = app.list_artifacts(
-        remixer, names=artifact_ids or None, limit=limit, sort=sort
-    )
-    if limit is None:
-        check_found(
-            "artifact",
-            (f"{r}/{n}" for r, n in artifact_ids),
-            (f"{a.remixer}/{a.name}" for a in artifacts),
+    found = app.find_documents(documents, sort=sort)
+    if documents.limit is None:
+        check_found("document", documents.document_ids or (), (d.id for d in found))
+    summary = app.delete_documents(d.id for d in found if d.id is not None)
+    for document_id in summary.refused:
+        click.echo(
+            f"Refused document {document_id}: it has deliveries not `done`",
+            err=True,
         )
-
-    delivered: set[str | None] = set()
-    if artifacts and not force:
-        delivered = {
-            d.artifact_name
-            for d in app.find_deliveries(
-                artifact_names=[(a.remixer, a.name) for a in artifacts]
-            )
-        }
-        for name in sorted(n for n in delivered if n is not None):
-            click.echo(
-                f"Skipped artifact {name}: it has deliveries (--force)", err=True
-            )
-
-    deleted = app.delete_artifacts(
-        (a.remixer, a.name)
-        for a in artifacts
-        if f"{a.remixer}/{a.name}" not in delivered
-    )
-    click.echo(f"Deleted {deleted} artifact(s)")
+    click.echo(f"Deleted {summary.deleted} document(s)")
 
 
 @delete_group.command("deliveries")
@@ -1093,37 +1058,30 @@ def delete_artifacts_cmd(
     "--all",
     "all_rows",
     is_flag=True,
-    help="Every row of the workflow, or of --sink; takes no other filter",
+    help="Every row, or every row of --sink; takes no other filter",
 )
 @click.pass_context
 @report_user_errors
 def delete_deliveries_cmd(
     ctx: click.Context,
-    scope: ProcessingScope,
-    artifact_ids: tuple[tuple[str, str], ...],
+    documents: DocumentFilter,
     delivery_ids: tuple[int, ...],
-    workflow: str | None,
     sink: str | None,
     status: str | None,
     sort: str,
     all_rows: bool,
 ) -> None:
-    """Delete one workflow's ledger rows; --limit counts rows.
+    """Delete ledger rows; --limit counts rows.
 
-    A deleted subject is queued again by the next run of its delivery while
-    its lookback still covers it, and is then delivered again.
+    Their documents are not delivered again unless `deliveries set-status`
+    creates rows for them.
     """
-    require_workflow(workflow)
-    check_all_rows(all_rows, scope, artifact_ids, delivery_ids, status)
+    check_all_rows(all_rows, documents, delivery_ids, status)
     if not all_rows:
-        require_selection(
-            *delivery_filters(scope, artifact_ids, delivery_ids, sink, status)
-        )
+        require_selection(*delivery_filters(documents, delivery_ids, sink, status))
     app = app_from_context(ctx, write=True)
-    deliveries = select_deliveries(
-        app, scope, artifact_ids, delivery_ids, workflow, sink, status, sort
-    )
-    deleted = app.delete_deliveries(d.id for d in deliveries)
+    deliveries = select_deliveries(app, documents, delivery_ids, sink, status, sort)
+    deleted = app.delete_deliveries(d.id for d in deliveries if d.id is not None)
     click.echo(f"Deleted {deleted} delivery(ies)")
 
 
@@ -1151,23 +1109,21 @@ def deliveries_group() -> None:
     "--all",
     "all_rows",
     is_flag=True,
-    help="With --sink, every subject of the delivery; without it, every row"
-    " of the workflow. Takes no other filter",
+    help="With --sink, every document routed to it; without it, every row."
+    " Takes no other filter",
 )
 @click.option(
     "--overwrite",
     is_flag=True,
-    help="With --sink, also change the subjects' existing rows",
+    help="With --sink, also change the documents' existing rows",
 )
 @click.option("--dry-run", is_flag=True, help="Count, without changing anything")
 @click.pass_context
 @report_user_errors
 def deliveries_set_status_cmd(
     ctx: click.Context,
-    scope: ProcessingScope,
-    artifact_ids: tuple[tuple[str, str], ...],
+    documents: DocumentFilter,
     delivery_ids: tuple[int, ...],
-    workflow: str | None,
     sink: str | None,
     status: str | None,
     sort: str,
@@ -1176,41 +1132,37 @@ def deliveries_set_status_cmd(
     overwrite: bool,
     dry_run: bool,
 ) -> None:
-    """Set the state of one workflow's deliveries.
+    """Set the state of deliveries.
 
-    With --sink and subject filters (or --all), every selected subject gets
-    a row of that delivery, whatever the lookback or the annotation it
-    requires; --limit counts subjects. Existing rows are left as they are
-    unless --overwrite. `--all --as done` marks what a new delivery must not
-    send.
+    With --sink and document filters (or --all), every selected document
+    routed to that sink gets a row of it; --limit counts documents. Existing
+    rows are left as they are unless --overwrite. That queues documents
+    emitted before a route was added (`--as queued`).
 
     Otherwise, or with --delivery or --status, it changes the selected rows;
     --limit counts rows. That settles an interrupted `sending` row (`--as
     done` or `--as queued`), or requeues failed ones (`--as queued`).
     """
-    workflow = require_workflow(workflow)
-    check_all_rows(all_rows, scope, artifact_ids, delivery_ids, status)
-    by_subject = (
+    check_all_rows(all_rows, documents, delivery_ids, status)
+    by_document = (
         sink is not None
         and not (delivery_ids or status)
-        and (all_rows or any(subject_filters(scope, artifact_ids)))
+        and (all_rows or documents.is_set())
     )
-    if overwrite and not by_subject:
+    if overwrite and not by_document:
         raise click.UsageError(
-            "--overwrite needs --sink and subject filters (or --all), and no"
+            "--overwrite needs --sink and document filters (or --all), and no"
             " --delivery or --status"
         )
     verb = "Would mark" if dry_run else "Marked"
     app = app_from_context(ctx, write=not dry_run)
 
-    if by_subject:
+    if by_document:
         assert sink is not None
         summary = app.mark_deliveries(
             sink,
             DeliveryStatus(target),
-            scope,
-            artifact_ids,
-            workflow=workflow,
+            documents,
             overwrite=overwrite,
             dry_run=dry_run,
         )
@@ -1228,12 +1180,10 @@ def deliveries_set_status_cmd(
 
     if not all_rows:
         require_selection(
-            *delivery_filters(scope, artifact_ids, delivery_ids, sink, status),
+            *delivery_filters(documents, delivery_ids, sink, status),
             action="change",
         )
-    deliveries = select_deliveries(
-        app, scope, artifact_ids, delivery_ids, workflow, sink, status, sort
-    )
+    deliveries = select_deliveries(app, documents, delivery_ids, sink, status, sort)
     if dry_run:
         changed = len(deliveries)
     else:
@@ -1248,27 +1198,146 @@ def deliveries_set_status_cmd(
 @report_user_errors
 def deliveries_send_cmd(
     ctx: click.Context,
-    scope: ProcessingScope,
-    artifact_ids: tuple[tuple[str, str], ...],
+    documents: DocumentFilter,
     delivery_ids: tuple[int, ...],
-    workflow: str | None,
     sink: str | None,
     status: str | None,
     sort: str,
 ) -> None:
-    """Send one workflow's ledger rows now, whatever their state, with no
-    backoff or pacing.
+    """Send ledger rows now, whatever their state, with no backoff or
+    pacing.
 
     A row is sent again even if it is `done`. Exits non-zero if any fails.
     """
-    require_workflow(workflow)
     require_selection(
-        *delivery_filters(scope, artifact_ids, delivery_ids, sink, status),
-        action="send",
+        *delivery_filters(documents, delivery_ids, sink, status), action="send"
     )
     app = app_from_context(ctx, write=True)
-    deliveries = select_deliveries(
-        app, scope, artifact_ids, delivery_ids, workflow, sink, status, sort
-    )
+    deliveries = select_deliveries(app, documents, delivery_ids, sink, status, sort)
     if print_deliver(app.send_deliveries(deliveries)):
         ctx.exit(1)
+
+
+@cli.command("deliver")
+@click.option(
+    "--sink", "sink_ids", multiple=True, help="Only this sink instance (repeatable)"
+)
+@dry_run_option
+@click.pass_context
+@report_user_errors
+def deliver_cmd(ctx: click.Context, sink_ids: tuple[str, ...], dry_run: bool) -> None:
+    """Send every sink instance's pending deliveries, paced; `apps run`
+    does this after running the applets."""
+    app = app_from_context(ctx, write=not dry_run)
+    now = datetime.now(UTC)
+    selected = list(sink_ids) or app.sink_ids
+    if dry_run:
+        rows = [
+            [d.id, d.sink, f"{d.document_id} {d.document_label}", d.status]
+            for sink_id in selected
+            for d in app.plan_delivery(sink_id, now)
+        ]
+        print_table("Would deliver", ["ID", "Sink", "Document", "Status"], rows)
+        return
+    if failed := run_delivery(app, selected, now):
+        raise click.ClickException(f"{failed} delivery(ies) failed")
+
+
+def run_delivery(app: Application, sink_ids: list[str], now: datetime) -> int:
+    """Deliver for each sink instance and print the summary; return how many
+    deliveries failed."""
+    with progress_rows() as progress:
+        summaries = run_each(progress, sink_ids, lambda sink: app.deliver(sink, now))
+    for sink, count in app.unconfigured_pending().items():
+        LOGGER.warning(
+            f"{sink}: not configured, {count} pending delivery(ies) left as they are"
+        )
+    return print_deliver(summaries)
+
+
+# --- Applets ----------------------------------------------------------------
+
+
+@cli.group("apps")
+def apps_group() -> None:
+    """Run applet instances, or reset them."""
+
+
+@apps_group.command("run")
+@click.option(
+    "--app", "app_ids", multiple=True, help="Only this applet instance (repeatable)"
+)
+@click.option("--force", is_flag=True, help="Run even if not due")
+@dry_run_option
+@click.pass_context
+@report_user_errors
+def apps_run_cmd(
+    ctx: click.Context, app_ids: tuple[str, ...], force: bool, dry_run: bool
+) -> None:
+    """Run the applet instances that are due, then deliver.
+
+    --dry-run runs them and shows the documents they would emit, storing and
+    delivering nothing. Exits non-zero if anything failed.
+    """
+    app = app_from_context(ctx, write=not dry_run)
+    now = datetime.now(UTC)
+    selected = list(app_ids) or app.app_ids
+    for app_id in selected:
+        app.app_instance(app_id)
+    with progress_rows() as progress:
+        reports = run_each(
+            progress,
+            selected,
+            lambda app_id: app.run_app(app_id, now, force=force, dry_run=dry_run),
+        )
+    failures = print_apps(reports)
+    if dry_run:
+        print_emitted(reports)
+    else:
+        failures += run_delivery(app, app.sink_ids, now)
+    if failures:
+        raise click.ClickException(f"{failures} failure(s); see the log above")
+
+
+def print_emitted(reports: dict[str, AppReport]) -> None:
+    """The documents a dry run would emit, and each instance's new state."""
+    rows = [
+        [name, output, key, label]
+        for name, report in reports.items()
+        for pairs, label in ((report.new, "new"), (report.ignored, "already stored"))
+        for output, key in pairs
+    ]
+    print_table("Documents", ["App", "Output", "Key", "Status"], rows)
+    print_table(
+        "States",
+        ["App", "State"],
+        [
+            [name, preview(report.state)]
+            for name, report in reports.items()
+            if report.due and report.error is None
+        ],
+    )
+
+
+@apps_group.command("reset")
+@click.argument("app_id")
+@click.option(
+    "--with-documents",
+    is_flag=True,
+    help="Also delete its documents and their deliveries",
+)
+@dry_run_option
+@click.pass_context
+@report_user_errors
+def apps_reset_cmd(
+    ctx: click.Context, app_id: str, with_documents: bool, dry_run: bool
+) -> None:
+    """Delete APP_ID's state and run times, so it starts from scratch.
+
+    Its documents stay unless --with-documents, so what it emits again under
+    their keys is not delivered again. The instance need not be configured.
+    """
+    app = app_from_context(ctx, write=not dry_run)
+    deleted = app.reset_app(app_id, with_documents=with_documents, dry_run=dry_run)
+    verb = "Would reset" if dry_run else "Reset"
+    click.echo(f"{verb} {app_id}; {deleted} document(s) deleted")

@@ -1,6 +1,7 @@
 """Application: the single entry point for front ends (CLI, scripts) and
 external tools. It owns the wiring (config, HTTP cache, database, plugins),
-runs the four phases (import, process, remix, deliver) and answers queries.
+runs the workflows' phases (import, process), the applets and the
+deliveries, and answers queries.
 """
 
 from __future__ import annotations
@@ -15,19 +16,23 @@ from types import TracebackType
 from typing import IO, Any, Self
 
 from foundation.cache import UserCache
+from foundation.jsonlib import JsonCompatible
 from sqlalchemy import make_url
 
-from .catalog import Catalog, Profile
+from .applets import AppletReader, check_result
+from .catalog import AppInstance, Catalog, Profile
 from .config import DEFAULT_WORKFLOW, Config, ConfigError, Workflow
 from .consts import PACKAGE_NAME
 from .db import Database, DeliveryStatus
-from .errors import describe
+from .errors import describe, log_failure, reason
 from .httpclient import HTTPClient
 from .llms import LLM
 from .models import (
     Annotation,
-    Artifact,
+    AppletRun,
     Delivery,
+    Document,
+    DocumentFilter,
     ItemKey,
     ProcessingScope,
     SourceData,
@@ -37,7 +42,7 @@ from .models import (
 from .plugins import ClassRegister, Services
 from .processors import RunSummary
 from .providers import PreflightProvider
-from .sinks import ArtifactNames
+from .sinks import Deliverer
 
 PLUGINS_NAMESPACE = "newstool.plugins"
 PLUGIN_ENTRY_POINT = "__newstool_plugin__"
@@ -63,6 +68,37 @@ class MarkSummary:
     kept: int = 0
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class DeleteSummary:
+    """What `delete_documents` deleted, and the ids it refused."""
+
+    deleted: int = 0
+    refused: list[int] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AppReport:
+    """What a run of an applet instance did, or would do: whether it was
+    due, its error, and the `(output, key)` of the documents it emitted, new
+    or already stored."""
+
+    app: str
+    due: bool
+    error: str | None = None
+    new: tuple[tuple[str, str], ...] = ()
+    ignored: tuple[tuple[str, str], ...] = ()
+    state: JsonCompatible = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AppStatus:
+    """An instance with its run record and when it is next due."""
+
+    instance: AppInstance
+    run: AppletRun
+    next_due: datetime
+
+
 class Application:
     def __init__(self, config: Config, *, create_schema: bool = True) -> None:
         self.config = config
@@ -75,6 +111,7 @@ class Application:
         self._db = Database(
             config.database_uri, config.content_dir, create_schema=create_schema
         )
+        self._reader = AppletReader(self._db)
         self._cache = UserCache(
             app=PACKAGE_NAME,
             expiration_time=config.cache.expiration,
@@ -159,23 +196,10 @@ class Application:
             if name == workflow and processor in (None, run.profile.name)
         ]
 
-    def remix_keys(self, workflow: str = DEFAULT_WORKFLOW) -> list[str]:
-        """The keys of the workflow's remix runs, in order."""
-        self.workflow(workflow)
-        return [
-            key
-            for key, run in self._catalog.remix.items()
-            if run.workflow.name == workflow
-        ]
-
-    def delivery_keys(self, workflow: str = DEFAULT_WORKFLOW) -> list[str]:
-        """The keys of the workflow's delivery runs, in order."""
-        self.workflow(workflow)
-        return [
-            run.key
-            for run in self._catalog.deliveries.values()
-            if run.workflow.name == workflow
-        ]
+    @property
+    def app_ids(self) -> list[str]:
+        """Every applet instance, in configuration order."""
+        return list(self._catalog.apps)
 
     # --- Import ------------------------------------------------------------
 
@@ -266,42 +290,123 @@ class Application:
             force=force,
         )
 
-    # --- Remix -------------------------------------------------------------
+    # --- Applets -----------------------------------------------------------
 
-    def run_remix(self, key: str, *, scope: ProcessingScope | None = None) -> list[str]:
-        """Run the remix run `key` on its workflow's sources; return the
-        names of the artifacts saved under `key`."""
-        if (run := self._catalog.remix.get(key)) is None:
-            raise ConfigError(f"no workflow has a remix run '{key}'")
-        return self._object(run.profile).remix(
-            key=key,
-            scope=workflow_scope(run.workflow, scope),
+    def app_instance(self, app_id: str) -> AppInstance:
+        return lookup(self._catalog.apps, app_id, "app")
+
+    def app_status(self, now: datetime) -> list[AppStatus]:
+        """Every instance's run record and next due time, in configuration
+        order."""
+        runs = self._db.get_app_runs()
+        statuses = []
+        for app in self._catalog.apps.values():
+            run = runs.get(app.id, AppletRun(app=app.id))
+            statuses.append(
+                AppStatus(
+                    instance=app,
+                    run=run,
+                    next_due=app.schedule.next_due(now, run.last_success),
+                )
+            )
+        return statuses
+
+    def run_app(
+        self,
+        app_id: str,
+        now: datetime,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> AppReport:
+        """Run the instance if it is due (always with `force`) and store
+        what it returns, or record its failure. With `dry_run`, report what
+        it would emit and store nothing."""
+        app = self.app_instance(app_id)
+        applet = self._object(app.profile)
+        run = self._db.get_app_run(app_id)
+        if not force and not applet.is_due(now, run, app.schedule):
+            return AppReport(app_id, due=False)
+        if not dry_run:
+            self._db.start_app_run(app_id, now)
+        try:
+            result = applet.run(now, run, self._reader)
+            check_result(result, app.profile.cls.outputs)
+        except Exception as e:  # noqa: BLE001
+            # One failing applet must not stop the others; the run record and
+            # the summary report it.
+            log_failure(LOGGER, f"{app_id}: run failed", e)
+            if not dry_run:
+                self._db.fail_app_run(app_id, reason(e))
+            return AppReport(app_id, due=True, error=describe(e))
+
+        emitted = [(d.output, d.key) for d in result.documents]
+        if dry_run:
+            existing = self._db.existing_document_keys(app_id, emitted)
+            return AppReport(
+                app_id,
+                due=True,
+                new=tuple(pair for pair in emitted if pair not in existing),
+                ignored=tuple(pair for pair in emitted if pair in existing),
+                state=result.state,
+            )
+        stored = self._db.commit_app_run(app_id, now, result, app.routes)
+        new = {(d.output, d.key) for d in stored}
+        LOGGER.info(
+            f"{app_id}: {len(new)} new document(s),"
+            f" {len(emitted) - len(new)} already stored"
         )
+        return AppReport(
+            app_id,
+            due=True,
+            new=tuple(pair for pair in emitted if pair in new),
+            ignored=tuple(pair for pair in emitted if pair not in new),
+            state=result.state,
+        )
+
+    def reset_app(
+        self, app_id: str, *, with_documents: bool = False, dry_run: bool = False
+    ) -> int:
+        """Delete the instance's run record; with `with_documents`, also its
+        documents and their deliveries. Returns how many documents were (or
+        would be) deleted. The instance need not be configured any more."""
+        if dry_run:
+            if not with_documents:
+                return 0
+            return len(self._db.find_documents(DocumentFilter(app=app_id)))
+        return self._db.reset_app(app_id, with_documents=with_documents)
 
     # --- Deliver -----------------------------------------------------------
 
-    def run_delivery(
-        self,
-        key: str,
-        *,
-        workflow: str = DEFAULT_WORKFLOW,
-        scope: ProcessingScope | None = None,
-        artifacts: ArtifactNames = (),
-        requeue: bool = False,
-        force: bool = False,
-    ) -> RunSummary:
-        """Run the workflow's delivery run `key` on its sources. `force`
-        sends the selected subjects now and needs an explicit selection."""
-        ledger_key = self.workflow(workflow).ledger_key(key)
-        if (run := self._catalog.deliveries.get(ledger_key)) is None:
-            raise ConfigError(f"workflow '{workflow}' has no delivery '{key}'")
-        return self._object(run.profile).deliver(
-            key=ledger_key,
-            scope=workflow_scope(run.workflow, scope),
-            artifacts=artifacts,
-            requeue=requeue,
-            force=force,
-        )
+    def sink_profile(self, sink_id: str) -> Profile:
+        return lookup(self._catalog.sinks, sink_id, "sink")
+
+    def _deliverer(self, sink_id: str) -> Deliverer:
+        profile = self.sink_profile(sink_id)
+        return Deliverer(self._db, sink_id, self._object(profile), profile.options)
+
+    @property
+    def sink_ids(self) -> list[str]:
+        """Every sink instance, in configuration order."""
+        return list(self._catalog.sinks)
+
+    def plan_delivery(self, sink_id: str, now: datetime) -> list[Delivery]:
+        """The rows a delivery run of the sink instance would send now."""
+        return [delivery for delivery, _ in self._deliverer(sink_id).plan(now)]
+
+    def deliver(self, sink_id: str, now: datetime) -> RunSummary:
+        """Send the sink instance's pending rows, paced."""
+        return self._deliverer(sink_id).deliver(now)
+
+    def unconfigured_pending(self) -> dict[str, int]:
+        """Pending rows of sinks no longer configured, counted by sink."""
+        counts: dict[str, int] = {}
+        for delivery, _ in self._db.deliveries_of(
+            statuses=[DeliveryStatus.QUEUED, DeliveryStatus.ERROR]
+        ):
+            if delivery.sink not in self._catalog.sinks:
+                counts[delivery.sink] = counts.get(delivery.sink, 0) + 1
+        return counts
 
     # --- Queries -----------------------------------------------------------
 
@@ -356,45 +461,61 @@ class Application:
         """One annotation's value per item; items without it are absent."""
         return self._db.get_annotation_values(items, key=key)
 
-    def get_artifact(self, remixer: str, name: str) -> Artifact | None:
-        """The artifact with its content, or None if it does not exist."""
-        return self._db.get_artifact(remixer, name)
+    # --- Documents ---------------------------------------------------------
 
-    def list_artifacts(
+    def find_documents(
         self,
-        remixer: str | None = None,
+        selection: DocumentFilter | None = None,
         *,
-        names: Iterable[tuple[str, str]] | None = None,
-        limit: int | None = None,
-        sort: str = "id",
-    ) -> list[Artifact]:
-        """Artifacts' metadata by a `db.ARTIFACT_SORTS` key; `content` is
-        None. `names` keeps only these `(remixer, name)` pairs."""
-        return self._db.list_artifacts(remixer, names=names, limit=limit, sort=sort)
+        sort: str = "emitted",
+        with_content: bool = False,
+    ) -> list[Document]:
+        """Documents by a `db.DOCUMENT_SORTS` key, ascending; contents only
+        `with_content`."""
+        return self._db.find_documents(selection, sort=sort, with_content=with_content)
+
+    def delete_documents(self, document_ids: Iterable[int]) -> DeleteSummary:
+        """Delete these documents with their deliveries, except those with a
+        delivery that is not `done`, which are refused."""
+        document_ids = list(document_ids)
+        undelivered = sorted(
+            {
+                delivery.document_id
+                for delivery in self._db.find_deliveries(
+                    DocumentFilter(document_ids=tuple(document_ids))
+                )
+                if delivery.status != DeliveryStatus.DONE
+            }
+        )
+        deleted = self._db.delete_documents(
+            document_id
+            for document_id in document_ids
+            if document_id not in undelivered
+        )
+        return DeleteSummary(deleted=deleted, refused=undelivered)
+
+    # --- Deliveries --------------------------------------------------------
 
     def find_deliveries(
         self,
-        scope: ProcessingScope | None = None,
+        documents: DocumentFilter | None = None,
         *,
-        workflow: str | None = None,
         sink: str | None = None,
         status: DeliveryStatus | None = None,
-        artifact_names: ArtifactNames | None = None,
         delivery_ids: Iterable[int] | None = None,
+        limit: int | None = None,
         sort: str = "id",
     ) -> list[Delivery]:
-        """Ledger rows by a `db.DELIVERY_SORTS` key; `workflow` keeps its
-        rows, `sink` those of that delivery key in any workflow, item
-        filters item rows, `artifact_names` artifact rows, `delivery_ids`
-        these rows, and `limit` counts rows. Neither name is checked against
-        the configuration, so the rows of a removed delivery can be found."""
+        """Ledger rows by a `db.DELIVERY_SORTS` key, of the documents
+        `documents` selects; filters combine and `limit` counts rows. `sink`
+        is not checked against the configuration, so the rows of a removed
+        sink can be found."""
         return self._db.find_deliveries(
-            scope,
-            workflow=workflow,
-            key=sink,
+            documents,
+            sink=sink,
             status=status,
-            artifact_names=artifact_names,
             delivery_ids=delivery_ids,
+            limit=limit,
             sort=sort,
         )
 
@@ -419,96 +540,101 @@ class Application:
 
     def send_deliveries(self, deliveries: Iterable[Delivery]) -> dict[str, RunSummary]:
         """Send these ledger rows now, whatever their state, with no backoff
-        and no pacing; one summary per ledger key. Rows of a ledger key that
-        is no longer configured are skipped with a warning."""
-        by_key: dict[str, list[Delivery]] = {}
+        and no pacing; one summary per sink. Rows of a sink that is no longer
+        configured are skipped with a warning."""
+        by_sink: dict[str, list[int]] = {}
         for delivery in deliveries:
-            by_key.setdefault(delivery.sink, []).append(delivery)
+            assert delivery.id is not None
+            by_sink.setdefault(delivery.sink, []).append(delivery.id)
 
         summaries: dict[str, RunSummary] = {}
-        for ledger_key, rows in by_key.items():
-            if (run := self._catalog.deliveries.get(ledger_key)) is None:
+        for sink_id, delivery_ids in by_sink.items():
+            if sink_id not in self._catalog.sinks:
                 LOGGER.warning(
-                    f"{ledger_key}: not configured, skipped {len(rows)} delivery(ies)"
+                    f"{sink_id}: not configured, skipped"
+                    f" {len(delivery_ids)} delivery(ies)"
                 )
                 continue
-            item_ids = tuple(d.item_id for d in rows if d.item_id is not None)
-            summaries[ledger_key] = self._object(run.profile).deliver(
-                key=ledger_key,
-                scope=workflow_scope(
-                    run.workflow, ProcessingScope(item_ids=item_ids or None)
-                ),
-                artifacts=tuple(
-                    (remixer, name)
-                    for d in rows
-                    if d.artifact_name is not None
-                    for remixer, _, name in [d.artifact_name.partition("/")]
-                ),
-                force=True,
-            )
+            rows = self._db.deliveries_of(sink_id, delivery_ids=delivery_ids)
+            summaries[sink_id] = self._deliverer(sink_id).send_rows(rows)
         return summaries
+
+    def routed_documents(
+        self, sink_id: str, selection: DocumentFilter | None = None
+    ) -> list[Document]:
+        """The documents `selection` names among those of the outputs routed
+        to the sink instance; `limit` counts them."""
+        selection = selection or DocumentFilter()
+        self.sink_profile(sink_id)
+        routed = {
+            (app.id, output)
+            for app in self._catalog.apps.values()
+            for output, sinks in app.routes.items()
+            if sink_id in sinks
+        }
+        documents = [
+            document
+            for document in self._db.find_documents(
+                dataclasses.replace(selection, limit=None)
+            )
+            if (document.app, document.output) in routed
+        ]
+        return documents[: selection.limit]
 
     def mark_deliveries(
         self,
-        key: str,
+        sink_id: str,
         status: DeliveryStatus,
-        scope: ProcessingScope | None = None,
-        artifacts: ArtifactNames = (),
+        selection: DocumentFilter | None = None,
         *,
-        workflow: str,
         overwrite: bool = False,
         dry_run: bool = False,
     ) -> MarkSummary:
-        """Give the subjects selected for the workflow's delivery `key` a row
-        in `status`, ignoring the lookback and the delivery's `requires`;
-        without filters, every subject of the delivery. Existing rows are
-        left as they are unless `overwrite`. `dry_run` only counts."""
+        """Give the documents `selection` names among those routed to the
+        sink instance (every one without filters) a row in `status`.
+        Existing rows are left as they are unless `overwrite`. `dry_run`
+        only counts."""
         if status == DeliveryStatus.SENDING:
             raise ValueError("a delivery is only `sending` while it is sent")
-        ledger_key = self.workflow(workflow).ledger_key(key)
-        if (run := self._catalog.deliveries.get(ledger_key)) is None:
-            raise ConfigError(f"workflow '{workflow}' has no delivery '{key}'")
-        target = self._object(run.profile)
-        scope = workflow_scope(run.workflow, scope)
-        subjects = target.subjects(scope, artifacts)
+        documents = self.routed_documents(sink_id, selection)
         existing = {
-            subject.id: row
-            for row, subject in target.rows(ledger_key, scope, artifacts)
+            delivery.document_id: delivery
+            for delivery in self._db.find_deliveries(
+                DocumentFilter(document_ids=tuple(d.id for d in documents if d.id)),
+                sink=sink_id,
+            )
         }
-        new = [subject for subject in subjects if subject.id not in existing]
-        present = [subject for subject in subjects if subject.id in existing]
+        new = [d for d in documents if d.id not in existing]
+        present = [existing[d.id] for d in documents if d.id in existing]
         summary = MarkSummary(created=len(new))
         if overwrite:
             summary.changed = len(present)
         else:
             summary.kept = len(present)
-
-        required = target.required_key(target.options)
-        if status == DeliveryStatus.QUEUED and required is not None:
-            queued = new + present if overwrite else new
-            values = self._db.get_annotation_values(queued, key=required)
-            if missing := sum(item.key not in values for item in queued):
-                LOGGER.warning(
-                    f"{ledger_key}: {missing} item(s) without '{required}' fail"
-                    " until it exists, and hold back their source meanwhile"
-                )
-
         if dry_run:
             return summary
+
         last_error = SET_BY_HAND if status == DeliveryStatus.ERROR else None
         self._db.add_deliveries(
-            dataclasses.replace(
-                target.new_delivery(ledger_key, subject),
+            Delivery(
+                sink=sink_id,
+                document_id=document.id,
                 status=status,
                 last_error=last_error,
             )
-            for subject in new
+            for document in new
+            if document.id is not None
         )
         if overwrite:
-            self.set_delivery_status(
-                (existing[subject.id] for subject in present), status
-            )
+            self.set_delivery_status(present, status)
         return summary
+
+    def delete_deliveries(self, delivery_ids: Iterable[int]) -> int:
+        """Delete these ledger rows; return how many. Their documents are
+        not delivered again unless rows are created for them."""
+        return self._db.delete_deliveries(delivery_ids)
+
+    # --- Deletion ----------------------------------------------------------
 
     def delete_annotations(self, annotation_ids: Iterable[int]) -> int:
         """Delete these annotations with the processing state of their
@@ -518,21 +644,11 @@ class Application:
         """
         return self._db.delete_annotations(annotation_ids)
 
-    def delete_deliveries(self, delivery_ids: Iterable[int]) -> int:
-        """Delete these ledger rows; return how many. Their subjects are
-        queued again if their delivery's lookback still covers them."""
-        return self._db.delete_deliveries(delivery_ids)
-
     def delete_items(self, item_ids: Iterable[int]) -> int:
-        """Delete items with their state, annotations and deliveries; return
-        how many. One still in its source's index comes back on the next
-        import, with a new id."""
+        """Delete items with their state and annotations; return how many.
+        One still in its source's index comes back on the next import, with
+        a new id."""
         return self._db.delete_items(item_ids)
-
-    def delete_artifacts(self, names: Iterable[tuple[str, str]]) -> int:
-        """Delete the `(remixer, name)` artifacts with their deliveries;
-        return how many. A remixer that runs again rebuilds them."""
-        return self._db.delete_artifacts(names)
 
 
 def write_lock(database_url: str) -> IO[str] | None:

@@ -2,6 +2,8 @@
 
 - **Status:** accepted
 - **Date:** 2026-10-18
+- **Revised:** 2026-11-06, by 0015 (artifacts are removed; document
+  contents are stored the same way)
 
 ## Context
 

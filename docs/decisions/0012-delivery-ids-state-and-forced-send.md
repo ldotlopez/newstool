@@ -1,6 +1,6 @@
 # 0012: Delivery ids, changing their state and forced send
 
-- **Status:** accepted
+- **Status:** superseded by 0015
 - **Date:** 2026-10-29
 - **Revises:** 0007 (`deliver --requeue|--force`, `deliveries resolve`),
   0008 (deliveries "selected by their subject")

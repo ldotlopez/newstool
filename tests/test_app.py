@@ -1,5 +1,5 @@
 """Application end to end on a temp database, with real plugins that need no
-network (markdownify, feedgenerator) and a stubbed HTTP fetcher."""
+network (markdownify, feed, file) and a stubbed HTTP fetcher."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import unittest
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -21,11 +21,12 @@ from newstool.app import (
     LockedError,
     MarkSummary,
 )
+from newstool.applets import run_key
 from newstool.config import Config, ConfigError
 from newstool.db import DeliveryStatus, ProcessingStatus
 from newstool.errors import PluginFailure
 from newstool.models import (
-    Artifact,
+    DocumentFilter,
     PreflightSourceItemData,
     ProcessingScope,
     SourceItem,
@@ -35,7 +36,6 @@ from newstool.plugins import ClassRegister, Services, feedreader, markdownify
 from newstool.plugins.markdownify import MarkdownifyProcessor
 from newstool.plugins.ollama import OllamaLLM
 from newstool.processors import ProcessorOptions, ProcessorType
-from newstool.sinks import SubjectKindError
 
 SAMPLE = Path(__file__).parent / "samples" / "prensaiberica-item-132310503.html"
 SAMPLE_UID = "ec16b09f034ca03296e75d7e5c304f10337f2e77a0327b0d045c54f0a1d970e8"
@@ -43,6 +43,7 @@ SAMPLE_UID = "ec16b09f034ca03296e75d7e5c304f10337f2e77a0327b0d045c54f0a1d970e8"
 APRIL = datetime(2026, 4, 30, 10, tzinfo=UTC)
 MAY = datetime(2026, 5, 28, 10, tzinfo=UTC)
 JUNE = datetime(2026, 6, 25, 10, tzinfo=UTC)
+NOW = datetime(2026, 11, 6, 12, tzinfo=UTC)
 
 
 def listed(
@@ -82,8 +83,8 @@ class ApplicationTests(unittest.TestCase):
 
     def make_app(
         self,
-        plugins: str = "  feedgenerator: {title: Test feed}\n",
-        catalog: str = "processors: [markdownify]\nremixers: [feedgenerator]\n",
+        plugins: str = "  feed: {title: Test feed}\n",
+        catalog: str = "processors: [markdownify]\napps: [{id: news, app: feed}]\n",
         workflows: str = "",
     ) -> Application:
         config = Config.from_text(
@@ -309,7 +310,7 @@ cache_dir: {self.tmp_dir}/cache
             ["markdownify", "prensaiberica"],
         )
 
-    def test_process_then_remix(self) -> None:
+    def test_process_then_run_an_applet(self) -> None:
         item = self.import_sample()
 
         self.assertEqual(self.app.run_process("markdown").done, 1)
@@ -317,8 +318,11 @@ cache_dir: {self.tmp_dir}/cache
         markdown = self.app.get_annotations(item)["markdown"]
         self.assertIn("asedio carlista", markdown)
 
-        self.assertEqual(self.app.run_remix("feedgenerator"), ["feed"])
-        feed = self.app.get_artifact("feedgenerator", "feed")
+        report = self.app.run_app("news", NOW)
+
+        self.assertEqual(report.new, (("feed", run_key(NOW)),))
+        (feed,) = self.app.find_documents(with_content=True)
+        self.assertEqual((feed.app, feed.output), ("news", "feed"))
         self.assertIn("<title>Test feed</title>", feed.content)
         self.assertIn(f"mediterraneo/{SAMPLE_UID}", feed.content)
 
@@ -350,12 +354,10 @@ cache_dir: {self.tmp_dir}/cache
             ConfigError, "no process run of workflow 'default' writes the key"
         ):
             self.app.run_process("summary")
-        with self.assertRaisesRegex(
-            ConfigError, "no workflow has a remix run 'avglink'"
-        ):
-            self.app.run_remix("avglink")
-        with self.assertRaisesRegex(ConfigError, "has no delivery 'telegram'"):
-            self.app.run_delivery("telegram")
+        with self.assertRaisesRegex(ConfigError, "app 'nope' is not configured"):
+            self.app.run_app("nope", NOW)
+        with self.assertRaisesRegex(ConfigError, "sink 'nope' is not configured"):
+            self.app.deliver("nope", NOW)
         with self.assertRaisesRegex(ConfigError, "workflow 'nope' is not configured"):
             self.app.process_keys(workflow="nope")
 
@@ -366,64 +368,250 @@ cache_dir: {self.tmp_dir}/cache
 processors:
   - markdownify
   - {processor: markdownify, key: markdown/copy, skip_default: true}
-remixers:
-  - feedgenerator
-  - {remixer: feedgenerator, skip_default: true}
-  - {remixer: feedgenerator, key: short}
+apps:
+  - {id: news, app: feed}
+  - {id: short, app: feed, options: {max_items: 1}}
 """
         )
 
         self.assertEqual(self.app.process_keys(), ["markdown"])
-        self.assertEqual(self.app.remix_keys(), ["feedgenerator", "short"])
-        self.assertEqual(self.app.delivery_keys(), [])
+        self.assertEqual(self.app.app_ids, ["news", "short"])
 
-    def test_remix_entries_save_their_artifacts_under_their_key(self) -> None:
+    def test_an_applet_runs_when_due_and_its_runs_are_recorded(self) -> None:
         self.app.close()
         self.app = self.make_app(
-            catalog="""
-remixers:
-  - feedgenerator
-  - {remixer: feedgenerator, key: short, options: {title: Short, max_items: 1}}
-"""
+            catalog="apps:\n  - {id: news, app: feed, every: 1h}\n"
         )
         self.import_sample()
 
-        self.assertEqual(self.app.remix_keys(), ["feedgenerator", "short"])
-        self.assertEqual(self.app.run_remix("short"), ["feed"])
-        self.assertIn(
-            "<title>Short</title>", self.app.get_artifact("short", "feed").content
+        dry = self.app.run_app("news", NOW, dry_run=True)
+        self.assertEqual((dry.due, len(dry.new)), (True, 1))
+        self.assertEqual(self.app.find_documents(), [])
+
+        self.assertTrue(self.app.run_app("news", NOW).due)
+        self.assertFalse(self.app.run_app("news", NOW + timedelta(minutes=59)).due)
+        forced = self.app.run_app("news", NOW, force=True)
+        # The same run time: the same key, already stored.
+        self.assertEqual((forced.new, len(forced.ignored)), ((), 1))
+        (status,) = self.app.app_status(NOW)
+        self.assertEqual(status.run.last_success, NOW)
+        self.assertEqual(status.next_due, NOW + timedelta(hours=1))
+
+    def test_a_failed_run_is_recorded_and_stores_nothing(self) -> None:
+        applet = self.app._object(self.app.app_instance("news").profile)
+
+        with (
+            patch.object(applet, "run", side_effect=PluginFailure("broken")),
+            self.assertLogs("newstool.app", "ERROR"),
+        ):
+            report = self.app.run_app("news", NOW)
+
+        self.assertEqual(report.error, "broken")
+        (status,) = self.app.app_status(NOW)
+        self.assertEqual(
+            (status.run.last_started, status.run.last_success, status.run.last_error),
+            (NOW, None, "broken"),
         )
-        self.assertIsNone(self.app.get_artifact("feedgenerator", "feed"))
+        self.assertEqual(self.app.find_documents(), [])
+
+    def test_routed_documents_are_delivered_by_their_sinks(self) -> None:
+        site = self.tmp_dir / "site"
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(site))
+        self.import_sample()
+
+        self.app.run_app("news", NOW)
+        self.assertEqual(len(self.app.plan_delivery("site", NOW)), 1)
+        summary = self.app.deliver("site", NOW)
+
+        self.assertEqual(summary.done, 1)
+        self.assertIn("<title>Test feed</title>", (site / "news.xml").read_text())
+        self.assertEqual(self.app.deliver("site", NOW).done, 0)
+        (row,) = self.app.find_deliveries()
+        self.assertEqual(row.external_ref, {"path": str(site / "news.xml")})
+
+    @patch("newstool.plugins.telegram.requests.post")
+    def test_itemfeed_posts_each_summarized_item_once(self, post: Mock) -> None:
+        post.return_value.json.return_value = {"ok": True, "result": {"message_id": 1}}
+        self.app.close()
+        self.app = self.make_app(
+            "  telegram: {bot_token: t}\n",
+            catalog="""
+llms: [ollama]
+processors: [markdownify, summarize]
+sinks:
+  - {id: chat, sink: telegram, options: {chat_id: main, images: false}}
+apps:
+  - id: items
+    app: itemfeed
+    options: {sources: [mediterraneo], since_first_run: false}
+    sink: chat
+""",
+        )
+        item = self.import_sample()
+        self.app._db.record_result(
+            item, "summarize", "summary", ProcessingStatus.DONE, value="S"
+        )
+
+        self.app.run_app("items", datetime.now(UTC))
+        self.app.deliver("chat", datetime.now(UTC))
+        self.app.run_app("items", datetime.now(UTC), force=True)
+        self.app.deliver("chat", datetime.now(UTC))
+
+        post.assert_called_once()
+        self.assertIn("S", post.call_args.kwargs["json"]["text"])
+        (row,) = self.app.find_deliveries()
+        self.assertEqual(row.external_ref, {"chat_id": "main", "message_id": 1})
+
+    def routed_catalog(self, site: Path) -> str:
+        return f"""
+sinks:
+  - {{id: site, sink: file, options: {{path: '{site}/{{app}}.xml'}}}}
+apps:
+  - {{id: news, app: feed, sink: site}}
+  - {{id: other, app: feed}}
+"""
+
+    def test_deliveries_are_marked_and_sent_again_by_id(self) -> None:
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app.run_app("news", NOW)
+        self.app.deliver("site", NOW)
+        (row,) = self.app.find_deliveries()
+
+        summaries = self.app.send_deliveries([row])
+
+        self.assertEqual(summaries["site"].done, 1)
+        marked = self.app.set_delivery_status(
+            self.app.find_deliveries(delivery_ids=[row.id]), DeliveryStatus.QUEUED
+        )
+        self.assertEqual(marked, 1)
+        (row,) = self.app.find_deliveries(status=DeliveryStatus.QUEUED)
+        self.assertEqual(row.attempts, 0)
+        with self.assertRaises(ValueError):
+            self.app.set_delivery_status([row], DeliveryStatus.SENDING)
+        row.sink = "gone"
+        with self.assertLogs("newstool.app", "WARNING"):
+            self.assertEqual(self.app.send_deliveries([row]), {})
+
+    def test_mark_gives_rows_to_documents_routed_to_the_sink(self) -> None:
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app.run_app("other", NOW)  # not routed to `site`
+        self.app.run_app("news", NOW)
+        (row,) = self.app.find_deliveries()
+        self.app._db.delete_deliveries([row.id])
+
+        dry = self.app.mark_deliveries("site", DeliveryStatus.DONE, dry_run=True)
+        self.assertEqual(dry, MarkSummary(created=1))
+        self.assertEqual(self.app.find_deliveries(), [])
+
+        self.assertEqual(
+            self.app.mark_deliveries("site", DeliveryStatus.DONE),
+            MarkSummary(created=1),
+        )
+        self.assertEqual(
+            self.app.mark_deliveries("site", DeliveryStatus.QUEUED),
+            MarkSummary(kept=1),
+        )
+        self.assertEqual(
+            self.app.mark_deliveries(
+                "site",
+                DeliveryStatus.ERROR,
+                DocumentFilter(app="news"),
+                overwrite=True,
+            ),
+            MarkSummary(changed=1),
+        )
+        (row,) = self.app.find_deliveries()
+        self.assertEqual((row.sink, row.status), ("site", DeliveryStatus.ERROR))
+        self.assertEqual(
+            self.app.mark_deliveries(
+                "site", DeliveryStatus.DONE, DocumentFilter(app="other")
+            ),
+            MarkSummary(),
+        )
+        with self.assertRaisesRegex(ConfigError, "sink 'nope' is not configured"):
+            self.app.mark_deliveries("nope", DeliveryStatus.DONE)
+
+        self.app._db.delete_deliveries([row.id])
+        self.app.mark_deliveries("site", DeliveryStatus.ERROR)
+        (row,) = self.app.find_deliveries()
+        self.assertEqual(row.last_error, SET_BY_HAND)
+
+    def test_documents_with_pending_deliveries_are_not_deleted(self) -> None:
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app.run_app("news", NOW)
+        self.app.run_app("other", NOW)
+        news, other = self.app.find_documents()
+
+        summary = self.app.delete_documents([news.id, other.id])
+
+        self.assertEqual((summary.deleted, summary.refused), (1, [news.id]))
+        self.app.deliver("site", NOW)
+        self.assertEqual(self.app.delete_documents([news.id]).deleted, 1)
+
+    def test_reset_forgets_the_run_and_with_documents_their_deliveries(self) -> None:
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app.run_app("news", NOW)
+
+        self.assertEqual(self.app.reset_app("news", dry_run=True), 0)
+        self.assertEqual(
+            self.app.reset_app("news", with_documents=True, dry_run=True), 1
+        )
+        self.assertEqual(self.app.reset_app("news"), 0)
+        (status, _) = self.app.app_status(NOW)
+        self.assertIsNone(status.run.last_success)
+        self.assertEqual(self.app.run_app("news", NOW).new, ())
+
+        self.assertEqual(self.app.reset_app("news", with_documents=True), 1)
+        self.assertEqual(self.app.find_deliveries(), [])
+        self.assertEqual(len(self.app.run_app("news", NOW).new), 1)
 
     def test_invalid_entries_are_config_errors(self) -> None:
         workflow = "workflows:\n  - {name: w, sources: [juntas], %s}\n"
-        for workflows, message in (
+        sinks = "sinks:\n  - {id: chat, sink: telegram, options: {bot_token: t, chat_id: c}}\n"
+        for catalog, message in (
             (
-                "remixers: [nope]\n",
-                r"remixers\.0: no plugin provides the remixer 'nope'",
+                "apps: [{id: a, app: nope}]\n",
+                r"apps\.0: no plugin provides the applet 'nope'",
             ),
             (
-                "remixers: [{remixer: feedgenerator, options: {color: red}}]\n",
-                r"remixers\.0\.options\.color: Extra inputs are not permitted",
+                "apps: [{id: a, app: feed, options: {color: red}}]\n",
+                r"apps\.0\.options\.color: Extra inputs are not permitted",
             ),
             (
-                workflow % "remix: [feedgenerator]",
+                "apps: [{id: a, app: feed, sink: nope}]\n",
+                r"apps\.0: no sink has the id 'nope'",
+            ),
+            (
+                "apps: [{id: a, app: feed, routes: {items: [x]}}]\n",
+                r"apps\.0: feed has no output 'items' \(it has feed\)",
+            ),
+            (
+                sinks + "apps: [{id: a, app: feed, sink: chat}]\n",
                 (
-                    r"workflows\.w\.remix\.0: remix key 'feedgenerator' is used by"
-                    r" remixers\.0 too \(workflow 'default'\); a remix key belongs to"
-                    r" one workflow"
+                    r"apps\.0: sink 'chat' \(telegram\) does not accept the content"
+                    r" of output 'feed' \(application/rss\+xml\)"
                 ),
             ),
             (
-                workflow % "process: [{processor: tagger, key: markdown}]",
+                "apps: [{id: a, app: feed, options: {sources: [nope]}}]\n",
+                r"apps\.0: unknown source\(s\) nope",
+            ),
+            (
+                "sinks: [{id: s, sink: nope}]\n",
+                r"sinks\.0: no plugin provides the sink 'nope'",
+            ),
+            (
+                "processors: [markdownify]\n"
+                + workflow % "process: [{processor: tagger, key: markdown}]",
                 (
                     r"workflows\.w\.process\.0: key 'markdown' is written by"
                     r" markdownify too \(processors\.0\) on the same sources"
                 ),
-            ),
-            (
-                workflow % "deliver: [feedgenerator]",
-                r"workflows\.w\.deliver\.0: no sink has the id or type 'feedgenerator'",
             ),
             (
                 "processors:\n  - {processor: markdownify, id: tagger}\n",
@@ -431,208 +619,10 @@ remixers:
             ),
         ):
             with (
-                self.subTest(workflows=workflows),
+                self.subTest(catalog=catalog),
                 self.assertRaisesRegex(ConfigError, message),
             ):
-                self.make_app(workflows=workflows)
-
-    @patch("newstool.plugins.telegram.requests.post")
-    def test_workflows_run_on_their_sources_and_deliver_under_their_name(
-        self, post
-    ) -> None:
-        post.return_value.json.return_value = {"ok": True, "result": {"message_id": 1}}
-        self.app.close()
-        self.app = self.make_app(
-            "  telegram: {bot_token: t}\n",
-            catalog="""
-llms: [ollama]
-processors: [markdownify, summarize]
-sinks:
-  - {sink: telegram, id: main, options: {chat_id: main}}
-""",
-            workflows="""
-workflows:
-  - name: channel
-    sources: [mediterraneo]
-    deliver: [main]
-  - name: juntas-channel
-    sources: [juntas]
-    process: [markdownify, summarize]
-    deliver:
-      - {sink: telegram, options: {chat_id: juntas, interval: 30m, max_per_run: 1}}
-""",
-        )
-        item = self.import_sample()  # a `mediterraneo` item
-        self.app._db.record_result(
-            item, "summarize", "summary", ProcessingStatus.DONE, value="S"
-        )
-
-        self.assertEqual(self.app.process_keys(), ["markdown", "summary"])
-        self.assertEqual(self.app.process_keys(workflow="channel"), [])
-        self.assertEqual(self.app.delivery_keys(), [])
-        # An id names the profile; the key is still the sink's.
-        self.assertEqual(self.app.delivery_keys("channel"), ["telegram"])
-        # The item is not of the workflow's sources.
-        self.assertEqual(
-            self.app.run_process("markdown", workflow="juntas-channel").done, 0
-        )
-        self.assertEqual(
-            [source.id for source in self.app.sources("juntas-channel")], ["juntas"]
-        )
-        # The sample is older than the lookback window: name it.
-        scope = ProcessingScope(item_ids=(item.id,))
-        self.assertEqual(
-            self.app.run_delivery(
-                "telegram", workflow="juntas-channel", scope=scope
-            ).done,
-            0,
-        )
-        self.assertEqual(
-            self.app.run_delivery("telegram", workflow="channel", scope=scope).done, 1
-        )
-        (row,) = self.app.find_deliveries()
-        self.assertEqual(row.sink, "channel/telegram")
-        self.assertEqual(row.external_ref, {"chat_id": "main", "message_id": 1})
-
-    @patch("newstool.plugins.telegram.requests.post")
-    def test_deliveries_are_marked_and_sent_again_by_id(self, post) -> None:
-        post.return_value.json.return_value = {"ok": True, "result": {"message_id": 1}}
-        self.app.close()
-        self.app = self.make_app(
-            "  telegram: {bot_token: t}\n",
-            catalog="""
-llms: [ollama]
-processors: [markdownify, summarize]
-sinks:
-  - {sink: telegram, id: main, options: {chat_id: main}}
-""",
-            workflows="""
-workflows:
-  - name: channel
-    sources: [mediterraneo]
-    process: [markdownify, summarize]
-    deliver: [main]
-""",
-        )
-        item = self.import_sample()
-        self.app._db.record_result(
-            item, "summarize", "summary", ProcessingStatus.DONE, value="S"
-        )
-        scope = ProcessingScope(item_ids=(item.id,))
-        self.app.run_delivery("telegram", workflow="channel", scope=scope, force=True)
-        (row,) = self.app.find_deliveries()
-
-        summaries = self.app.send_deliveries([row])
-
-        self.assertEqual(summaries["channel/telegram"].done, 1)
-        self.assertEqual(post.call_count, 2)
-
-        marked = self.app.set_delivery_status(
-            self.app.find_deliveries(delivery_ids=[row.id]), DeliveryStatus.QUEUED
-        )
-
-        self.assertEqual(marked, 1)
-        (row,) = self.app.find_deliveries(status=DeliveryStatus.QUEUED)
-        self.assertEqual(row.attempts, 0)
-        with self.assertRaises(ValueError):
-            self.app.set_delivery_status([row], DeliveryStatus.SENDING)
-        row.sink = "gone/telegram"
-        self.assertEqual(self.app.send_deliveries([row]), {})
-        self.assertEqual(post.call_count, 2)
-
-    def test_mark_gives_rows_without_sending_lookback_or_requires(self) -> None:
-        self.app.close()
-        self.app = self.make_app(
-            "  telegram: {bot_token: t}\n  telegram_artifacts: {bot_token: t}\n",
-            catalog="""
-llms: [ollama]
-processors: [markdownify, summarize]
-remixers:
-  - {remixer: feedgenerator, skip_default: true}
-sinks:
-  - {sink: telegram, id: main, options: {chat_id: main}}
-  - {sink: telegram_artifacts, id: docs, options: {chat_id: d, artifacts: [feedgenerator]}}
-""",
-            workflows="""
-workflows:
-  - name: channel
-    sources: [mediterraneo]
-    process: [markdownify, summarize]
-    remix: [feedgenerator]
-    deliver: [main, docs]
-""",
-        )
-        item = self.import_sample()  # older than the lookback window
-        self.app._db.save_artifact(
-            Artifact("feedgenerator", "feed", "<rss/>", "application/rss+xml")
-        )
-
-        # Nothing is written on a dry run.
-        dry = self.app.mark_deliveries(
-            "telegram", DeliveryStatus.DONE, workflow="channel", dry_run=True
-        )
-        self.assertEqual(dry, MarkSummary(created=1))
-        self.assertEqual(self.app.find_deliveries(), [])
-
-        # The item has no summary, which the telegram sink requires.
-        self.assertEqual(
-            self.app.mark_deliveries(
-                "telegram", DeliveryStatus.DONE, workflow="channel"
-            ),
-            MarkSummary(created=1),
-        )
-        self.assertEqual(
-            self.app.mark_deliveries(
-                "telegram", DeliveryStatus.QUEUED, workflow="channel"
-            ),
-            MarkSummary(kept=1),
-        )
-        with self.assertLogs("newstool.app", "WARNING") as logs:
-            overwritten = self.app.mark_deliveries(
-                "telegram",
-                DeliveryStatus.QUEUED,
-                ProcessingScope(item_ids=(item.id,)),
-                workflow="channel",
-                overwrite=True,
-            )
-        self.assertEqual(overwritten, MarkSummary(changed=1))
-        self.assertIn("1 item(s) without 'summary'", logs.output[0])
-
-        self.assertEqual(
-            self.app.mark_deliveries(
-                "telegram_artifacts", DeliveryStatus.ERROR, workflow="channel"
-            ),
-            MarkSummary(created=1),
-        )
-        self.assertEqual(
-            {
-                (d.sink, d.status, d.attempts, d.last_error)
-                for d in self.app.find_deliveries()
-            },
-            {
-                ("channel/telegram", DeliveryStatus.QUEUED, 0, None),
-                ("channel/telegram_artifacts", DeliveryStatus.ERROR, 0, SET_BY_HAND),
-            },
-        )
-
-        with self.assertRaisesRegex(SubjectKindError, "not --artifact"):
-            self.app.mark_deliveries(
-                "telegram",
-                DeliveryStatus.DONE,
-                artifacts=(("feedgenerator", "feed"),),
-                workflow="channel",
-            )
-        with self.assertRaisesRegex(SubjectKindError, "not item filters"):
-            self.app.mark_deliveries(
-                "telegram_artifacts",
-                DeliveryStatus.DONE,
-                ProcessingScope(item_ids=(item.id,)),
-                workflow="channel",
-            )
-        with self.assertRaisesRegex(ConfigError, "has no delivery 'main'"):
-            self.app.mark_deliveries("main", DeliveryStatus.DONE, workflow="channel")
-        with self.assertRaisesRegex(ConfigError, "workflow 'nope'"):
-            self.app.mark_deliveries("telegram", DeliveryStatus.DONE, workflow="nope")
+                self.make_app(catalog=catalog)
 
     def test_what_runs_read_must_be_written_on_their_sources(self) -> None:
         for catalog, workflows, message in (
@@ -645,17 +635,25 @@ workflows:
                 ),
             ),
             (
-                "processors: [markdownify]\n",
                 (
-                    "workflows:\n  - {name: w, sources: [juntas], deliver:"
-                    " [{sink: telegram, options: {bot_token: t, chat_id: c}}]}\n"
+                    "processors: [markdownify]\n"
+                    "apps: [{id: a, app: itemfeed, options: {sources: [juntas]}}]\n"
                 ),
-                r"workflows\.w\.deliver\.0: telegram reads 'summary'",
+                "",
+                r"apps\.0: itemfeed reads 'summary', and no process run writes it",
             ),
             (
-                "remixers: [singlelink]\n",
+                "apps: [{id: a, app: singlelink}]\n",
                 "",
-                r"remixers\.0: singlelink reads 'tags', and no process run",
+                r"apps\.0: singlelink reads 'tags', and no process run",
+            ),
+            (
+                (
+                    "processors: [{processor: markdownify, skip_default: true}]\n"
+                    "apps: [{id: a, app: digest, options: {sources: [juntas]}}]\n"
+                ),
+                "workflows:\n  - {name: w, sources: [mediterraneo], process: [markdownify]}\n",
+                r"apps\.0: digest reads 'markdown'",
             ),
         ):
             with (
@@ -728,7 +726,6 @@ workflows:
             [(workflow.name, workflow.sources) for workflow in config.all_workflows()],
             [("default", ["a"]), ("only-b", ["b"])],
         )
-        self.assertEqual(config.workflows[0].ledger_key("telegram"), "only-b/telegram")
 
     def test_process_entries_run_in_order_each_with_its_key(self) -> None:
         self.app.close()

@@ -5,6 +5,8 @@
 - **Revises:** 0003 (loading, enabling, options, objects), 0006 (LLMs and
   `services`), 0007 (sinks built per use), 0009 (the `default` workflow,
   entries and keys)
+- **Revised:** 2026-11-06, by 0015 (`remixers` and `sinks` leave the
+  catalog; applet and sink instances are global)
 
 ## Context
 

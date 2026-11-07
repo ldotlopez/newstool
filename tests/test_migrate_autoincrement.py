@@ -2,12 +2,13 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import MetaData, create_engine
 
 from newstool.db import Base, Database, ProcessingStatus
-from newstool.models import Artifact, SourceData, SourceItem
+from newstool.models import AppletResult, EmittedDocument, SourceData, SourceItem
 from scripts.migrate_autoincrement import migrate
 
 SOURCE = SourceData(id="a", name="A", url="https://a.test/", provider="plaza")
@@ -43,8 +44,9 @@ class MigrateAutoincrementTests(unittest.TestCase):
         db.record_result(
             make_item("i1"), "summarize", "summary", ProcessingStatus.DONE, value="S"
         )
-        db.save_artifact(
-            Artifact("feedgenerator", "feed", "<rss/>", "application/rss+xml")
+        feed = EmittedDocument("feed", "k", "<rss/>", "application/rss+xml")
+        db.commit_app_run(
+            "news", datetime.now(UTC), AppletResult(documents=(feed,)), {}
         )
         db.close()
 
@@ -61,7 +63,7 @@ class MigrateAutoincrementTests(unittest.TestCase):
     def test_tables_get_autoincrement_and_keep_their_rows(self) -> None:
         before = {
             table: self.query(f"SELECT * FROM {table} ORDER BY id")
-            for table in ("source_items", "item_annotations", "artifacts")
+            for table in ("source_items", "item_annotations", "documents")
         }
 
         migrated = migrate(self.db_path)
@@ -72,13 +74,13 @@ class MigrateAutoincrementTests(unittest.TestCase):
                 "source_items",
                 "processing_state",
                 "item_annotations",
-                "artifacts",
+                "documents",
                 "deliveries",
             },
         )
         for (sql,) in self.query(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name IN"
-            " ('source_items', 'processing_state', 'item_annotations', 'artifacts')"
+            " ('source_items', 'processing_state', 'item_annotations', 'documents')"
         ):
             self.assertIn("AUTOINCREMENT", sql)
         for table, rows in before.items():

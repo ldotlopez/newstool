@@ -1,19 +1,30 @@
-"""Writes a markdown digest of the highlights of each source in scope with an
-LLM. Every remix run sends a week of articles to the model."""
+"""The `digest` applet (decision 0015) writes a Markdown digest of the
+highlights of each of its sources with an LLM, from the `markdown` of the
+items published in the last `lookback`. It emits one document per source on
+its `digest` output, keyed `<source id>/<since>_<until>` (YYYY-MM-DD), so a
+second run over the same period emits nothing new. Schedule it (`on`,
+`at`) for the period it covers."""
 
-import dataclasses
 import logging
-from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+from typing import ClassVar
 
+from ..applets import AppletReader, AppletType, BaseApplet, Outputs, SourcesOptions
 from ..config import Duration
 from ..errors import PluginFailure
 from ..llms import strip_code_fence
-from ..models import ProcessingScope, SourceData, SourceItem
-from ..remixers import BaseRemixer, RemixerType
+from ..models import (
+    AppletResult,
+    AppletRun,
+    EmittedDocument,
+    SourceData,
+    SourceItem,
+)
 from . import PluginTypes, Services, UsesLLMOptions
 
 LOGGER = logging.getLogger(__name__)
+
+OUTPUT = "digest"
 
 DIGEST_PROMPT = """You are the editor of a weekly news digest. Below are the articles
 a news source published in the period, numbered, each with its title, date, link
@@ -31,23 +42,20 @@ Articles:
 """
 
 
-class DigestOptions(UsesLLMOptions):
+class DigestOptions(SourcesOptions, UsesLLMOptions):
     model: str | None = None
-    lookback: Duration = 7 * 86400  # scope when it sets no `since`
+    lookback: Duration = 7 * 86400  # the period each run covers
     max_items: int = 50  # newest items per source
     max_article_chars: int = 3000  # each article's markdown is cut to this
     context_length: int = 32768  # the model's context window, in tokens
 
 
-class DigestRemixer(BaseRemixer):
-    """Writes a markdown digest of each source in scope from the markdown of
-    its newest items of the last `lookback`; one artifact per source, named
-    `<source id>/<since>_<until>` (YYYY-MM-DD), so each period is a new
-    artifact and rebuilding one overwrites it. Items without
-    `markdownify.markdown` are left out."""
+class DigestApplet(BaseApplet):
+    """Items without the `markdown` annotation are left out."""
 
     name = "digest"
-    requires = "markdown"
+    outputs: ClassVar[Outputs] = {OUTPUT: frozenset({"text/markdown"})}
+    requires = ("markdown",)
     options_model = DigestOptions
     options: DigestOptions
 
@@ -55,31 +63,41 @@ class DigestRemixer(BaseRemixer):
         super().__init__(options, services)
         self.llm = services.llm(options.llm)
 
-    def produce(self, scope: ProcessingScope) -> Iterator[tuple[str, str, str]]:
+    def run(self, now: datetime, run: AppletRun, reader: AppletReader) -> AppletResult:
         options = self.options
-        now = datetime.now(UTC)
-        since = scope.since or now - timedelta(seconds=options.lookback)
-        until = scope.until or now
-        items = self.db.get_items(
-            dataclasses.replace(scope, since=since), newest_first=True
+        since = now - timedelta(seconds=options.lookback)
+        items = reader.items(
+            sources=options.sources,
+            published_since=since,
+            published_until=now,
+            newest_first=True,
         )
-        markdowns = self.db.get_annotation_values(items, key="markdown")
+        markdowns = reader.annotations(items, "markdown")
 
         items_by_source: dict[str, list[SourceItem]] = {}
         for item in items:
             if item.key in markdowns:
                 items_by_source.setdefault(item.source.id, []).append(item)
         if not items_by_source:
-            LOGGER.info(f"{self.name}: no items with markdown in scope")
+            LOGGER.info(f"{self.name}: no items with markdown in the period")
 
+        documents = []
         for source_id, source_items in items_by_source.items():
             articles = [
-                (item, markdowns[item.key])
+                (item, str(markdowns[item.key]))
                 for item in reversed(source_items[: options.max_items])
             ]
-            digest = self._write(source_items[0].source, articles, since, until)
-            name = f"{source_id}/{since:%Y-%m-%d}_{until:%Y-%m-%d}"
-            yield name, digest, "text/markdown"
+            source = source_items[0].source
+            documents.append(
+                EmittedDocument(
+                    output=OUTPUT,
+                    key=f"{source_id}/{since:%Y-%m-%d}_{now:%Y-%m-%d}",
+                    content=self._write(source, articles, since, now),
+                    content_type="text/markdown",
+                    title=f"{source.name}: {since:%Y-%m-%d} – {now:%Y-%m-%d}",
+                )
+            )
+        return AppletResult(documents=tuple(documents))
 
     def _write(
         self,
@@ -115,4 +133,4 @@ class DigestRemixer(BaseRemixer):
 
 
 def __newstool_plugin__() -> PluginTypes:
-    return [(DigestRemixer.name, RemixerType, DigestRemixer)]
+    return [(DigestApplet.name, AppletType, DigestApplet)]

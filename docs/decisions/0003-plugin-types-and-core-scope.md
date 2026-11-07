@@ -8,7 +8,8 @@
   *Revisions*); 2026-10-28, by 0010 (entry points register classes, one
   object per use, `plugins` holds defaults per type; *Loading*,
   *Enabling*, *Options*, *Per-use options*, *Objects* and *Bundles* below
-  are superseded)
+  are superseded); 2026-11-06, by 0015 (the remixer type is replaced by
+  applets)
 - **Amended by:** 0006 (LLM plugins and the `services` argument), 0007
   (sinks and the `deliver` phase)
 
