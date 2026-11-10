@@ -305,6 +305,31 @@ class CommandTests(unittest.TestCase):
         app.process_keys.assert_called_once_with(workflow="juntas")
         app.run_app.assert_not_called()
 
+    def test_run_all_runs_every_workflow_in_order(self) -> None:
+        app = Mock()
+        app.workflows = ["default", "juntas"]
+        app.sources.return_value = [SOURCE]
+        app.import_source.return_value = []
+        app.process_keys.return_value = []
+
+        result = invoke(app, "run", "--all")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            [c.args for c in app.sources.call_args_list], [("default",), ("juntas",)]
+        )
+        self.assertEqual(
+            [c.kwargs for c in app.process_keys.call_args_list],
+            [{"workflow": "default"}, {"workflow": "juntas"}],
+        )
+        self.assertIn("Import (juntas)", result.stdout)
+
+    def test_run_all_excludes_a_named_workflow(self) -> None:
+        result = invoke(Mock(), "run", "--all", "-w", "juntas")
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("exclude each other", result.output)
+
     def test_user_errors_are_reported_without_traceback(self) -> None:
         app = Mock()
         app.process_keys.side_effect = ConfigError("processor 'nope' is not loaded")

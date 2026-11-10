@@ -13,6 +13,7 @@ from typing import Any
 
 import click as plain_click
 import rich_click
+from click.core import ParameterSource
 from foundation.clilib import (
     RICH_STDERR_DISABLED,
     RICH_STDOUT_DISABLED,
@@ -281,16 +282,16 @@ def import_sources(
     return list(run_each(progress, sources, import_one).values())
 
 
-def print_import(rows: list[list[Any]]) -> int:
+def print_import(rows: list[list[Any]], title: str = "Import") -> int:
     """Print the import summary; return how many sources failed."""
-    print_table("Import", ["Source", "Items", "Error"], rows)
+    print_table(title, ["Source", "Items", "Error"], rows)
     return sum(1 for _, _, error in rows if error)
 
 
-def print_process(summaries: dict[str, RunSummary]) -> int:
+def print_process(summaries: dict[str, RunSummary], title: str = "Process") -> int:
     """Print the process summary; return how many items failed."""
     print_table(
-        "Process",
+        title,
         ["Key", "Done", "Ignored", "Failed"],
         [[name, s.done, s.ignored, s.failed] for name, s in summaries.items()],
     )
@@ -372,36 +373,62 @@ def process_cmd(
     print_process(summaries)
 
 
-@cli.command("run")
-@workflow_option
-@click.pass_context
-@report_user_errors
-def run_cmd(ctx: click.Context, workflow: str) -> None:
-    """Run the workflow's import and process in turn; `apps run` runs the
-    applets and delivers.
+# (phase, run under the progress rows, print its summary and count failures)
+type Phase = tuple[str, Callable[[Progress], Any], Callable[[Any], int]]
 
-    A failure is logged and the next phase still runs; the exit status is
-    non-zero if anything failed.
-    """
-    app = app_from_context(ctx, write=True)
-    failures = 0
 
-    # (phase, run under the progress rows, print its summary and count failures)
-    phases: list[tuple[str, Callable[[Progress], Any], Callable[[Any], int]]] = [
+def workflow_phases(app: Application, workflow: str, labelled: bool) -> list[Phase]:
+    """The import and process phases of `run` for one workflow; labelled
+    phases and summaries name the workflow."""
+    prefix = f"{workflow}: " if labelled else ""
+    suffix = f" ({workflow})" if labelled else ""
+    return [
         (
-            "import",
+            f"{prefix}import",
             lambda progress: import_sources(app, progress, workflow),
-            print_import,
+            lambda rows: print_import(rows, title=f"Import{suffix}"),
         ),
         (
-            "process",
+            f"{prefix}process",
             lambda progress: run_each(
                 progress,
                 app.process_keys(workflow=workflow),
                 lambda key: app.run_process(key, workflow=workflow),
             ),
-            print_process,
+            lambda summaries: print_process(summaries, title=f"Process{suffix}"),
         ),
+    ]
+
+
+@cli.command("run")
+@workflow_option
+@click.option(
+    "--all",
+    "all_workflows",
+    is_flag=True,
+    help="Run every workflow, `default` first",
+)
+@click.pass_context
+@report_user_errors
+def run_cmd(ctx: click.Context, workflow: str, all_workflows: bool) -> None:
+    """Run the workflow's import and process in turn, or every workflow's
+    with --all; `apps run` runs the applets and delivers.
+
+    A failure is logged and the next phase still runs; the exit status is
+    non-zero if anything failed.
+    """
+    if all_workflows and (
+        ctx.get_parameter_source("workflow") is not ParameterSource.DEFAULT
+    ):
+        raise click.UsageError("--all and --workflow exclude each other")
+    app = app_from_context(ctx, write=True)
+    failures = 0
+
+    workflows = app.workflows if all_workflows else [workflow]
+    phases = [
+        phase
+        for name in workflows
+        for phase in workflow_phases(app, name, labelled=all_workflows)
     ]
     results = []
     with progress_rows() as progress:
