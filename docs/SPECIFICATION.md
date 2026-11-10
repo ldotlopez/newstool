@@ -266,6 +266,9 @@ Sinks deliver the documents routed to them and record every delivery.
   sink in a chosen state (`queued`, `done` or `error`), routed to it or
   not, if the sink accepts their content types; without filters, every
   document routed to it. Existing rows change only when asked.
+- **Renaming a sink instance** in the configuration starts its ledger
+  anew; moving its rows to the new `id` (allowed only when that `id` is
+  configured and has no rows) keeps it, so nothing is delivered twice.
 - A document is delivered at most once per sink instance, unless a
   delivery is forced or its row is deleted and created again.
 
@@ -290,7 +293,8 @@ process, not a network service. It offers:
   also settles interrupted deliveries), **marking** the selected documents
   routed to one sink (rows created in a chosen state), **deleting** rows
   and **sending** them now, selected by id or by the filters of
-  `inspect deliveries`.
+  `inspect deliveries`; **moving** a renamed sink instance's rows to its
+  new `id`.
 - A **write lock**: commands that write take it, so two of them never run
   at the same time; the second fails at once.
 

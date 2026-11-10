@@ -253,7 +253,8 @@ Changing a type's or an entry's options never regenerates existing
 annotations; use `process --force` for that. What is stored is keyed by a
 source's `id`, a process run's `key`, and an applet or sink instance's
 `id`: renaming an applet instance starts it from scratch, and renaming a
-sink instance starts its deliveries anew.
+sink instance starts its deliveries anew unless `deliveries rename OLD NEW`
+moves its ledger to the new `id`.
 
 ## Usage
 
@@ -301,6 +302,9 @@ uv run newstool -c config.yaml inspect deliveries --sink chat --status error
 uv run newstool -c config.yaml deliveries set-status --as queued --status error
 uv run newstool -c config.yaml deliveries set-status --as done --delivery 31
 uv run newstool -c config.yaml deliveries send --delivery 31
+
+# After renaming a sink instance in the configuration, keep its ledger
+uv run newstool -c config.yaml deliveries rename chat channel --dry-run
 
 # Queue documents for a sink by hand (routed to it or not), or mark them as sent
 uv run newstool -c config.yaml deliveries set-status --sink chat --app weekly --as queued
@@ -398,6 +402,11 @@ selected rows now, whatever their state (`done` ones too), with no backoff
 or pacing, and exits non-zero if one fails; a row whose sink is no longer
 in the configuration is skipped with a warning. It creates no rows.
 
+`deliveries rename OLD NEW` moves every ledger row of sink instance `OLD`
+to `NEW`, after renaming it in the configuration, so `NEW` does not send
+its documents again. `NEW` must be configured and have no rows yet;
+`--dry-run` counts the rows it would move.
+
 Global options: `--log-level LEVEL` (also accepts specs such as
 `info,db:debug`), and `-v`/`-q`, repeatable, to raise or lower it one step
 each from `warning` (`-v` shows progress messages, `-vv` debug). Without
@@ -448,7 +457,9 @@ type, over the items of its sources. Each entry writes one annotation key
 it (see *How `process` behaves*). `--source`, `--since`, `--until`,
 `--item` and `--limit` narrow the items; `--force` reprocesses them all.
 The `Process` table shows, per key, the items done, ignored (skipped by
-the processor) and failed.
+the processor) and failed. A key whose run fails as a whole (its LLM is
+unreachable, say) counts one failure and the next key still runs; the exit
+status is non-zero if anything failed.
 
 `run [-w WORKFLOW]` runs import, then process; a failing phase is logged
 and the next one still runs. It is the usual cron line, one per workflow;
@@ -483,7 +494,8 @@ first and keeps its own pace: with an `interval`, one row once its last
 delivery is that old; then at most `max_per_run` rows. `--ignore-interval`,
 `--ignore-max-per-run` and `--max-per-run N` override that pace for one
 run, and `--dry-run` lists what would be sent. The `Deliver` table shows,
-per sink, the rows delivered and failed.
+per sink, the rows delivered and failed; a sink whose run fails as a whole
+counts one failure and the next sink still delivers.
 
 A typical setup, two cron lines:
 
@@ -598,7 +610,10 @@ To support a new site, see
 Every option can be set in the type's section, as the default, or per
 entry. Every processor takes `max_retries` (default 3), and `summarize`,
 `tagger` and `embed` take `llm` (see above) and `model`; `summarize` takes
-`prompt` (followed by the article's markdown) and `embed` takes `input`
+`prompt` (followed by the article's markdown) and `source_prompts`, a map
+from source `id` to the prompt for that source's items, in place of
+`prompt` (a source it does not name uses `prompt`; ids are not checked
+against `sources`), and `embed` takes `input`
 (`tags`, the default, or `markdown`; one entry per input). `truncate`
 accepts `summarize`'s options and ignores them, so an entry swaps one for
 the other by its type alone; its `llm` is not checked, so it needs no

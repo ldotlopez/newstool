@@ -530,8 +530,6 @@ Risks:
   sources.
 - **Generalizing `BaseProvider`/`IndexSiteProvider`** for non-news sources:
   wait for a second concrete use case.
-- **Save annotations and artifacts as soon as possible**: they stay in
-  memory until the loop finishes.
 - **Per-source `process` overrides** (`sources>process`): the `process`
   section exists (see the plan above); per-source runs or options are next.
   Proposed shape (2026-10-27, not agreed): the same list format as `process`; an entry
@@ -546,29 +544,16 @@ Risks:
   no longer names, and delete them with the existing `delete` commands.
   Never delete from the configuration alone: several configurations may
   share a database.
-- **`deliveries rename OLD NEW`**: renaming a workflow or delivery key
-  redelivers its `lookback`; a rename keeps the ledger.
 - **Ledger columns `workflow`, `key`, `sink`** instead of `workflow/key`
   in `sink`: when querying by workflow or knowing the plugin per row
   matters. Needs a migration.
 - **Configurable input keys for consumers**: `summarize`/`tagger` read
   `markdown`, `telegram` `summary`, `grouping` `tags`; an option naming
   another key when a run writes, e.g., `summary/es`.
-- **summary plugin: per-source prompt**: the prompt is configurable
-  globally and per `process` entry; per source is pending.
-- **google chat deliver plugin**
 - **Backend-specific LLM options per use**: each use picks its LLM
   (`llm`, decision 0010) and `model`; `json_mode`/`context_length` stay
   explicit in the `LLM` protocol. An `llms` entry with other options covers
   most needs; revisit when a consumer needs a backend option per call.
-- **`pyproject.toml` cleanup** (2026-10-28): the distribution is still
-  named `news-aggregator` with the placeholder description, the `tagging`
-  (ollama) and `feeds` (feedparser) groups duplicate main dependencies, and
-  a stale `news_aggregator.egg-info/` remains. Do it with the `newstool`
-  rename.
-- **`run_each` stops a phase on the first failure** (2026-10-28, bug):
-  `cli.py` wraps each run in `try/finally` without `except`, so one failing
-  run skips the rest of its phase.
 - **Delivery order options** (2026-11-10, idea): today the order is fixed,
   oldest first. Sinks deliver by `emitted_at`, then document id (emission
   order within a run), and `itemfeed` emits its items by publication time,
