@@ -4,12 +4,17 @@ annotation is the text, with the item's title, link and image. Routed to a
 chat sink, it posts each summarized item once.
 
 Its state is a cursor, the time of its last run. With `since_first_run`,
-its first run only sets the cursor, so the items stored before it are not
-emitted. An item without the annotation yet is looked at again on later
-runs while it was imported less than `wait` ago.
+its first run only sets the cursor and records its time as `start`, so the
+items stored before it are never emitted. An item without the annotation
+yet is looked at again on later runs while it was imported less than `wait`
+ago, but never if it was imported before `start`.
+
+A run emits its documents oldest item first: by publication time, or import
+time for an item without one, then by database id. Sinks deliver documents
+in the order they were emitted, so a chat gets them in that order too.
 """
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import ClassVar
 
 from ..applets import (
@@ -48,24 +53,44 @@ class ItemFeedApplet(BaseApplet):
         options = self.options
         state = run.state if isinstance(run.state, dict) else {}
         cursor = state.get("cursor")
+        start = state.get("start")
         if cursor is None and options.since_first_run:
-            return AppletResult(state={"cursor": now.isoformat()})
+            return AppletResult(
+                state={"cursor": now.isoformat(), "start": now.isoformat()}
+            )
 
-        since = (
-            datetime.fromisoformat(cursor) - timedelta(seconds=options.wait)
-            if cursor is not None
-            else None
-        )
         items = reader.items(
-            sources=options.sources, imported_since=since, imported_until=now
+            sources=options.sources,
+            imported_since=self.since(cursor, start),
+            imported_until=now,
         )
         texts = reader.annotations(items, options.annotation)
         documents = tuple(
             self.document(item, str(texts[item.key]))
-            for item in items
+            for item in sorted(items, key=self.age)
             if item.key in texts
         )
-        return AppletResult(state={"cursor": now.isoformat()}, documents=documents)
+        new_state: dict[str, str] = {"cursor": now.isoformat()}
+        if start is not None:
+            new_state["start"] = start
+        return AppletResult(state=new_state, documents=documents)
+
+    def since(self, cursor: str | None, start: str | None) -> datetime | None:
+        """The earliest import time to read: `wait` before the cursor, but
+        never before `start`; None, everything."""
+        if cursor is None:
+            return None
+        since = datetime.fromisoformat(cursor) - timedelta(seconds=self.options.wait)
+        if start is not None:
+            since = max(since, datetime.fromisoformat(start))
+        return since
+
+    @staticmethod
+    def age(item: SourceItem) -> tuple[datetime, int]:
+        """The emission order: publication time, or import time without
+        one, then database id."""
+        when = item.published_at or item.imported_at or datetime.min.replace(tzinfo=UTC)
+        return (when, item.id or 0)
 
     @staticmethod
     def document(item: SourceItem, text: str) -> EmittedDocument:

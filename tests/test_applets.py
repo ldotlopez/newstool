@@ -212,7 +212,36 @@ class ItemFeedTests(AppletTestCase):
         result = self.applet().run(now, NEVER_RUN, self.reader)
 
         self.assertEqual(result.documents, ())
-        self.assertEqual(result.state, {"cursor": now.isoformat()})
+        self.assertEqual(
+            result.state, {"cursor": now.isoformat(), "start": now.isoformat()}
+        )
+
+    def test_items_stored_before_the_first_run_are_never_emitted(self) -> None:
+        # Import, then two runs seconds apart: `wait` must not reach back to
+        # the items imported before the first run.
+        for item in self.add_items(1, 2):
+            self.annotate(item, "summary", "S")
+        applet = self.applet(wait="1d")
+        first_at = datetime.now(UTC)
+        first = applet.run(first_at, NEVER_RUN, self.reader)
+
+        run = AppletRun(app="a", state=first.state)
+        second = applet.run(first_at + timedelta(seconds=5), run, self.reader)
+
+        self.assertEqual(second.documents, ())
+        self.assertEqual(second.state["start"], first_at.isoformat())
+
+    def test_items_imported_after_the_first_run_are_emitted(self) -> None:
+        start = datetime.now(UTC) - timedelta(hours=1)
+        (item,) = self.add_items(1)
+        self.annotate(item, "summary", "New")
+        state = {"cursor": datetime.now(UTC).isoformat(), "start": start.isoformat()}
+
+        result = self.applet(wait="1d").run(
+            datetime.now(UTC), AppletRun(app="a", state=state), self.reader
+        )
+
+        self.assertEqual([d.content for d in result.documents], ["New"])
 
     def test_emits_summarized_items_imported_since_the_cursor(self) -> None:
         cursor = datetime.now(UTC)
@@ -241,6 +270,34 @@ class ItemFeedTests(AppletTestCase):
         self.assertEqual([d.key for d in result.documents], ["item:s/d1"])
         result = self.applet(wait="1m").run(later, run, self.reader)
         self.assertEqual(result.documents, ())
+
+    def test_emits_the_oldest_item_first(self) -> None:
+        # Stored newest first; one without a publication time counts by its
+        # import time, which is now: the newest.
+        items = self.add_items(9, 3, 6)
+        self.db.upsert_source_items(
+            [
+                SourceItem(
+                    source=SOURCE,
+                    uid="undated",
+                    title="Undated",
+                    uri="https://s.test/undated",
+                    content=b"<p></p>",
+                    mimetype="text/html",
+                )
+            ]
+        )
+        for item in self.db.get_items():
+            self.annotate(item, "summary", item.uid)
+        self.assertEqual(len(items), 3)
+
+        result = self.applet(since_first_run=False).run(
+            datetime.now(UTC), NEVER_RUN, self.reader
+        )
+
+        self.assertEqual(
+            [d.content for d in result.documents], ["d3", "d6", "d9", "undated"]
+        )
 
     def test_since_first_run_off_emits_everything(self) -> None:
         (item,) = self.add_items(1)
