@@ -488,9 +488,31 @@ Risks:
 
 - **Force rich without a terminal** (e.g. for `watch` or `ssh` without a
   pty), in foundation. Only if P2's TTY detection gets in the way.
-- **Per-item progress** inside processors, sinks and imports. P2 left it
-  out to keep the plugin contracts as they are (a callback would change
-  `Processor.process` and `Sink.deliver`); revisit if unit rows fall short.
+- **Better progress reporting through rich** (2026-11-10, plan; replaces
+  the old "per-item progress" entry). Today (P2): one `Progress` on the
+  stderr console in `cli.py` (`progress_rows`, `run_each`), a row per unit
+  (source, process key, applet, sink) with a spinner and the elapsed time,
+  removed when it ends; summary tables on stdout afterwards. Off when
+  stderr is not a terminal (cron). Gaps seen in use:
+  - no counts or ETA: a `summarize` run over hundreds of items with an LLM
+    shows only a spinner for an hour; `import`, `deliver` and `apps run`
+    the same. The units know their totals (`BaseProcessor.process` has
+    its item list, `Deliverer.plan` its rows, a provider its index);
+  - no current item: what is being fetched, summarized or sent is only in
+    `-v` logs, which scroll above the rows;
+  - output a plugin writes to stdout (the `stdout` sink) mixes with the
+    live display (`redirect_stdout=False`, kept so tables reach a
+    redirected stdout);
+  - the summaries show no durations, and failures are only counted (the
+    errors are in the logs).
+  Options: a progress reporter passed to the units (in `Services`, or an
+  optional argument of `Processor.process` / `Deliverer.deliver`, so
+  plugins that ignore it keep working), driving `total`/`advance` and a
+  description of the current item; core units first (processors through
+  `BaseProcessor`, `Deliverer`, import), plugins opting in. Keep P2's rules:
+  progress on stderr only, results on stdout, nothing when stderr is not a
+  terminal, logs never replaced. Decide whether a reporter belongs in the
+  plugin contracts (a decision record if so) and keep it a no-op in tests.
 - **Concurrent imports.** Releasing replaced contents can race with another
   process starting to reference the same content. Add a lock if imports ever
   run in parallel.
