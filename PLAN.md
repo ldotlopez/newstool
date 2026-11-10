@@ -555,6 +555,56 @@ Risks:
   `itemfeed` by publication or by import time); and a "newest only" mode
   that skips a backlog (e.g. after downtime, deliver the latest N and mark
   the rest `done`, instead of draining it at the `interval`).
+- **Database layer audit** (2026-11-10, plan): review `db.py` code and
+  schema, simplify and formalize where possible. It has gone through many
+  architecture changes (decisions 0001, 0002, 0004, 0007, 0012, 0014, 0015,
+  0016) and may carry leftovers or debt. Today: 7 tables (`sources`,
+  `source_items`, `processing_state`, `item_annotations`, `apps`,
+  `documents`, `deliveries`), ~1500 lines and ~67 methods in one
+  `Database` class; the schema is created, never migrated, with one-shot
+  scripts in `scripts/` (`migrate_applets.py`, `migrate_autoincrement.py`,
+  the older `migrate_annotation_keys.sql`). Things to look at:
+  - overlapping queries: `deliveries_of` vs `find_deliveries`;
+    `existing_document_keys` vs `count_missing_routes`; filters applied in
+    Python after the query (`Application.routed_documents` filters by
+    route, then applies `limit`);
+  - the DTO/ORM conventions (`from_dto`/`to_dto`/`update` on every model,
+    `.claude/rules/database.md`) applied evenly, and no ORM row leaking;
+  - which rules live in the schema (`UniqueConstraint`, `CheckConstraint`,
+    cascades) and which only in Python, e.g. delivery states, the
+    one-row-per-(sink, document) rule, document immutability;
+  - the split between `processing_state` and `item_annotations`, and
+    whether `sources` still earns its table;
+  - the custom column types (`CustomJSON`, `UTCDateTime`) and index
+    coverage for the queries actually run;
+  - whether to adopt real migrations (e.g. a schema version) instead of
+    one-shot scripts, and whether to split `Database` by aggregate (items,
+    applets, ledger).
+  Plan vs apply: audit first, as a written list of findings, before
+  changing anything; any schema change needs a script with a test.
+- **Configuration keys review** (2026-11-10, plan): review the names of
+  the configuration file's keys, look for names that say better what they
+  stand for, and make them consistent across subsystems. Seen so far, to
+  confirm:
+  - instance names: workflows use `name`, everything else `id`;
+  - the type field changes per section (`provider`, `processor`, `llm`,
+    `sink`, `app`); the `apps` section holds *applet* instances under
+    `app:`, and `sink:` means the sink type in `sinks` but the route
+    shorthand in `apps`;
+  - one concept, two names: a processor entry's `key` vs `itemfeed`'s
+    `annotation` for the same annotation key;
+  - durations named differently: `every` (apps), `interval` (sinks),
+    `wait` (`itemfeed`), `lookback` (`digest`, `grouping`),
+    `cache.expiration`;
+  - `plugins` holds defaults per *type*, not per plugin module (a module
+    such as `telegram` may register several types);
+  - `skip_default` and the implicit `default` workflow; `days` (renamed
+    from `on`, a YAML 1.1 boolean); `storage_dir` / `cache_dir`.
+  Renames break existing configuration files (and `${NEWSTOOL_*}`
+  overrides), so batch them in one change with a decision record, an
+  update of `config.example.yaml` and the docs, and clear errors for the
+  old names. Stored data keyed by config values (source `id`s, process
+  `key`s, applet and sink `id`s) must not change meaning.
 
 ---
 
