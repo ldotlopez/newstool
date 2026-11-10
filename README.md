@@ -418,6 +418,93 @@ while it runs. Set `DISABLE_RICH=1` (or `RICH_DISABLED=1`), or
 `TERM=dumb`, for plain output on both streams; `NO_COLOR=1` only drops the
 colors.
 
+### The phases, step by step
+
+newstool runs in four phases. Each is a command of its own, so they can
+run from separate cron lines or one by one by hand; `run` and `apps run`
+chain two of them. Every phase is safe to run again: what is already done
+is skipped, and what failed is retried.
+
+| Phase | Command | Reads | Writes |
+| :--- | :--- | :--- | :--- |
+| Import | `import` | the sources' websites | items |
+| Process | `process` | items, annotations | annotations |
+| Applets | `apps run` | items, annotations, documents | documents, delivery rows, applet state |
+| Deliver | `deliver` | delivery rows, documents | the outside world, delivery rows |
+
+**1. Import** (`import [-w WORKFLOW]`) fetches every source of the
+workflow (`default` without `-w`) with its provider and stores each
+article as an item, oldest first. An unchanged article is left as it is;
+a changed one is updated in place, so its processors run on it again. A
+failing source is reported and the others are still imported; what was
+fetched before an error is kept. The `Import` table shows, per source,
+the items read and the error, if any.
+
+**2. Process** (`process [PROCESSOR] [-w WORKFLOW]`) runs the workflow's
+process entries in configuration order, or only those of one processor
+type, over the items of its sources. Each entry writes one annotation key
+(`markdown`, `summary/telegram/es`...) and only picks the items that need
+it (see *How `process` behaves*). `--source`, `--since`, `--until`,
+`--item` and `--limit` narrow the items; `--force` reprocesses them all.
+The `Process` table shows, per key, the items done, ignored (skipped by
+the processor) and failed.
+
+`run [-w WORKFLOW]` runs import, then process; a failing phase is logged
+and the next one still runs. It is the usual cron line, one per workflow.
+
+**3. Applets** (`apps run`) runs every applet instance that is due by its
+schedule (`every`, `at`, `days`; without any, on every call), or the ones
+`--app` names; `--force` runs them whether due or not. Each run reads what
+is stored, emits its documents and saves its state, all in one
+transaction:
+
+- a document whose key the instance already stored is not stored again,
+  so an applet can emit the same item on every run without it being sent
+  twice;
+- every emitted document gets a `queued` delivery row for each sink its
+  output is routed to that it has none of: new ones, and stored ones
+  routed since they were emitted.
+
+The `Apps` table shows, per instance, whether it was due, the documents
+that are `New`, those `Already stored`, the rows `Routed` for stored ones,
+and the error. A failing instance keeps its previous state and does not
+stop the others. Then `apps run` delivers (phase 4): to every sink, or with
+`--app` to the sinks those instances are routed to. `--no-deliver` stops
+before that; `--dry-run` shows what the applets would emit and their new
+state, storing and sending nothing.
+
+**4. Deliver** (`deliver [--sink ID]`) sends the pending delivery rows of
+every sink instance, or of the ones named: `queued` rows, and failed ones
+with attempts left once their backoff has passed. Each sink goes oldest
+first and keeps its own pace: with an `interval`, one row once its last
+delivery is that old; then at most `max_per_run` rows. `--ignore-interval`,
+`--ignore-max-per-run` and `--max-per-run N` override that pace for one
+run, and `--dry-run` lists what would be sent. The `Deliver` table shows,
+per sink, the rows delivered and failed.
+
+A typical setup, two cron lines:
+
+```sh
+*/30 * * * *  uv run newstool -c config.yaml run -w news   # import and process
+*/5  * * * *  uv run newstool -c config.yaml apps run      # applets, then deliver
+```
+
+Both take the write lock, so a run that starts while the other holds it
+fails with a lock error and is picked up by its next cron run; keep them
+from overlapping where possible (`apps run` holds the lock while it
+sends). The same phases by hand, checking each step before the next:
+
+```sh
+uv run newstool -c config.yaml run -w news                     # import and process
+uv run newstool -c config.yaml inspect annotations --key summary
+uv run newstool -c config.yaml apps run --app items --dry-run  # what it would emit
+uv run newstool -c config.yaml apps run --app items --no-deliver
+uv run newstool -c config.yaml inspect documents --app items
+uv run newstool -c config.yaml inspect deliveries --status queued
+uv run newstool -c config.yaml deliver --sink chat --dry-run
+uv run newstool -c config.yaml deliver --sink chat
+```
+
 ### How `process` behaves
 
 - Each entry handles every item once, and keeps its own state per item
