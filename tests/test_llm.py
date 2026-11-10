@@ -147,6 +147,29 @@ class SummarizeTests(ProcessorTestCase):
             {"summary", "summary/es"},
         )
 
+    def test_a_source_prompt_replaces_the_prompt_for_its_items(self) -> None:
+        llm = StubLLM("Resumen.")
+        own = self.build(
+            summarize.SummarizeProcessor,
+            llm,
+            prompt="Summarize: ",
+            source_prompts={SOURCE.id: "Resume: "},
+        )
+        other = self.build(
+            summarize.SummarizeProcessor,
+            llm,
+            prompt="Summarize: ",
+            source_prompts={"elsewhere": "Resume: "},
+        )
+
+        self.annotation(own, "summary")
+        self.annotation(other, "summary")
+
+        self.assertEqual(
+            [call[1] for call in llm.calls],
+            ["Resume: # T\n\nBody", "Summarize: # T\n\nBody"],
+        )
+
     def test_rejects_options_the_processor_does_not_take(self) -> None:
         options = summarize.SummarizeOptions()
         self.assertEqual(summarize.SummarizeProcessor.output_key(options), "summary")
