@@ -27,19 +27,6 @@ The docs are large (~100 KB together); read only the one the task needs, when it
 - `docs/decisions/`: recorded design decisions (ADRs). Check before proposing changes to an established approach; do not reverse a recorded decision without asking.
 - `PLAN.md`: the backlog. Read only when asked about pending work.
 
-### Documentation Maintenance
-
-The project documentation (`README.md`, `docs/ARCHITECTURE.md`, `docs/SPECIFICATION.md`, `docs/decisions/`) must stay in sync with the code. Never edit these files without the user's explicit permission.
-
-- **When to propose an update:** after completing a change that makes any of them inaccurate. Typical triggers:
-  - A module or plugin is added, removed, renamed, or changes responsibility (`ARCHITECTURE.md`).
-  - A CLI flag, config key, plugin option, or supported behavior changes, or a roadmap item is completed (`README.md`).
-  - A significant architectural decision is made, or an existing one is reversed or superseded (`docs/decisions/`).
-- **How to ask:** at the end of the task, state which files are affected and summarize the proposed edit in one or two lines per file. Then wait for an explicit yes. Do not edit first and ask afterwards.
-- **Scope of the edit:** once approved, change only what the code change made inaccurate. Do not rewrite or reformat unrelated sections.
-- **Decisions are append-only:** never rewrite an existing record in `docs/decisions/`. To reverse a decision, propose a new record that supersedes it, and propose changing the old record's status line only to `superseded by NNNN`.
-- **When unsure** whether a change warrants a documentation update, ask instead of skipping it silently.
-
 ---
 
 ## File System Traversal & Search Rules
