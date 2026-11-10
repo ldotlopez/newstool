@@ -48,9 +48,9 @@ class ExternalErrorTests(unittest.TestCase):
         logger.setLevel(logging.WARNING)
 
     def process_failing_with(self, error: Exception):
+        # Outside `run_each`, which logs and summarizes a unit's failure.
         app = Mock()
-        app.process_keys.return_value = ["summary"]
-        app.run_process.side_effect = error
+        app.process_keys.side_effect = error
         return invoke(app, "process")
 
     def test_external_failure_is_a_message_without_traceback(self) -> None:
@@ -124,6 +124,21 @@ class CommandTests(unittest.TestCase):
                 call("summary/en", workflow="default", scope=scope, force=True),
             ],
         )
+
+    def test_process_goes_on_after_a_run_raises_and_exits_with_error(self) -> None:
+        app = Mock()
+        app.process_keys.return_value = ["summary", "tags"]
+        app.run_process.side_effect = [RuntimeError("llm down"), RunSummary(done=3)]
+
+        with self.assertLogs("newstool", "ERROR") as logs:
+            result = invoke(app, "process")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(
+            [c.args[0] for c in app.run_process.call_args_list], ["summary", "tags"]
+        )
+        self.assertIn("summary: failed", logs.output[0])
+        self.assertIn("1 failure(s)", result.output)
 
     def test_process_without_processor_runs_every_entry(self) -> None:
         app = Mock()
@@ -249,6 +264,22 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(app.deliver.call_args.args[0], "chat")
         self.assertIn("1 delivery(ies) failed", result.output)
         self.assertIn("gone: not configured, 4 pending", logs.output[0])
+
+    def test_deliver_goes_on_after_a_sink_raises(self) -> None:
+        app = Mock()
+        app.sink_ids = ["chat", "site"]
+        app.deliver.side_effect = [RuntimeError("bot blocked"), RunSummary(done=1)]
+        app.unconfigured_pending.return_value = {}
+
+        with self.assertLogs("newstool", "ERROR") as logs:
+            result = invoke(app, "deliver")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(
+            [c.args[0] for c in app.deliver.call_args_list], ["chat", "site"]
+        )
+        self.assertIn("chat: failed", logs.output[0])
+        self.assertIn("1 delivery(ies) failed", result.output)
 
     def test_deliver_passes_the_pacing_override(self) -> None:
         app = Mock()

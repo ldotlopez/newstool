@@ -116,17 +116,30 @@ def progress_rows() -> Iterator[Progress]:
 
 
 def run_each[T](
-    progress: Progress, names: Iterable[str], run: Callable[[str], T]
+    progress: Progress,
+    names: Iterable[str],
+    run: Callable[[str], T],
+    on_error: Callable[[str, Exception], T],
 ) -> dict[str, T]:
-    """Run each unit by name with its own row, removed when it ends."""
+    """Run each unit by name with its own row, removed when it ends. A unit
+    that raises is logged and gets `on_error`'s result, so the summary
+    reports it and the units after it still run."""
     results = {}
     for name in names:
         row = progress.add_task(name, total=None)
         try:
             results[name] = run(name)
+        except Exception as e:  # noqa: BLE001
+            log_failure(LOGGER, f"{name}: failed", e)
+            results[name] = on_error(name, e)
         finally:
             progress.remove_task(row)
     return results
+
+
+def failed_summary(name: str, exc: Exception) -> RunSummary:
+    """The summary of a process or delivery run that raised: one failure."""
+    return RunSummary(failed=1)
 
 
 def print_table(title: str, headers: list[str], rows: list[list[Any]]) -> None:
@@ -270,16 +283,13 @@ def import_sources(
     rows (source, items, error)."""
 
     def import_one(source_id: str) -> list[Any]:
-        try:
-            items = app.import_source(source_id)
-        except Exception as e:  # noqa: BLE001
-            # One broken site must not stop the others; the summary reports it.
-            log_failure(LOGGER, f"importing '{source_id}' failed", e)
-            return [source_id, "-", describe(e)]
-        return [source_id, len(items), ""]
+        return [source_id, len(app.import_source(source_id)), ""]
+
+    def import_failed(source_id: str, exc: Exception) -> list[Any]:
+        return [source_id, "-", describe(exc)]
 
     sources = [source.id for source in app.sources(workflow)]
-    return list(run_each(progress, sources, import_one).values())
+    return list(run_each(progress, sources, import_one, import_failed).values())
 
 
 def print_import(rows: list[list[Any]], title: str = "Import") -> int:
@@ -369,8 +379,10 @@ def process_cmd(
             lambda key: app.run_process(
                 key, workflow=workflow, scope=scope, force=force
             ),
+            failed_summary,
         )
-    print_process(summaries)
+    if failed := print_process(summaries):
+        raise click.ClickException(f"{failed} failure(s); see the log above")
 
 
 # (phase, run under the progress rows, print its summary and count failures)
@@ -394,6 +406,7 @@ def workflow_phases(app: Application, workflow: str, labelled: bool) -> list[Pha
                 progress,
                 app.process_keys(workflow=workflow),
                 lambda key: app.run_process(key, workflow=workflow),
+                failed_summary,
             ),
             lambda summaries: print_process(summaries, title=f"Process{suffix}"),
         ),
@@ -1321,7 +1334,10 @@ def run_delivery(
     deliveries failed."""
     with progress_rows() as progress:
         summaries = run_each(
-            progress, sink_ids, lambda sink: app.deliver(sink, now, pacing)
+            progress,
+            sink_ids,
+            lambda sink: app.deliver(sink, now, pacing),
+            failed_summary,
         )
     for sink, count in app.unconfigured_pending().items():
         LOGGER.warning(
@@ -1378,6 +1394,7 @@ def apps_run_cmd(
             progress,
             selected,
             lambda app_id: app.run_app(app_id, now, force=force, dry_run=dry_run),
+            lambda app_id, exc: AppReport(app_id, due=True, error=describe(exc)),
         )
     failures = print_apps(reports)
     if dry_run:
