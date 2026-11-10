@@ -223,6 +223,7 @@ class AppEntry(Entry):
     days: list[Weekday] = []
     sink: str | None = None
     routes: dict[str, list[str]] = {}
+    skip_default: bool = False  # left out of `--default` (`run`, `apps run`...)
 
     @pydantic.model_validator(mode="after")
     def sink_or_routes(self) -> AppEntry:
@@ -393,6 +394,10 @@ class Config(BaseSettings):
             name=DEFAULT_WORKFLOW,
             sources=[source.id for source in self.sources if not source.skip_default],
         )
+
+    def default_app_ids(self) -> list[str]:
+        """The applet instances without `skip_default`, in configuration order."""
+        return [entry.id for entry in self.apps if not entry.skip_default]
 
     def all_workflows(self) -> list[Workflow]:
         """Every workflow, `default` first."""

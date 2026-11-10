@@ -169,9 +169,10 @@ sinks:
   #   options:
   #     path: /srv/www/{app}.xml     # {app}, {output}, {key} are replaced
 
-# Applet instances, run by `apps run` (one cron line, every few minutes)
-# when due: `every` after their last success, on `days`, once a day from
-# `at` (local time). Each output goes to the sink instances in `routes`;
+# Applet instances, run by `apps run` and `run` when due: `every` after
+# their last success, on `days`, once a day from `at` (local time).
+# `skip_default: true` leaves one out of `--default`; `--app ID` or `--all`
+# still runs it. Each output goes to the sink instances in `routes`;
 # `sink` is the shorthand for an applet with one output. An instance's `id`
 # keys its state and documents: renaming it starts it from scratch.
 apps:

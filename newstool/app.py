@@ -33,7 +33,6 @@ from .models import (
     Delivery,
     Document,
     DocumentFilter,
-    ItemKey,
     ProcessingScope,
     SourceData,
     SourceItem,
@@ -179,10 +178,17 @@ class Application:
     def workflow(self, name: str = DEFAULT_WORKFLOW) -> Workflow:
         return lookup(self._workflows, name, "workflow")
 
-    def sources(self, workflow: str = DEFAULT_WORKFLOW) -> list[SourceData]:
-        """The workflow's sources, in configuration order."""
-        ids = set(self.workflow(workflow).sources)
-        return [source for source in self.config.sources if source.id in ids]
+    def source_ids(
+        self, workflows: Iterable[str], source: str | None = None
+    ) -> list[str]:
+        """The workflows' sources, each once, in configuration order; with
+        `source`, only it, which must be one of them."""
+        ids = {id_ for name in workflows for id_ in self.workflow(name).sources}
+        if source is not None:
+            if source not in ids:
+                raise ConfigError(f"source '{source}' is not in the workflow(s)")
+            ids = {source}
+        return [entry.id for entry in self.config.sources if entry.id in ids]
 
     def process_keys(
         self, processor: str | None = None, *, workflow: str = DEFAULT_WORKFLOW
@@ -202,6 +208,11 @@ class Application:
     def app_ids(self) -> list[str]:
         """Every applet instance, in configuration order."""
         return list(self._catalog.apps)
+
+    @property
+    def default_app_ids(self) -> list[str]:
+        """The applet instances without `skip_default`, in configuration order."""
+        return self.config.default_app_ids()
 
     # --- Import ------------------------------------------------------------
 
@@ -496,12 +507,6 @@ class Application:
             annotation_ids=annotation_ids,
             sort=sort,
         )
-
-    def get_annotation_values(
-        self, items: Iterable[SourceItem], *, key: str
-    ) -> dict[ItemKey, Any]:
-        """One annotation's value per item; items without it are absent."""
-        return self._db.get_annotation_values(items, key=key)
 
     # --- Documents ---------------------------------------------------------
 

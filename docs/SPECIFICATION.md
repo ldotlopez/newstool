@@ -78,6 +78,7 @@ apps:
     options: {...}         # over the applet's plugin section
     sink: <sink id>        # an applet with one output, or
     routes: {<output>: [<sink id>, ...]}
+    skip_default: false    # true: left out of `--default`
 cache:
   expiration: <duration>   # HTTP cache lifetime: seconds, or 5m, 2h, 3d
 db:
@@ -109,9 +110,17 @@ resolves to none is a configuration error.
 
 `default` uses every source without `skip_default: true` and runs, in
 order, every catalog processor without it. Each entry of `workflows` names
-its sources and its process runs. A command runs one workflow, `default`
-unless another is named (`run --all` runs each in turn, `default` first),
-and each phase only touches that workflow's sources. Applets and sinks belong to no workflow (§4.3).
+its sources and its process runs. Each phase only touches its workflow's
+sources. Applets and sinks belong to no workflow (§4.3).
+
+Every command that runs something is told what: names (`-w NAME`,
+`--app ID`, `--sink ID`), `--default` or `--all`, exactly one; a bare one
+is a usage error. `--default` is what has no `skip_default`: the `default`
+workflow, the applet instances without it and the sinks they are routed
+to. `--all` is everything, skipped or not: every workflow in turn,
+`default` first, every applet instance and every sink. `run` runs a
+workflow selection, then the applets and the delivery, both `--default` or
+both `--all`.
 
 - A process key is written by one run within a workflow. On sources shared
   by workflows, one processor type writes it; other options for it are a
@@ -166,8 +175,8 @@ article.
 
 ### 4.2 Processing
 
-Processors create annotations on items. `process` runs the workflow's
-process runs in order; each run writes one key, by default the processor's
+Processors create annotations on items. `process` runs each selected
+workflow's process runs in order; each run writes one key, by default the processor's
 own, and keeps its own processing state per item under that key (§3.1). A
 run's options override those of the processor's plugin section.
 
@@ -203,7 +212,8 @@ run's options override those of the processor's plugin section.
 Applets are a plugin type of their own. Each configured instance decides
 when it runs, reads items, annotations and the documents of any instance,
 and returns its new state and the documents it emits. `apps run` runs the
-instances that are due, then delivers.
+selected instances that are due, then delivers: with `--all` to every sink,
+otherwise to the sinks they are routed to.
 
 - **When it runs:** an instance is due when its schedule allows it:
   `every` after its last success, on its `days`, once a day from `at`

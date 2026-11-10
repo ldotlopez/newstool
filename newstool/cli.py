@@ -9,11 +9,10 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import click as plain_click
 import rich_click
-from click.core import ParameterSource
 from foundation.clilib import (
     RICH_STDERR_DISABLED,
     RICH_STDOUT_DISABLED,
@@ -243,13 +242,123 @@ def document_options[**P, R](command: Callable[P, R]) -> Callable[P, R]:
     return wrapper
 
 
-workflow_option = click.option(
+# What an execution command runs: the named ones, the `default` set (those
+# without `skip_default`) or every one, skipped or not.
+DEFAULT_SELECTION = "default"
+ALL_SELECTION = "all"
+type Selection = tuple[str, ...] | Literal["default", "all"]
+
+
+def selection_options[**P, R](
+    *flags: str,
+    multiple: bool = False,
+    names_help: str = "",
+    default_help: str,
+    all_help: str,
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Add the name option `flags` (if any), --default and --all, passed to
+    the command as `selection`. Exactly one is required: without any, the
+    command would run something nobody asked for."""
+    choices = ", ".join([*flags[-1:], "--default", "--all"])
+
+    def decorate(command: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(command)
+        def wrapper(
+            *args: Any,
+            selected_names: tuple[str, ...] | str | None = None,
+            select_default: bool,
+            select_all: bool,
+            **kwargs: Any,
+        ) -> R:
+            if isinstance(selected_names, str):
+                selected_names = (selected_names,)
+            names = selected_names or ()
+            if sum((bool(names), select_default, select_all)) != 1:
+                raise click.UsageError(f"give exactly one of {choices}")
+            selection: Selection = (
+                DEFAULT_SELECTION
+                if select_default
+                else ALL_SELECTION
+                if select_all
+                else names
+            )
+            return command(*args, selection=selection, **kwargs)
+
+        decorated = click.option("--all", "select_all", is_flag=True, help=all_help)(
+            wrapper
+        )
+        decorated = click.option(
+            "--default", "select_default", is_flag=True, help=default_help
+        )(decorated)
+        if flags:
+            decorated = click.option(
+                *flags, "selected_names", multiple=multiple, help=names_help
+            )(decorated)
+        return decorated
+
+    return decorate
+
+
+workflow_selection = selection_options(
     "-w",
     "--workflow",
-    default=DEFAULT_WORKFLOW,
-    show_default=True,
-    help="The workflow to run",
+    names_help="This workflow",
+    default_help="The `default` workflow: the sources and processors"
+    " without skip_default",
+    all_help="Every workflow, `default` first",
 )
+
+app_selection = selection_options(
+    "--app",
+    multiple=True,
+    names_help="This applet instance (repeatable)",
+    default_help="The applet instances without skip_default",
+    all_help="Every applet instance",
+)
+
+sink_selection = selection_options(
+    "--sink",
+    multiple=True,
+    names_help="This sink instance (repeatable)",
+    default_help="The sink instances the applet instances without skip_default"
+    " are routed to",
+    all_help="Every sink instance",
+)
+
+
+def selected_workflows(app: Application, selection: Selection) -> list[str]:
+    if selection == ALL_SELECTION:
+        return app.workflows
+    if selection == DEFAULT_SELECTION:
+        return [DEFAULT_WORKFLOW]
+    return list(selection)
+
+
+def selected_apps(app: Application, selection: Selection) -> list[str]:
+    if selection == ALL_SELECTION:
+        return app.app_ids
+    if selection == DEFAULT_SELECTION:
+        return app.default_app_ids
+    for app_id in selection:
+        app.app_instance(app_id)
+    return list(selection)
+
+
+def selected_sinks(app: Application, selection: Selection) -> list[str]:
+    if selection == ALL_SELECTION:
+        return app.sink_ids
+    if selection == DEFAULT_SELECTION:
+        return app.routed_sinks(app.default_app_ids)
+    return list(selection)
+
+
+def routed_from(
+    app: Application, selection: Selection, app_ids: list[str]
+) -> list[str]:
+    """The sinks to deliver to after running `app_ids`: every one with --all,
+    so rows queued by hand go too; the ones they are routed to otherwise."""
+    return app.sink_ids if selection == ALL_SELECTION else app.routed_sinks(app_ids)
+
 
 dry_run_option = click.option(
     "--dry-run", is_flag=True, help="Show what would be done, changing nothing"
@@ -277,10 +386,10 @@ def cli(
 
 
 def import_sources(
-    app: Application, progress: Progress, workflow: str
+    app: Application, progress: Progress, source_ids: list[str]
 ) -> list[list[Any]]:
-    """Import every source of the workflow, a row each; return the summary
-    rows (source, items, error)."""
+    """Import each source, a row each; return the summary rows (source,
+    items, error)."""
 
     def import_one(source_id: str) -> list[Any]:
         return [source_id, len(app.import_source(source_id)), ""]
@@ -288,8 +397,7 @@ def import_sources(
     def import_failed(source_id: str, exc: Exception) -> list[Any]:
         return [source_id, "-", describe(exc)]
 
-    sources = [source.id for source in app.sources(workflow)]
-    return list(run_each(progress, sources, import_one, import_failed).values())
+    return list(run_each(progress, source_ids, import_one, import_failed).values())
 
 
 def print_import(rows: list[list[Any]], title: str = "Import") -> int:
@@ -339,21 +447,42 @@ def print_deliver(summaries: dict[str, RunSummary]) -> int:
 
 
 @cli.command("import")
-@workflow_option
+@click.argument("source", required=False)
+@workflow_selection
 @click.pass_context
 @report_user_errors
-def import_cmd(ctx: click.Context, workflow: str) -> None:
-    """Import every source of the workflow."""
+def import_cmd(ctx: click.Context, source: str | None, selection: Selection) -> None:
+    """Import the sources of the selected workflows, each once, or only
+    SOURCE, which must be one of them."""
     app = app_from_context(ctx, write=True)
+    source_ids = app.source_ids(selected_workflows(app, selection), source)
     with progress_rows() as progress:
-        rows = import_sources(app, progress, workflow)
+        rows = import_sources(app, progress, source_ids)
     if failed := print_import(rows):
         raise click.ClickException(f"{failed} source(s) failed")
 
 
+def process_workflow(
+    app: Application,
+    progress: Progress,
+    workflow: str,
+    processor: str | None = None,
+    scope: ProcessingScope | None = None,
+    force: bool = False,
+) -> dict[str, RunSummary]:
+    """Run the workflow's process runs in order, or only `processor`'s, a
+    row each; return their summaries by key."""
+    return run_each(
+        progress,
+        app.process_keys(processor, workflow=workflow),
+        lambda key: app.run_process(key, workflow=workflow, scope=scope, force=force),
+        failed_summary,
+    )
+
+
 @cli.command("process")
 @click.argument("processor", required=False)
-@workflow_option
+@workflow_selection
 @scope_options
 @click.option(
     "--force",
@@ -365,23 +494,27 @@ def import_cmd(ctx: click.Context, workflow: str) -> None:
 def process_cmd(
     ctx: click.Context,
     processor: str | None,
-    workflow: str,
+    selection: Selection,
     scope: ProcessingScope,
     force: bool,
 ) -> None:
-    """Run every process run of the workflow in order, or only
+    """Run every process run of the selected workflows in order, or only
     PROCESSOR's."""
     app = app_from_context(ctx, write=True)
+    labelled = selection == ALL_SELECTION
     with progress_rows() as progress:
-        summaries = run_each(
-            progress,
-            app.process_keys(processor, workflow=workflow),
-            lambda key: app.run_process(
-                key, workflow=workflow, scope=scope, force=force
-            ),
-            failed_summary,
-        )
-    if failed := print_process(summaries):
+        summaries = [
+            (
+                workflow,
+                process_workflow(app, progress, workflow, processor, scope, force),
+            )
+            for workflow in selected_workflows(app, selection)
+        ]
+    failed = sum(
+        print_process(result, title=phase_title("Process", workflow, labelled))
+        for workflow, result in summaries
+    )
+    if failed:
         raise click.ClickException(f"{failed} failure(s); see the log above")
 
 
@@ -389,60 +522,56 @@ def process_cmd(
 type Phase = tuple[str, Callable[[Progress], Any], Callable[[Any], int]]
 
 
+def phase_title(title: str, workflow: str, labelled: bool) -> str:
+    return f"{title} ({workflow})" if labelled else title
+
+
 def workflow_phases(app: Application, workflow: str, labelled: bool) -> list[Phase]:
-    """The import and process phases of `run` for one workflow; labelled
-    phases and summaries name the workflow."""
+    """The import and process phases of one workflow; labelled phases and
+    summaries name the workflow."""
     prefix = f"{workflow}: " if labelled else ""
-    suffix = f" ({workflow})" if labelled else ""
     return [
         (
             f"{prefix}import",
-            lambda progress: import_sources(app, progress, workflow),
-            lambda rows: print_import(rows, title=f"Import{suffix}"),
+            lambda progress: import_sources(app, progress, app.source_ids([workflow])),
+            lambda rows: print_import(
+                rows, title=phase_title("Import", workflow, labelled)
+            ),
         ),
         (
             f"{prefix}process",
-            lambda progress: run_each(
-                progress,
-                app.process_keys(workflow=workflow),
-                lambda key: app.run_process(key, workflow=workflow),
-                failed_summary,
+            lambda progress: process_workflow(app, progress, workflow),
+            lambda summaries: print_process(
+                summaries, title=phase_title("Process", workflow, labelled)
             ),
-            lambda summaries: print_process(summaries, title=f"Process{suffix}"),
         ),
     ]
 
 
-@cli.command("run")
-@workflow_option
-@click.option(
-    "--all",
-    "all_workflows",
-    is_flag=True,
-    help="Run every workflow, `default` first",
-)
-@click.pass_context
-@report_user_errors
-def run_cmd(ctx: click.Context, workflow: str, all_workflows: bool) -> None:
-    """Run the workflow's import and process in turn, or every workflow's
-    with --all; `apps run` runs the applets and delivers.
+def apps_phase(app: Application, app_ids: list[str], now: datetime) -> Phase:
+    """Run the applet instances that are due."""
+    return (
+        "apps",
+        lambda progress: run_each(
+            progress, app_ids, lambda app_id: app.run_app(app_id, now), failed_report
+        ),
+        print_apps,
+    )
 
-    A failure is logged and the next phase still runs; the exit status is
-    non-zero if anything failed.
-    """
-    if all_workflows and (
-        ctx.get_parameter_source("workflow") is not ParameterSource.DEFAULT
-    ):
-        raise click.UsageError("--all and --workflow exclude each other")
-    app = app_from_context(ctx, write=True)
+
+def delivery_phase(app: Application, sink_ids: list[str], now: datetime) -> Phase:
+    """Deliver for each sink instance, paced."""
+    return (
+        "deliver",
+        lambda progress: deliver_each(app, progress, sink_ids, now),
+        lambda summaries: report_delivery(app, summaries),
+    )
+
+
+def run_phases(phases: list[Phase]) -> int:
+    """Run the phases in turn, then print their summaries; return how many
+    failures there were. A failing phase is logged and the next still runs."""
     failures = 0
-
-    workflows = app.workflows if all_workflows else [workflow]
-    phases = [
-        phase
-        for name in workflows
-        for phase in workflow_phases(app, name, labelled=all_workflows)
-    ]
     results = []
     with progress_rows() as progress:
         for number, (phase, run_phase, print_summary) in enumerate(phases, start=1):
@@ -458,39 +587,60 @@ def run_cmd(ctx: click.Context, workflow: str, all_workflows: bool) -> None:
 
     for print_summary, result in results:
         failures += print_summary(result)
-    if failures:
+    return failures
+
+
+@cli.command("workflows")
+@workflow_selection
+@click.pass_context
+@report_user_errors
+def workflows_cmd(ctx: click.Context, selection: Selection) -> None:
+    """Run the selected workflows' import and process in turn.
+
+    A failure is logged and the next phase still runs; the exit status is
+    non-zero if anything failed.
+    """
+    app = app_from_context(ctx, write=True)
+    labelled = selection == ALL_SELECTION
+    phases = [
+        phase
+        for workflow in selected_workflows(app, selection)
+        for phase in workflow_phases(app, workflow, labelled)
+    ]
+    if failures := run_phases(phases):
         raise click.ClickException(f"{failures} failure(s); see the log above")
 
 
-def match_snippet(text: str, query: str, width: int = 60) -> str | None:
-    """The text around the first case-insensitive match, on one line."""
-    start = text.casefold().find(query.casefold())
-    if start < 0:
-        return None
-    snippet = text[max(start - width, 0) : start + len(query) + width]
-    return " ".join(snippet.split())
-
-
-@cli.command("search")
-@click.argument("query")
-@scope_options
+@cli.command("run")
+@selection_options(
+    default_help="The `default` workflow, the applet instances without"
+    " skip_default and the sinks they are routed to",
+    all_help="Every workflow, `default` first, every applet instance and every sink",
+)
 @click.pass_context
 @report_user_errors
-def search_cmd(ctx: click.Context, query: str, scope: ProcessingScope) -> None:
-    """Items whose markdownify text contains QUERY (case-insensitive).
+def run_cmd(ctx: click.Context, selection: Selection) -> None:
+    """Run the selected workflows (`workflows`), then the applet instances
+    that are due and the delivery (`apps run`).
 
-    --limit counts the items searched, not the matches.
+    A failure is logged and the next phase still runs; the exit status is
+    non-zero if anything failed.
     """
-    app = app_from_context(ctx)
-    items = app.get_items(scope)
-    # shortcut: loads every markdown from disk, add an index if it gets slow
-    markdowns = app.get_annotation_values(items, key="markdown")
-    rows = []
-    for item in items:
-        snippet = match_snippet(markdowns.get(item.key, ""), query)
-        if snippet is not None:
-            rows.append([item.id, item.source.id, item.title, snippet])
-    print_table("Matches", ["ID", "Source", "Title", "Match"], rows)
+    app = app_from_context(ctx, write=True)
+    now = datetime.now(UTC)
+    labelled = selection == ALL_SELECTION
+    app_ids = selected_apps(app, selection)
+    phases = [
+        *(
+            phase
+            for workflow in selected_workflows(app, selection)
+            for phase in workflow_phases(app, workflow, labelled)
+        ),
+        apps_phase(app, app_ids, now),
+        delivery_phase(app, routed_from(app, selection, app_ids), now),
+    ]
+    if failures := run_phases(phases):
+        raise click.ClickException(f"{failures} failure(s); see the log above")
 
 
 # --- Inspection -------------------------------------------------------------
@@ -1282,9 +1432,7 @@ def deliveries_send_cmd(
 
 
 @cli.command("deliver")
-@click.option(
-    "--sink", "sink_ids", multiple=True, help="Only this sink instance (repeatable)"
-)
+@sink_selection
 @click.option(
     "--ignore-interval",
     is_flag=True,
@@ -1305,14 +1453,14 @@ def deliveries_send_cmd(
 @report_user_errors
 def deliver_cmd(
     ctx: click.Context,
-    sink_ids: tuple[str, ...],
+    selection: Selection,
     ignore_interval: bool,
     ignore_max_per_run: bool,
     max_per_run: int | None,
     dry_run: bool,
 ) -> None:
-    """Send every sink instance's pending deliveries, paced; `apps run`
-    does this after running the applets.
+    """Send the selected sink instances' pending deliveries, paced; `apps
+    run` does this after running the applets.
 
     --ignore-interval and --ignore-max-per-run each drop one of the sinks'
     pacing options for this run, and --max-per-run replaces one. A sink
@@ -1331,7 +1479,7 @@ def deliver_cmd(
     )
     app = app_from_context(ctx, write=not dry_run)
     now = datetime.now(UTC)
-    selected = list(sink_ids) or app.sink_ids
+    selected = selected_sinks(app, selection)
     if dry_run:
         rows = [
             [d.id, d.sink, f"{d.document_id} {d.document_label}", d.status]
@@ -1353,17 +1501,36 @@ def run_delivery(
     """Deliver for each sink instance and print the summary; return how many
     deliveries failed."""
     with progress_rows() as progress:
-        summaries = run_each(
-            progress,
-            sink_ids,
-            lambda sink: app.deliver(sink, now, pacing),
-            failed_summary,
-        )
+        summaries = deliver_each(app, progress, sink_ids, now, pacing)
+    return report_delivery(app, summaries)
+
+
+def deliver_each(
+    app: Application,
+    progress: Progress,
+    sink_ids: list[str],
+    now: datetime,
+    pacing: PacingOverride | None = None,
+) -> dict[str, RunSummary]:
+    """Deliver for each sink instance, a row each; return the summaries."""
+    return run_each(
+        progress, sink_ids, lambda sink: app.deliver(sink, now, pacing), failed_summary
+    )
+
+
+def report_delivery(app: Application, summaries: dict[str, RunSummary]) -> int:
+    """Warn about rows of sinks no longer configured, whatever was selected,
+    and print the summary; return how many deliveries failed."""
     for sink, count in app.unconfigured_pending().items():
         LOGGER.warning(
             f"{sink}: not configured, {count} pending delivery(ies) left as they are"
         )
     return print_deliver(summaries)
+
+
+def failed_report(app_id: str, exc: Exception) -> AppReport:
+    """The report of an applet run that raised."""
+    return AppReport(app_id, due=True, error=describe(exc))
 
 
 # --- Applets ----------------------------------------------------------------
@@ -1375,9 +1542,7 @@ def apps_group() -> None:
 
 
 @apps_group.command("run")
-@click.option(
-    "--app", "app_ids", multiple=True, help="Only this applet instance (repeatable)"
-)
+@app_selection
 @click.option("--force", is_flag=True, help="Run even if not due")
 @click.option(
     "--no-deliver",
@@ -1389,13 +1554,13 @@ def apps_group() -> None:
 @report_user_errors
 def apps_run_cmd(
     ctx: click.Context,
-    app_ids: tuple[str, ...],
+    selection: Selection,
     force: bool,
     no_deliver: bool,
     dry_run: bool,
 ) -> None:
-    """Run the applet instances that are due, then deliver: with --app,
-    for the sink instances those are routed to; without it, for all.
+    """Run the selected applet instances that are due, then deliver: with
+    --all, for every sink instance; otherwise, for those they are routed to.
 
     Each emitted document gets a queued delivery per sink its output is
     routed to, including one already stored that has no row of a sink
@@ -1406,22 +1571,19 @@ def apps_run_cmd(
     """
     app = app_from_context(ctx, write=not dry_run)
     now = datetime.now(UTC)
-    selected = list(app_ids) or app.app_ids
-    for app_id in selected:
-        app.app_instance(app_id)
+    selected = selected_apps(app, selection)
     with progress_rows() as progress:
         reports = run_each(
             progress,
             selected,
             lambda app_id: app.run_app(app_id, now, force=force, dry_run=dry_run),
-            lambda app_id, exc: AppReport(app_id, due=True, error=describe(exc)),
+            failed_report,
         )
     failures = print_apps(reports)
     if dry_run:
         print_emitted(reports)
     elif not no_deliver:
-        sinks = app.routed_sinks(selected) if app_ids else app.sink_ids
-        failures += run_delivery(app, sinks, now)
+        failures += run_delivery(app, routed_from(app, selection, selected), now)
     if failures:
         raise click.ClickException(f"{failures} failure(s); see the log above")
 
@@ -1447,7 +1609,7 @@ def print_emitted(reports: dict[str, AppReport]) -> None:
 
 
 @apps_group.command("reset")
-@click.argument("app_id")
+@click.option("--app", "app_id", required=True, help="The applet instance")
 @click.option(
     "--with-documents",
     is_flag=True,
@@ -1459,7 +1621,8 @@ def print_emitted(reports: dict[str, AppReport]) -> None:
 def apps_reset_cmd(
     ctx: click.Context, app_id: str, with_documents: bool, dry_run: bool
 ) -> None:
-    """Delete APP_ID's state and run times, so it starts from scratch.
+    """Delete the applet instance's state and run times, so it starts from
+    scratch.
 
     Its documents stay unless --with-documents, so what it emits again under
     their keys is not delivered again. The instance need not be configured.

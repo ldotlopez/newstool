@@ -370,12 +370,32 @@ processors:
   - {processor: markdownify, key: markdown/copy, skip_default: true}
 apps:
   - {id: news, app: feed}
-  - {id: short, app: feed, options: {max_items: 1}}
+  - {id: short, app: feed, options: {max_items: 1}, skip_default: true}
 """
         )
 
         self.assertEqual(self.app.process_keys(), ["markdown"])
         self.assertEqual(self.app.app_ids, ["news", "short"])
+        self.assertEqual(self.app.default_app_ids, ["news"])
+
+    def test_source_ids_of_workflows_each_once_in_configuration_order(self) -> None:
+        self.app.close()
+        self.app = self.make_app(
+            workflows="""
+workflows:
+  - {name: both, sources: [juntas, mediterraneo]}
+  - {name: juntas, sources: [juntas]}
+"""
+        )
+
+        self.assertEqual(
+            self.app.source_ids(["juntas", "both"]), ["mediterraneo", "juntas"]
+        )
+        self.assertEqual(self.app.source_ids(["both"], "juntas"), ["juntas"])
+        with self.assertRaisesRegex(
+            ConfigError, "source 'mediterraneo' is not in the workflow"
+        ):
+            self.app.source_ids(["juntas"], "mediterraneo")
 
     def test_an_applet_runs_when_due_and_its_runs_are_recorded(self) -> None:
         self.app.close()

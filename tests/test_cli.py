@@ -51,7 +51,7 @@ class ExternalErrorTests(unittest.TestCase):
         # Outside `run_each`, which logs and summarizes a unit's failure.
         app = Mock()
         app.process_keys.side_effect = error
-        return invoke(app, "process")
+        return invoke(app, "process", "--default")
 
     def test_external_failure_is_a_message_without_traceback(self) -> None:
         result = self.process_failing_with(requests.ConnectionError("llm down"))
@@ -81,16 +81,91 @@ class ExternalErrorTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_execution_commands_need_exactly_one_selection(self) -> None:
+        commands = [
+            ["import"],
+            ["process"],
+            ["workflows"],
+            ["run"],
+            ["apps", "run"],
+            ["deliver"],
+            ["workflows", "--default", "--all"],
+            ["workflows", "--all", "-w", "juntas"],
+            ["apps", "run", "--app", "news", "--default"],
+            ["deliver", "--sink", "chat", "--all"],
+        ]
+        for args in commands:
+            with self.subTest(args=args):
+                app = Mock()
+
+                result = invoke(app, *args)
+
+                self.assertEqual(result.exit_code, 2)
+                self.assertIn("give exactly one of", result.output)
+                app.import_source.assert_not_called()
+                app.run_app.assert_not_called()
+                app.deliver.assert_not_called()
+
+    def test_run_takes_no_workflow(self) -> None:
+        result = invoke(Mock(), "run", "-w", "juntas")
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("No such option", result.output)
+
     def test_import_reports_failed_sources_and_exits_with_error(self) -> None:
         app = Mock()
-        app.sources.return_value = [SOURCE]
+        app.source_ids.return_value = ["plaza"]
         app.import_source.side_effect = RuntimeError("site down")
 
-        result = invoke(app, "import")
+        result = invoke(app, "import", "--default")
 
         self.assertEqual(result.exit_code, 1)
+        app.source_ids.assert_called_once_with(["default"], None)
         self.assertIn("site down", result.output)
         self.assertIn("1 source(s) failed", result.output)
+
+    def test_import_all_imports_every_workflow_sources_once(self) -> None:
+        app = Mock()
+        app.workflows = ["default", "juntas"]
+        app.source_ids.return_value = ["plaza", "juntas"]
+        app.import_source.return_value = []
+
+        result = invoke(app, "import", "--all")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.source_ids.assert_called_once_with(["default", "juntas"], None)
+        self.assertEqual(
+            [c.args[0] for c in app.import_source.call_args_list], ["plaza", "juntas"]
+        )
+
+    def test_import_source_narrows_the_named_workflow(self) -> None:
+        app = Mock()
+        app.source_ids.return_value = ["juntas"]
+        app.import_source.return_value = []
+
+        result = invoke(app, "import", "juntas", "-w", "juntas")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.source_ids.assert_called_once_with(["juntas"], "juntas")
+        app.import_source.assert_called_once_with("juntas")
+
+    def test_process_all_runs_every_workflow_in_order(self) -> None:
+        app = Mock()
+        app.workflows = ["default", "juntas"]
+        app.process_keys.return_value = ["summary"]
+        app.run_process.return_value = RunSummary(done=1)
+
+        result = invoke(app, "process", "summarize", "--all")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            app.process_keys.call_args_list,
+            [
+                call("summarize", workflow="default"),
+                call("summarize", workflow="juntas"),
+            ],
+        )
+        self.assertIn("Process (juntas)", result.stdout)
 
     def test_process_runs_every_entry_of_one_processor_with_scope_and_force(
         self,
@@ -103,6 +178,7 @@ class CommandTests(unittest.TestCase):
             app,
             "process",
             "summarize",
+            "--default",
             "--source",
             "plaza",
             "--item",
@@ -131,7 +207,7 @@ class CommandTests(unittest.TestCase):
         app.run_process.side_effect = [RuntimeError("llm down"), RunSummary(done=3)]
 
         with self.assertLogs("newstool", "ERROR") as logs:
-            result = invoke(app, "process")
+            result = invoke(app, "process", "--default")
 
         self.assertEqual(result.exit_code, 1)
         self.assertEqual(
@@ -145,7 +221,7 @@ class CommandTests(unittest.TestCase):
         app.process_keys.return_value = ["markdown"]
         app.run_process.return_value = RunSummary(done=1)
 
-        result = invoke(app, "process")
+        result = invoke(app, "process", "--default")
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.process_keys.assert_called_once_with(None, workflow="default")
@@ -164,7 +240,7 @@ class CommandTests(unittest.TestCase):
         app.deliver.return_value = RunSummary(done=1)
         app.unconfigured_pending.return_value = {}
 
-        result = invoke(app, "apps", "run", "--force")
+        result = invoke(app, "apps", "run", "--all", "--force")
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
@@ -193,6 +269,25 @@ class CommandTests(unittest.TestCase):
         app.routed_sinks.assert_called_once_with(["news"])
         self.assertEqual([c.args[0] for c in app.deliver.call_args_list], ["site"])
 
+    def test_apps_run_default_runs_the_unskipped_and_delivers_to_their_sinks(
+        self,
+    ) -> None:
+        app = Mock()
+        app.app_ids = ["news", "digest"]
+        app.default_app_ids = ["news"]
+        app.sink_ids = ["chat", "site"]
+        app.routed_sinks.return_value = ["site"]
+        app.run_app.return_value = AppReport("news", due=True)
+        app.deliver.return_value = RunSummary()
+        app.unconfigured_pending.return_value = {}
+
+        result = invoke(app, "apps", "run", "--default")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual([c.args[0] for c in app.run_app.call_args_list], ["news"])
+        app.routed_sinks.assert_called_once_with(["news"])
+        self.assertEqual([c.args[0] for c in app.deliver.call_args_list], ["site"])
+
     def test_apps_run_no_deliver_stores_and_sends_nothing(self) -> None:
         app = Mock()
         app.app_ids = ["news"]
@@ -200,7 +295,7 @@ class CommandTests(unittest.TestCase):
             "news", due=True, ignored=(("feed", "k"),), routed=2
         )
 
-        result = invoke(app, "apps", "run", "--no-deliver")
+        result = invoke(app, "apps", "run", "--all", "--no-deliver")
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(app.run_app.call_args.kwargs["dry_run"], False)
@@ -235,7 +330,7 @@ class CommandTests(unittest.TestCase):
         app.run_app.return_value = AppReport("news", due=True, error="broken")
         app.unconfigured_pending.return_value = {}
 
-        result = invoke(app, "apps", "run")
+        result = invoke(app, "apps", "run", "--all")
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("1 failure(s)", result.output)
@@ -244,7 +339,7 @@ class CommandTests(unittest.TestCase):
         app = Mock()
         app.reset_app.return_value = 3
 
-        result = invoke(app, "apps", "reset", "news", "--with-documents")
+        result = invoke(app, "apps", "reset", "--app", "news", "--with-documents")
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.reset_app.assert_called_once_with(
@@ -282,7 +377,7 @@ class CommandTests(unittest.TestCase):
         app.unconfigured_pending.return_value = {}
 
         with self.assertLogs("newstool", "ERROR") as logs:
-            result = invoke(app, "deliver")
+            result = invoke(app, "deliver", "--all")
 
         self.assertEqual(result.exit_code, 1)
         self.assertEqual(
@@ -297,14 +392,18 @@ class CommandTests(unittest.TestCase):
         app.deliver.return_value = RunSummary(done=1)
         app.unconfigured_pending.return_value = {}
 
-        result = invoke(app, "deliver", "--ignore-interval", "--ignore-max-per-run")
+        result = invoke(
+            app, "deliver", "--all", "--ignore-interval", "--ignore-max-per-run"
+        )
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
             app.deliver.call_args.args[2],
             PacingOverride(ignore_interval=True, ignore_max_per_run=True),
         )
-        result = invoke(app, "deliver", "--ignore-max-per-run", "--max-per-run", "3")
+        result = invoke(
+            app, "deliver", "--all", "--ignore-max-per-run", "--max-per-run", "3"
+        )
         self.assertEqual(result.exit_code, 2)
         self.assertIn("exclude each other", result.output)
 
@@ -313,19 +412,34 @@ class CommandTests(unittest.TestCase):
         app.process_keys.return_value = []
 
         with patch("newstool.cli.Application", return_value=app):
-            result = CliRunner().invoke(cli, ["process"])
+            result = CliRunner().invoke(cli, ["process", "--default"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         app.lock.assert_called_once_with()
 
-    def test_run_goes_on_after_a_failed_phase_and_exits_with_error(self) -> None:
+    def test_deliver_default_sends_for_the_sinks_of_unskipped_apps(self) -> None:
         app = Mock()
-        app.sources.return_value = [SOURCE]
+        app.default_app_ids = ["news"]
+        app.routed_sinks.return_value = ["site"]
+        app.deliver.return_value = RunSummary(done=1)
+        app.unconfigured_pending.return_value = {}
+
+        result = invoke(app, "deliver", "--default")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.routed_sinks.assert_called_once_with(["news"])
+        self.assertEqual([c.args[0] for c in app.deliver.call_args_list], ["site"])
+
+    def test_workflows_goes_on_after_a_failed_phase_and_exits_with_error(
+        self,
+    ) -> None:
+        app = Mock()
+        app.source_ids.return_value = ["plaza"]
         app.import_source.return_value = []
         app.process_keys.side_effect = RuntimeError("llm down")
 
         with self.assertLogs("newstool", "ERROR"):
-            result = invoke(app, "run")
+            result = invoke(app, "workflows", "--default")
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("1 failure(s)", result.output)
@@ -333,31 +447,33 @@ class CommandTests(unittest.TestCase):
         self.assertIn("Import", result.stdout)
         self.assertNotIn("Import", result.stderr)
 
-    def test_run_runs_the_named_workflow(self) -> None:
+    def test_workflows_runs_the_named_workflow(self) -> None:
         app = Mock()
-        app.sources.return_value = [SOURCE]
+        app.source_ids.return_value = ["juntas"]
         app.import_source.return_value = []
         app.process_keys.return_value = []
 
-        result = invoke(app, "run", "--workflow", "juntas")
+        result = invoke(app, "workflows", "--workflow", "juntas")
 
         self.assertEqual(result.exit_code, 0, result.output)
-        app.sources.assert_called_once_with("juntas")
-        app.process_keys.assert_called_once_with(workflow="juntas")
+        app.source_ids.assert_called_once_with(["juntas"])
+        app.process_keys.assert_called_once_with(None, workflow="juntas")
         app.run_app.assert_not_called()
+        app.deliver.assert_not_called()
 
-    def test_run_all_runs_every_workflow_in_order(self) -> None:
+    def test_workflows_all_runs_every_workflow_in_order(self) -> None:
         app = Mock()
         app.workflows = ["default", "juntas"]
-        app.sources.return_value = [SOURCE]
+        app.source_ids.return_value = ["plaza"]
         app.import_source.return_value = []
         app.process_keys.return_value = []
 
-        result = invoke(app, "run", "--all")
+        result = invoke(app, "workflows", "--all")
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
-            [c.args for c in app.sources.call_args_list], [("default",), ("juntas",)]
+            [c.args for c in app.source_ids.call_args_list],
+            [(["default"],), (["juntas"],)],
         )
         self.assertEqual(
             [c.kwargs for c in app.process_keys.call_args_list],
@@ -365,17 +481,78 @@ class CommandTests(unittest.TestCase):
         )
         self.assertIn("Import (juntas)", result.stdout)
 
-    def test_run_all_excludes_a_named_workflow(self) -> None:
-        result = invoke(Mock(), "run", "--all", "-w", "juntas")
+    def test_run_default_runs_default_then_unskipped_apps_and_their_sinks(
+        self,
+    ) -> None:
+        app = Mock()
+        app.default_app_ids = ["news"]
+        app.sink_ids = ["chat", "site"]
+        app.routed_sinks.return_value = ["site"]
+        app.source_ids.return_value = ["plaza"]
+        app.import_source.return_value = []
+        app.process_keys.return_value = []
+        app.run_app.return_value = AppReport("news", due=True)
+        app.deliver.return_value = RunSummary(done=1)
+        app.unconfigured_pending.return_value = {}
 
-        self.assertEqual(result.exit_code, 2)
-        self.assertIn("exclude each other", result.output)
+        result = invoke(app, "run", "--default")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.source_ids.assert_called_once_with(["default"])
+        app.process_keys.assert_called_once_with(None, workflow="default")
+        self.assertEqual([c.args[0] for c in app.run_app.call_args_list], ["news"])
+        app.routed_sinks.assert_called_once_with(["news"])
+        self.assertEqual([c.args[0] for c in app.deliver.call_args_list], ["site"])
+        self.assertIn("Apps", result.stdout)
+        self.assertIn("site\t1\t0", result.stdout)
+
+    def test_run_all_runs_every_workflow_app_and_sink(self) -> None:
+        app = Mock()
+        app.workflows = ["default", "juntas"]
+        app.app_ids = ["news", "digest"]
+        app.sink_ids = ["chat", "site"]
+        app.source_ids.return_value = []
+        app.process_keys.return_value = []
+        app.run_app.side_effect = lambda app_id, now: AppReport(app_id, due=False)
+        app.deliver.return_value = RunSummary()
+        app.unconfigured_pending.return_value = {}
+
+        result = invoke(app, "run", "--all")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            [c.kwargs for c in app.process_keys.call_args_list],
+            [{"workflow": "default"}, {"workflow": "juntas"}],
+        )
+        self.assertEqual(
+            [c.args[0] for c in app.run_app.call_args_list], ["news", "digest"]
+        )
+        app.routed_sinks.assert_not_called()
+        self.assertEqual(
+            [c.args[0] for c in app.deliver.call_args_list], ["chat", "site"]
+        )
+
+    def test_run_goes_on_to_the_apps_after_a_failed_workflow_phase(self) -> None:
+        app = Mock()
+        app.default_app_ids = ["news"]
+        app.routed_sinks.return_value = []
+        app.source_ids.side_effect = RuntimeError("bad source")
+        app.process_keys.return_value = []
+        app.run_app.return_value = AppReport("news", due=True)
+        app.unconfigured_pending.return_value = {}
+
+        with self.assertLogs("newstool", "ERROR"):
+            result = invoke(app, "run", "--default")
+
+        self.assertEqual(result.exit_code, 1)
+        app.run_app.assert_called_once()
+        self.assertIn("1 failure(s)", result.output)
 
     def test_user_errors_are_reported_without_traceback(self) -> None:
         app = Mock()
         app.process_keys.side_effect = ConfigError("processor 'nope' is not loaded")
 
-        result = invoke(app, "process", "nope")
+        result = invoke(app, "process", "nope", "--default")
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("processor 'nope' is not loaded", result.output)
@@ -397,27 +574,6 @@ def annotation(annotation_id: int, key: str, value: object) -> Annotation:
     return Annotation(annotation_id, 7, "tagger", key, NOW, value)
 
 
-class SearchTests(unittest.TestCase):
-    def test_lists_items_whose_markdown_contains_the_query(self) -> None:
-        other = SourceItem(source=SOURCE, uid="def", title="Other", uri="u", id=8)
-        app = Mock()
-        app.get_items.return_value = [ITEM, other]
-        app.get_annotation_values.return_value = {
-            ITEM.key: "# Title\n\nLa Junta aprueba el PRESUPUESTO anual",
-            other.key: "Nothing here",
-        }
-
-        result = invoke(app, "search", "presupuesto", "--source", "plaza")
-
-        self.assertEqual(result.exit_code, 0, result.output)
-        app.get_items.assert_called_once_with(ProcessingScope(source="plaza"))
-        self.assertIn(
-            "7\tplaza\tTitle\t# Title La Junta aprueba el PRESUPUESTO anual",
-            result.output,
-        )
-        self.assertNotIn("Other", result.output)
-
-
 class LogLevelTests(unittest.TestCase):
     """Precedence: --log-level and -v/-q, then NEWSTOOL_LOG_LEVEL, then the
     config's log_level, then warning."""
@@ -434,7 +590,7 @@ class LogLevelTests(unittest.TestCase):
         with patch("newstool.cli.Application", return_value=app):
             result = CliRunner().invoke(
                 cli,
-                ["-c", str(config_path), *args, "process"],
+                ["-c", str(config_path), *args, "process", "--default"],
                 env={"NEWSTOOL_LOG_LEVEL": env},
             )
         self.assertEqual(result.exit_code, 0, result.output)

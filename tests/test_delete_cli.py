@@ -229,7 +229,7 @@ class DeleteCommandTests(unittest.TestCase):
     def test_reset_with_documents_works_for_an_unconfigured_instance(self) -> None:
         self.emit("k1")
 
-        result = self.run_cli("apps", "reset", "items", "--with-documents")
+        result = self.run_cli("apps", "reset", "--app", "items", "--with-documents")
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Reset items; 1 document(s) deleted", result.stdout)
