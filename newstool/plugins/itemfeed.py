@@ -3,11 +3,13 @@ imported item that has its `annotation` (the summary, by default): the
 annotation is the text, with the item's title, link and image. Routed to a
 chat sink, it posts each summarized item once.
 
-Its state is a cursor, the time of its last run. With `since_first_run`,
-its first run only sets the cursor and records its time as `start`, so the
-items stored before it are never emitted. An item without the annotation
-yet is looked at again on later runs while it was imported less than `wait`
-ago, but never if it was imported before `start`.
+Its state is a cursor, the time of its last run, and `start`: its first
+run's time minus `backfill`. Nothing imported before `start` is ever
+emitted, so with the default `backfill` of 0 the first run emits nothing
+and only starts counting; `backfill: 1d` emits the last day's items on the
+first run; `backfill: all` has no `start` and emits the whole history. An
+item without the annotation yet is looked at again on later runs while it
+was imported less than `wait` ago.
 
 A run emits its documents oldest item first: by publication time, or import
 time for an item without one, then by database id. Sinks deliver documents
@@ -15,7 +17,7 @@ in the order they were emitted, so a chat gets them in that order too.
 """
 
 from datetime import UTC, datetime, timedelta
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from ..applets import (
     AppletReader,
@@ -34,7 +36,9 @@ OUTPUT = "items"
 
 class ItemFeedOptions(SourcesOptions):
     annotation: str = "summary"  # the annotation key emitted as the text
-    since_first_run: bool = True  # the first run emits nothing
+    # How far before the first run to start: 0, nothing stored before it;
+    # `all`, the whole history.
+    backfill: Literal["all"] | Duration = 0
     wait: Duration = 86400  # how long an item may wait for its annotation
 
 
@@ -54,10 +58,8 @@ class ItemFeedApplet(BaseApplet):
         state = run.state if isinstance(run.state, dict) else {}
         cursor = state.get("cursor")
         start = state.get("start")
-        if cursor is None and options.since_first_run:
-            return AppletResult(
-                state={"cursor": now.isoformat(), "start": now.isoformat()}
-            )
+        if cursor is None:
+            start = self.first_start(now)
 
         items = reader.items(
             sources=options.sources,
@@ -75,15 +77,23 @@ class ItemFeedApplet(BaseApplet):
             new_state["start"] = start
         return AppletResult(state=new_state, documents=documents)
 
-    def since(self, cursor: str | None, start: str | None) -> datetime | None:
-        """The earliest import time to read: `wait` before the cursor, but
-        never before `start`; None, everything."""
-        if cursor is None:
+    def first_start(self, now: datetime) -> str | None:
+        """`start` for a first run at `now`: `backfill` before it; None with
+        `backfill: all`."""
+        if self.options.backfill == "all":
             return None
-        since = datetime.fromisoformat(cursor) - timedelta(seconds=self.options.wait)
+        return (now - timedelta(seconds=self.options.backfill)).isoformat()
+
+    def since(self, cursor: str | None, start: str | None) -> datetime | None:
+        """The earliest import time to read: `wait` before the cursor (on a
+        first run, none), but never before `start`; None, everything."""
+        bounds = []
+        if cursor is not None:
+            wait = timedelta(seconds=self.options.wait)
+            bounds.append(datetime.fromisoformat(cursor) - wait)
         if start is not None:
-            since = max(since, datetime.fromisoformat(start))
-        return since
+            bounds.append(datetime.fromisoformat(start))
+        return max(bounds) if bounds else None
 
     @staticmethod
     def age(item: SourceItem) -> tuple[datetime, int]:

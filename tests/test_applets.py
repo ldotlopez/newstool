@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import Mock
 
+import pydantic
+
 from newstool.applets import (
     AppletReader,
     AppletType,
@@ -291,7 +293,7 @@ class ItemFeedTests(AppletTestCase):
             self.annotate(item, "summary", item.uid)
         self.assertEqual(len(items), 3)
 
-        result = self.applet(since_first_run=False).run(
+        result = self.applet(backfill="all").run(
             datetime.now(UTC), NEVER_RUN, self.reader
         )
 
@@ -299,15 +301,48 @@ class ItemFeedTests(AppletTestCase):
             [d.content for d in result.documents], ["d3", "d6", "d9", "undated"]
         )
 
-    def test_since_first_run_off_emits_everything(self) -> None:
+    def test_backfill_all_emits_everything(self) -> None:
         (item,) = self.add_items(1)
         self.annotate(item, "summary/es", "Uno")
 
-        result = self.applet(since_first_run=False, annotation="summary/es").run(
+        result = self.applet(backfill="all", annotation="summary/es").run(
             datetime.now(UTC), NEVER_RUN, self.reader
         )
 
         self.assertEqual([d.content for d in result.documents], ["Uno"])
+        self.assertNotIn("start", result.state)
+
+    def test_backfill_emits_what_was_imported_within_it_on_the_first_run(
+        self,
+    ) -> None:
+        (item,) = self.add_items(1)
+        self.annotate(item, "summary", "Recent")
+        now = datetime.now(UTC)
+
+        recent = self.applet(backfill="1h").run(now, NEVER_RUN, self.reader)
+        # Imported (just now) before a start a day after it: left out.
+        later = now + timedelta(days=1, hours=1)
+        too_old = self.applet(backfill="1h").run(later, NEVER_RUN, self.reader)
+
+        self.assertEqual([d.content for d in recent.documents], ["Recent"])
+        self.assertEqual(
+            recent.state,
+            {
+                "cursor": now.isoformat(),
+                "start": (now - timedelta(hours=1)).isoformat(),
+            },
+        )
+        self.assertEqual(too_old.documents, ())
+        # Later runs keep `start` and never read before it.
+        run = AppletRun(app="a", state=recent.state)
+        again = self.applet(backfill="1h", wait="1d").run(
+            now + timedelta(minutes=5), run, self.reader
+        )
+        self.assertEqual(again.state["start"], recent.state["start"])
+
+    def test_rejects_an_unknown_backfill(self) -> None:
+        with self.assertRaises(pydantic.ValidationError):
+            itemfeed.ItemFeedOptions(backfill="forever")
 
     def test_requirements_name_the_annotation(self) -> None:
         options = itemfeed.ItemFeedOptions(sources=["s"], annotation="summary/es")

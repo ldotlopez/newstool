@@ -444,7 +444,7 @@ sinks:
 apps:
   - id: items
     app: itemfeed
-    options: {sources: [mediterraneo], since_first_run: false}
+    options: {sources: [mediterraneo], backfill: all}
     sink: chat
 """,
         )

@@ -9,7 +9,7 @@
 - the new `apps`, `documents` and `deliveries` tables are created.
 
 The delivery history is lost: `itemfeed` instances start from their first
-run (`since_first_run`), so nothing already posted is posted again. Running
+run (`backfill`, 0 by default), so nothing already posted is posted again. Running
 it again does nothing.
 
 Back the database up first. It takes the write lock, so it fails at once
