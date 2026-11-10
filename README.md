@@ -268,6 +268,7 @@ uv run newstool -c config.yaml process markdownify --source castellonplaza --lim
 # Run import and process in turn (e.g. from cron), for a workflow with -w
 uv run newstool -c config.yaml run
 uv run newstool -c config.yaml run -w juntas
+uv run newstool -c config.yaml run --all     # every workflow, default first
 
 # Run the applet instances that are due, then deliver (cron, every few minutes)
 uv run newstool -c config.yaml apps run
@@ -450,7 +451,9 @@ The `Process` table shows, per key, the items done, ignored (skipped by
 the processor) and failed.
 
 `run [-w WORKFLOW]` runs import, then process; a failing phase is logged
-and the next one still runs. It is the usual cron line, one per workflow.
+and the next one still runs. It is the usual cron line, one per workflow;
+`run --all` runs every workflow's phases in turn, `default` first, and
+excludes `-w`.
 
 **3. Applets** (`apps run`) runs every applet instance that is due by its
 schedule (`every`, `at`, `days`; without any, on every call), or the ones

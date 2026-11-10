@@ -110,8 +110,8 @@ resolves to none is a configuration error.
 `default` uses every source without `skip_default: true` and runs, in
 order, every catalog processor without it. Each entry of `workflows` names
 its sources and its process runs. A command runs one workflow, `default`
-unless another is named, and each phase only touches that workflow's
-sources. Applets and sinks belong to no workflow (§4.3).
+unless another is named (`run --all` runs each in turn, `default` first),
+and each phase only touches that workflow's sources. Applets and sinks belong to no workflow (§4.3).
 
 - A process key is written by one run within a workflow. On sources shared
   by workflows, one processor type writes it; other options for it are a
