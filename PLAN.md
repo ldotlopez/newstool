@@ -554,14 +554,10 @@ Risks:
   (`llm`, decision 0010) and `model`; `json_mode`/`context_length` stay
   explicit in the `LLM` protocol. An `llms` entry with other options covers
   most needs; revisit when a consumer needs a backend option per call.
-- **Delivery order options** (2026-11-10, idea): today the order is fixed,
-  oldest first. Sinks deliver by `emitted_at`, then document id (emission
-  order within a run), and `itemfeed` emits its items by publication time,
-  or import time without one. Options to control it: a per-sink `order:
-  oldest|newest` for its pending rows; per-applet emission order (e.g.
-  `itemfeed` by publication or by import time); and a "newest only" mode
-  that skips a backlog (e.g. after downtime, deliver the latest N and mark
-  the rest `done`, instead of draining it at the `interval`).
+- **Delivery order** (2026-11-10, settled): stays FIFO, oldest document
+  first, with no order options. A backlog that grows too big is the user's
+  to clear: mark the older rows `done`, e.g. `deliveries set-status --sink
+  chat --status queued --until DATE --as done` (`--dry-run` first).
 - **Database layer audit** (2026-11-10, plan): review `db.py` code and
   schema, simplify and formalize where possible. It has gone through many
   architecture changes (decisions 0001, 0002, 0004, 0007, 0012, 0014, 0015,
