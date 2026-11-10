@@ -265,6 +265,16 @@ class CommandTests(unittest.TestCase):
         self.assertIn("1 delivery(ies) failed", result.output)
         self.assertIn("gone: not configured, 4 pending", logs.output[0])
 
+    def test_deliveries_rename_moves_the_ledger(self) -> None:
+        app = Mock()
+        app.rename_sink.return_value = 4
+
+        result = invoke(app, "deliveries", "rename", "chat", "channel", "--dry-run")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.rename_sink.assert_called_once_with("chat", "channel", dry_run=True)
+        self.assertIn("Would move 4 delivery(ies) from chat to channel", result.output)
+
     def test_deliver_goes_on_after_a_sink_raises(self) -> None:
         app = Mock()
         app.sink_ids = ["chat", "site"]

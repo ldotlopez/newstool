@@ -1234,6 +1234,26 @@ def deliveries_set_status_cmd(
     click.echo(f"{verb} {changed} delivery(ies) as {target}")
 
 
+@deliveries_group.command("rename")
+@click.argument("old")
+@click.argument("new")
+@click.option("--dry-run", is_flag=True, help="Count, without changing anything")
+@click.pass_context
+@report_user_errors
+def deliveries_rename_cmd(
+    ctx: click.Context, old: str, new: str, dry_run: bool
+) -> None:
+    """Move the ledger of sink instance OLD to NEW, after renaming it in the
+    configuration, so NEW does not deliver its documents again.
+
+    NEW must be configured and have no deliveries yet.
+    """
+    app = app_from_context(ctx, write=not dry_run)
+    count = app.rename_sink(old, new, dry_run=dry_run)
+    verb = "Would move" if dry_run else "Moved"
+    click.echo(f"{verb} {count} delivery(ies) from {old} to {new}")
+
+
 @deliveries_group.command("send")
 @delivery_options
 @sort_option(DELIVERY_SORTS)

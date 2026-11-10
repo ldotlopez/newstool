@@ -1516,3 +1516,19 @@ class Database:
                 .filter(DBDelivery.id.in_(delivery_ids))
                 .delete(synchronize_session=False)
             )
+
+    def count_sink_deliveries(self, sink: str) -> int:
+        """How many ledger rows the sink instance has."""
+        with self.session_scope() as sess:
+            return sess.query(DBDelivery).filter(DBDelivery.sink == sink).count()
+
+    def rename_sink(self, old: str, new: str) -> int:
+        """Move the ledger rows of sink instance `old` to `new`; return how
+        many. The unique (sink, document) rule rejects it if `new` already
+        has a row for one of the documents."""
+        with self.session_scope() as sess:
+            return (
+                sess.query(DBDelivery)
+                .filter(DBDelivery.sink == old)
+                .update({DBDelivery.sink: new}, synchronize_session=False)
+            )

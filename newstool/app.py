@@ -423,6 +423,23 @@ class Application:
         `pacing`."""
         return self._deliverer(sink_id, pacing).deliver(now)
 
+    def rename_sink(self, old: str, new: str, *, dry_run: bool = False) -> int:
+        """Move the ledger of sink instance `old` to `new`, the name it now
+        has in the configuration, so `new` does not deliver its documents
+        again; return how many rows. `dry_run` only counts. `new` must be
+        configured and have no rows yet."""
+        lookup(self._catalog.sinks, new, "sink")
+        if old == new:
+            raise ConfigError(f"sink '{old}' cannot be renamed to itself")
+        if existing := self._db.count_sink_deliveries(new):
+            raise ConfigError(
+                f"sink '{new}' already has {existing} delivery(ies); a rename"
+                " needs an empty ledger"
+            )
+        if not (count := self._db.count_sink_deliveries(old)):
+            raise ConfigError(f"sink '{old}' has no deliveries")
+        return count if dry_run else self._db.rename_sink(old, new)
+
     def unconfigured_pending(self) -> dict[str, int]:
         """Pending rows of sinks no longer configured, counted by sink."""
         counts: dict[str, int] = {}

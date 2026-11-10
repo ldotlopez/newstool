@@ -494,6 +494,29 @@ apps:
         with self.assertLogs("newstool.app", "WARNING"):
             self.assertEqual(self.app.send_deliveries([row]), {})
 
+    def test_rename_sink_moves_its_ledger_to_the_new_name(self) -> None:
+        self.app.close()
+        site = self.tmp_dir / "site"
+        self.app = self.make_app(catalog=self.routed_catalog(site))
+        self.app.run_app("news", NOW)
+        self.app.close()
+        renamed = self.routed_catalog(site).replace("site", "web")
+        self.app = self.make_app(catalog=renamed)
+
+        with self.assertRaisesRegex(ConfigError, "sink 'nope' is not configured"):
+            self.app.rename_sink("site", "nope")
+        with self.assertRaisesRegex(ConfigError, "sink 'gone' has no deliveries"):
+            self.app.rename_sink("gone", "web")
+        self.assertEqual(self.app.rename_sink("site", "web", dry_run=True), 1)
+        self.assertEqual(self.app.find_deliveries()[0].sink, "site")
+
+        self.assertEqual(self.app.rename_sink("site", "web"), 1)
+        (row,) = self.app.find_deliveries()
+        self.assertEqual(row.sink, "web")
+        self.assertEqual(self.app.unconfigured_pending(), {})
+        with self.assertRaisesRegex(ConfigError, "already has 1 delivery"):
+            self.app.rename_sink("site", "web")
+
     def test_mark_gives_rows_to_documents_routed_to_the_sink(self) -> None:
         self.app.close()
         self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
