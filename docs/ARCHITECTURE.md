@@ -424,8 +424,9 @@ The applets:
   `item:<source>/<uid>`, with the item's title, link and `data["image"]`.
   The window starts `wait` before the cursor, so an item whose annotation
   came late is still emitted, but never before `start`, the first run's
-  time; keys already stored are ignored. With `since_first_run`, its first
-  run only sets the cursor and `start`. It emits the
+  time minus `backfill` (none with `backfill: all`); keys already stored
+  are ignored. A first run reads from `start`, so with the default
+  `backfill` of 0 it emits nothing. It emits the
   oldest item first (`ItemFeedApplet.age`: publication time, or import time
   without one, then id), so its sinks deliver in that order.
 - `digest` writes one Markdown document per source, keyed

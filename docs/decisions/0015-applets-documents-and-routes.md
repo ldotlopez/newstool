@@ -11,7 +11,10 @@
   global instances)
 - **Revised:** 2026-11-10, by 0016 (routes reach re-emitted documents;
   `set-status --sink` with filters ignores routes; `apps run --no-deliver`
-  and `--app` delivering to its own sinks; pacing overrides on `deliver`)
+  and `--app` delivering to its own sinks; pacing overrides on `deliver`);
+  2026-11-10 (`itemfeed`'s `since_first_run` is replaced by `backfill`,
+  how far before its first run it starts: 0, the old `true`, by default;
+  `all`, the old `false`)
 
 ## Context
 

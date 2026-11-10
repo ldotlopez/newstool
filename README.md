@@ -632,10 +632,12 @@ of time, here and in every other option, are seconds or a number with a
 unit suffix: `90s`, `5m`, `2h`, `3d`, `1h30m`.
 
 - `itemfeed`: `annotation` (the key emitted as the text, default
-  `summary`), `since_first_run` (default true: its first run only starts
-  counting, so what is already stored is not sent) and `wait` (default 1d:
-  an item imported up to this long before a run is still emitted once its
-  annotation exists, unless it was imported before the first run).
+  `summary`), `backfill` (how far before its first run it starts: default
+  0, so its first run only starts counting and what is already stored is
+  not sent; `1d` emits the last day's items on the first run; `all`, the
+  whole history; nothing imported before that start is ever emitted) and
+  `wait` (default 1d: an item imported up to this long before a run is
+  still emitted once its annotation exists, but never before the start).
 - `feed`: `title` (default `newstool feed`), `link`, `description`
   (default: the title), `max_items` (default 100). Route it to a `file`
   sink to publish it.
@@ -731,9 +733,9 @@ How delivery behaves:
   uv run newstool -c config.yaml deliver --sink chat
   ```
 
-  Or start over with `apps reset items --with-documents`: for `itemfeed`
-  with `since_first_run`, the next run is a first run again, so the items
-  already imported are not emitted.
+  Or start over with `apps reset items --with-documents`: for `itemfeed`,
+  the next run is a first run again, so only what its `backfill` reaches
+  is emitted (with the default 0, none of the items already imported).
 - A sink instance delivers oldest first, whatever applet emitted them:
   by when each document was emitted, and within one run in the order the
   applet emitted them. `itemfeed` emits the oldest item first (by
