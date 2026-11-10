@@ -46,7 +46,7 @@ config.yaml ─► Config ─► Application (app.py) ◄── cli.py, scripts/
 | `applets.py` | The `Applet` and `AppletType` protocols, `BaseApplet`, `SourcesOptions`, `Schedule` (when an instance is due), `Requirements`, `AppletReader` (what applets may read), `check_result` and `run_key`. |
 | `sinks.py` | The `Sink` and `SinkType` protocols, `SinkOptions`, `accepts`, and `Deliverer`, the delivery cycle of one sink instance over the ledger. |
 | `llms.py` | The `LLM` and `LLMType` protocols, `LLMUnavailableError` and `strip_code_fence`, for answers wrapped in a code fence. |
-| `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `embed`, the applets `digest`, `grouping` (`singlelink`, `avglink`, `embeddings`), `feed` and `itemfeed`, and the sinks `telegram`, `googlechat` and `filesink` (`file`). `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
+| `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `embed`, `truncate` (a test stand-in for `summarize`), the applets `digest`, `grouping` (`singlelink`, `avglink`, `embeddings`), `feed` and `itemfeed`, and the sinks `telegram`, `googlechat`, `filesink` (`file`) and `stdout`. `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
 | `scripts/` | The one-shot migrations `migrate_autoincrement.py`, `migrate_applets.py` and `migrate_annotation_keys.sql`. |
 
 ## Plugins
@@ -392,13 +392,18 @@ sources and annotation keys some process run writes on one of them.
    outputs and content types, no key twice);
 4. stores it with `Database.commit_app_run`: in one transaction, each
    document whose `(output, key)` the instance has not stored, a `queued`
-   delivery per sink its output is routed to, and the run record with the
-   new state and `last_success = last_started`. Contents are written first.
+   delivery per sink its output is routed to that the document has none of
+   (for a stored one too: a route added since, decision 0016), and the run
+   record with the new state and `last_success = last_started`. It returns
+   a `CommittedRun` (the new documents, and `routed`, the rows added for
+   stored ones). Contents are written first.
    A failure (any exception, logged with `log_failure`) stores only
    `last_error` (`fail_app_run`).
 
 `dry_run` runs the applet and reports which keys are new
-(`existing_document_keys`) and the state, writing nothing. `apps run` takes
+(`existing_document_keys`), the rows it would add for stored ones
+(`count_missing_routes`) and the state, writing nothing. `apps run --app`
+delivers only to `routed_sinks(app_ids)`; `--no-deliver` delivers nothing. `apps run` takes
 the write lock, so two of them never overlap. `reset_app` deletes the run
 record, and with `with_documents` the instance's documents (deliveries
 cascade); `app_status` gives each instance's record and
@@ -418,8 +423,11 @@ The applets:
   cursor (its state, the last run's time) that has its `annotation`, keyed
   `item:<source>/<uid>`, with the item's title, link and `data["image"]`.
   The window starts `wait` before the cursor, so an item whose annotation
-  came late is still emitted; keys already stored are ignored. With
-  `since_first_run`, its first run only sets the cursor.
+  came late is still emitted, but never before `start`, the first run's
+  time; keys already stored are ignored. With `since_first_run`, its first
+  run only sets the cursor and `start`. It emits the
+  oldest item first (`ItemFeedApplet.age`: publication time, or import time
+  without one, then id), so its sinks deliver in that order.
 - `digest` writes one Markdown document per source, keyed
   `<source id>/<since>_<until>` (YYYY-MM-DD) over the last `lookback`. It
   reads `markdown` of the newest `max_items` items per source, cuts each to
@@ -437,16 +445,18 @@ The applets:
 
 Decision 0015. A sink renders and sends one `Document` (`send(document)`,
 returning its external reference); it knows nothing of items, annotations
-or the ledger. `Deliverer(db, sink_id, sink, options)` runs the cycle of
+or the ledger. `Deliverer(db, sink_id, sink, options, pacing)` runs the cycle of
 one sink instance over its rows (`Database.deliveries_of(sink)`, oldest
-document first):
+document first: by `emitted_at`, then document id, which follows emission
+order within a run):
 
 1. `plan(now)`: warn about `sending` rows, keep `queued` ones and `error`
    ones with attempts left (`max_retries`) whose backoff
    (`backoff_seconds`, as processors) has passed, then `pace`: with an
    `interval`, only the first one, once the instance's last `done`
    delivery (`last_delivered_at`) is that old; then at most
-   `max_per_run`;
+   `max_per_run`. A `PacingOverride` (from `deliver`'s options) drops the
+   interval, drops `max_per_run` or replaces it, for one run;
 2. `send_rows(rows)`: for each, save it `sending`, load the document's
    content, call `send`, then save it `done` with the returned
    `external_ref`, or `error` with one more attempt. Errors are logged with
@@ -457,8 +467,10 @@ transaction. `Application.deliver(sink_id, now)` runs a cycle;
 `plan_delivery` is its dry run. `send_deliveries` groups rows by sink and
 sends them now with `send_rows`, skipping sinks no longer configured.
 `set_delivery_status` rewrites the state of rows, and `mark_deliveries`
-gives the documents routed to a sink (`routed_documents`) a row in a given
-state (`Database.add_deliveries`). `delete_documents` refuses documents
+gives documents a row of a sink in a given state
+(`Database.add_deliveries`): those a filter selects, routed or not, once
+the sink `accepts` their content types (`selected_documents`), or without
+filters those routed to it (`routed_documents`). `delete_documents` refuses documents
 with rows that are not `done`.
 
 A sink's options are a `SinkOptions` subclass (`interval`, `max_per_run`,

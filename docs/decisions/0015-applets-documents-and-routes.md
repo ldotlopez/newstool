@@ -9,6 +9,9 @@
   storage path), 0009 (workflows keep only `sources` and `process`), 0010
   (`remixers` and `sinks` leave the workflows; applets and sinks are
   global instances)
+- **Revised:** 2026-11-10, by 0016 (routes reach re-emitted documents;
+  `set-status --sink` with filters ignores routes; `apps run --no-deliver`
+  and `--app` delivering to its own sinks; pacing overrides on `deliver`)
 
 ## Context
 

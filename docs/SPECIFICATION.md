@@ -237,9 +237,10 @@ instances that are due, then delivers.
 
 Sinks deliver the documents routed to them and record every delivery.
 
-- **Routes:** storing a document creates a `queued` delivery for each sink
-  its output is routed to. A route added later delivers only documents
-  emitted afterwards; older ones are queued by hand. Documents carry no
+- **Routes:** each document a run emits, new or already stored, gets a
+  `queued` delivery for each sink its output is routed to that it has none
+  of (decision 0016). A route added later reaches the stored documents its
+  applet emits again; older ones are queued by hand. Documents carry no
   delivery parameters: the destination and the pacing are the sink
   instance's. A route between an output and a sink that does not accept
   its content types is a configuration error.
@@ -251,14 +252,20 @@ Sinks deliver the documents routed to them and record every delivery.
   `max_retries` (3 by default). Requeuing gives failures fresh attempts. A
   failure does not hold back other deliveries.
 - **Order and pacing** are the sink instance's, over every document routed
-  to it, oldest first: with an `interval`, one delivery once its last one
-  is that old; and never more than `max_per_run` in a run. Two instances
-  routed to one sink share its pacing.
+  to it, oldest first: by emission time, then emission order within a run
+  (document id). An applet that emits several documents in one run emits
+  them oldest first; `itemfeed` orders its items by publication time, or
+  import time for an item without one, then id. With an `interval`, one
+  delivery once its last one is that old; and never more than `max_per_run`
+  in a run. Two instances routed to one sink share its pacing. One
+  delivery run may drop the interval, drop `max_per_run`, or replace it;
+  retries still wait for their backoff.
 - **Forced delivery** sends explicitly selected deliveries now, whatever
   their state, with no backoff and no pacing.
-- **Marking by hand** gives the selected documents routed to one sink a row
-  in a chosen state (`queued`, `done` or `error`); existing rows change
-  only when asked.
+- **Marking by hand** gives the documents selected by filters a row of one
+  sink in a chosen state (`queued`, `done` or `error`), routed to it or
+  not, if the sink accepts their content types; without filters, every
+  document routed to it. Existing rows change only when asked.
 - A document is delivered at most once per sink instance, unless a
   delivery is forced or its row is deleted and created again.
 

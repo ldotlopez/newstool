@@ -547,7 +547,15 @@ Risks:
 - **`run_each` stops a phase on the first failure** (2026-10-28, bug):
   `cli.py` wraps each run in `try/finally` without `except`, so one failing
   run skips the rest of its phase.
+- **Delivery order options** (2026-11-10, idea): today the order is fixed,
+  oldest first. Sinks deliver by `emitted_at`, then document id (emission
+  order within a run), and `itemfeed` emits its items by publication time,
+  or import time without one. Options to control it: a per-sink `order:
+  oldest|newest` for its pending rows; per-applet emission order (e.g.
+  `itemfeed` by publication or by import time); and a "newest only" mode
+  that skips a backlog (e.g. after downtime, deliver the latest N and mark
+  the rest `done`, instead of draining it at the `interval`).
 
 ---
 
-*Last updated: 2026-10-28*
+*Last updated: 2026-11-10*

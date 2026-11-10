@@ -273,10 +273,12 @@ uv run newstool -c config.yaml run -w juntas
 uv run newstool -c config.yaml apps run
 uv run newstool -c config.yaml apps run --app weekly --force
 uv run newstool -c config.yaml apps run --dry-run
+uv run newstool -c config.yaml apps run --app items --no-deliver
 
 # Deliver what is pending, without running applets
 uv run newstool -c config.yaml deliver
 uv run newstool -c config.yaml deliver --sink chat --dry-run
+uv run newstool -c config.yaml deliver --sink chat --ignore-interval --ignore-max-per-run
 
 # Start an applet instance from scratch, optionally dropping its documents
 uv run newstool -c config.yaml apps reset items
@@ -299,7 +301,7 @@ uv run newstool -c config.yaml deliveries set-status --as queued --status error
 uv run newstool -c config.yaml deliveries set-status --as done --delivery 31
 uv run newstool -c config.yaml deliveries send --delivery 31
 
-# Queue documents emitted before a route existed, or mark them as sent
+# Queue documents for a sink by hand (routed to it or not), or mark them as sent
 uv run newstool -c config.yaml deliveries set-status --sink chat --app weekly --as queued
 uv run newstool -c config.yaml deliveries set-status --sink chat --all --as done --dry-run
 
@@ -344,7 +346,12 @@ run, last success, next due time (local time) and last error.
 
 `apps run` runs every instance that is due (`--app`, repeatable, limits
 it; `--force` runs them whether due or not), then delivers what is pending
-for every sink. A failing instance is reported and the others still run;
+for every sink, or with `--app` for the sinks those instances are routed
+to. `--no-deliver` stores and queues what they emit and sends nothing, for
+`deliver` to send later. Its table shows, per instance, the documents it
+emitted that are new, those already stored, and `Routed`: the rows it
+queued for stored documents routed since they were emitted (see *How
+delivery behaves*). A failing instance is reported and the others still run;
 its state is kept, so its next run covers what the failed one did not. The
 exit status is non-zero if anything failed. `--dry-run` runs the applets
 and shows the documents they would emit (new, or already stored) and their
@@ -375,12 +382,13 @@ run `inspect` first.
 `done` records a delivery you settled by hand.
 
 - With `--sink` and document filters (`--app`, `--output`, `--key`,
-  `--since`, `--until`, `--document`), or `--all` for every document routed
-  to that sink, each selected document routed to it without a row gets one
-  in that state; `--limit` counts documents. Existing rows are left as they
-  are, with a warning, unless `--overwrite`. A route added to an existing
-  output only delivers documents emitted afterwards: `--as queued` sends
-  older ones too.
+  `--since`, `--until`, `--document`), each selected document without a row
+  of that sink gets one in that state, whether its output is routed to the
+  sink or not; a content type the sink does not accept is refused, and
+  nothing is marked. With `--sink` and `--all`, only the documents routed to
+  that sink. `--limit` counts documents. Existing rows are left as they
+  are, with a warning, unless `--overwrite`. So `--as queued` queues
+  documents for a sink without editing the configuration.
 - Otherwise, or with `--delivery` or `--status`, it changes the selected
   rows; `--all` alone changes every row.
 
@@ -495,12 +503,17 @@ To support a new site, see
 | `summarize` | `summarize` | `markdown` | `summary` | Summarizes the article with an LLM |
 | `tagger` | `tagger` | `markdown` | `tags` | Extracts entity tags with an LLM |
 | `embed` | `embed` | `tags` or `markdown` | `<input>_embedding` | Embeds the tags (sorted and comma-separated) or the markdown with an LLM |
+| `truncate` | `truncate` | `markdown` | `summary` | The markdown's first `length` characters (default 200): a fast, offline stand-in for `summarize` in tests |
 
 Every option can be set in the type's section, as the default, or per
 entry. Every processor takes `max_retries` (default 3), and `summarize`,
 `tagger` and `embed` take `llm` (see above) and `model`; `summarize` takes
 `prompt` (followed by the article's markdown) and `embed` takes `input`
-(`tags`, the default, or `markdown`; one entry per input). Consumers read annotations by key:
+(`tags`, the default, or `markdown`; one entry per input). `truncate`
+accepts `summarize`'s options and ignores them, so an entry swaps one for
+the other by its type alone; its `llm` is not checked, so it needs no
+`llms`. On shared sources, two types cannot write one key: give each its
+own. Consumers read annotations by key:
 `itemfeed` reads `summary` (or its `annotation` option's key), `grouping`
 reads `tags` and
 `<embedding>_embedding`, and `digest` and `search` read `markdown`.
@@ -535,7 +548,7 @@ unit suffix: `90s`, `5m`, `2h`, `3d`, `1h30m`.
   `summary`), `since_first_run` (default true: its first run only starts
   counting, so what is already stored is not sent) and `wait` (default 1d:
   an item imported up to this long before a run is still emitted once its
-  annotation exists).
+  annotation exists, unless it was imported before the first run).
 - `feed`: `title` (default `newstool feed`), `link`, `description`
   (default: the title), `max_items` (default 100). Route it to a `file`
   sink to publish it.
@@ -563,6 +576,7 @@ is ignored. Documents are kept until `delete documents` removes them.
 | `telegram` | `telegram` | `text/plain`, `text/markdown` | Documents to a Telegram chat: as a message (title, text, link, image) when it fits, else as a file |
 | `googlechat` | `googlechat` | `text/plain`, `text/markdown` | Documents to a Google Chat space, by incoming webhook, as a card |
 | `filesink` | `file` | anything | Writes each document to a file, replacing it |
+| `stdout` | `stdout` | anything | Prints each document as a line of JSON on stdout, for tests and debugging |
 
 Every sink takes `interval` (time between its deliveries, default 0: no
 pacing), `max_per_run` (deliveries per run at most, default 5) and
@@ -588,7 +602,10 @@ hosted at `blogger.googleusercontent.com`, so those go at full size through
 the `wsrv.nl` image proxy, which sees their URLs. `file` takes `path`, an
 absolute path (`~` allowed) where `{app}`, `{output}` and `{key}` are
 replaced by the document's (`/` in a key becomes `_`); the file is
-replaced whole, never left half-written.
+replaced whole, never left half-written. `stdout` takes only the common
+options; each line holds every field of the document, its content
+included, and it records no reference. It shares stdout with the
+commands' tables.
 
 ```yaml
 plugins:
@@ -609,10 +626,40 @@ How delivery behaves:
 - Each document an applet emits is queued for every sink its output is
   routed to. `apps run` delivers after running the applets, and `deliver`
   on its own.
-- A sink instance delivers oldest first, whatever applet emitted them. With
-  an `interval`, it delivers one document once its last delivery is that
-  old; without one, every pending document, up to `max_per_run` per run.
-  Two applets routed to one chat share its pace.
+- A document has no destination of its own: `inspect documents` shows what
+  was emitted and by whom (applet, output, key, content, title, link,
+  image, time), and no sink. The destination is the applet's `sink` or
+  `routes` in the configuration, and delivering only sends ledger rows
+  (`inspect deliveries`). Each document a run emits, new or already
+  stored, gets a row for each sink its output is routed to at that moment
+  and it has none of. So an applet without a route stores documents that
+  are never delivered, and a route added later reaches the stored
+  documents the applet emits again (an `itemfeed`'s window), not older
+  ones. A row deleted by hand comes back if the applet emits its document
+  again while routed to that sink. To deliver documents without a row,
+  route them or not, then create their rows and send them:
+
+  ```sh
+  uv run newstool -c config.yaml deliveries set-status --sink chat --app items --as queued
+  uv run newstool -c config.yaml deliver --sink chat
+  ```
+
+  Or start over with `apps reset items --with-documents`: for `itemfeed`
+  with `since_first_run`, the next run is a first run again, so the items
+  already imported are not emitted.
+- A sink instance delivers oldest first, whatever applet emitted them:
+  by when each document was emitted, and within one run in the order the
+  applet emitted them. `itemfeed` emits the oldest item first (by
+  publication time, or import time for an item without one), so a chat
+  gets articles in the order they were published. The order is fixed for
+  now. With an `interval`, it delivers one document once its last delivery
+  is that old; without one, every pending document, up to `max_per_run`
+  per run. Two applets routed to one chat share its pace. `deliver`
+  overrides the pacing for one run: `--ignore-interval` sends now, up to
+  `max_per_run`; `--ignore-max-per-run` sends every due row, which on a
+  sink with an `interval` needs `--ignore-interval` too (one row per run
+  otherwise); `--max-per-run N` replaces the limit. Retries still wait for
+  their backoff.
 - A failed delivery is retried like a processor's; it holds nothing else
   back.
 - Nothing is delivered twice to the same sink instance.
