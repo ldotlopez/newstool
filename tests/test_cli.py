@@ -26,6 +26,7 @@ from newstool.models import (
     SourceItem,
 )
 from newstool.processors import RunSummary
+from newstool.sinks import PacingOverride
 
 SOURCE = SourceData(
     id="plaza", name="Plaza", url="https://plaza.test/", provider="plaza"
@@ -159,9 +160,38 @@ class CommandTests(unittest.TestCase):
             ],
         )
         app.deliver.assert_called_once()
-        self.assertIn("news\tyes\t1\t0", result.stdout)
-        self.assertIn("digest\tno\t-\t-", result.stdout)
+        self.assertIn("news\tyes\t1\t0\t0", result.stdout)
+        self.assertIn("digest\tno\t-\t-\t-", result.stdout)
         self.assertIn("site\t1\t0", result.stdout)
+
+    def test_apps_run_with_app_delivers_to_its_sinks_only(self) -> None:
+        app = Mock()
+        app.sink_ids = ["chat", "site"]
+        app.routed_sinks.return_value = ["site"]
+        app.run_app.return_value = AppReport("news", due=True)
+        app.deliver.return_value = RunSummary()
+        app.unconfigured_pending.return_value = {}
+
+        result = invoke(app, "apps", "run", "--app", "news")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        app.routed_sinks.assert_called_once_with(["news"])
+        self.assertEqual([c.args[0] for c in app.deliver.call_args_list], ["site"])
+
+    def test_apps_run_no_deliver_stores_and_sends_nothing(self) -> None:
+        app = Mock()
+        app.app_ids = ["news"]
+        app.run_app.return_value = AppReport(
+            "news", due=True, ignored=(("feed", "k"),), routed=2
+        )
+
+        result = invoke(app, "apps", "run", "--no-deliver")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(app.run_app.call_args.kwargs["dry_run"], False)
+        app.deliver.assert_not_called()
+        self.assertIn("news\tyes\t0\t1\t2", result.stdout)
+        self.assertNotIn("Deliver", result.stdout)
 
     def test_apps_run_dry_run_shows_documents_and_delivers_nothing(self) -> None:
         app = Mock()
@@ -219,6 +249,23 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(app.deliver.call_args.args[0], "chat")
         self.assertIn("1 delivery(ies) failed", result.output)
         self.assertIn("gone: not configured, 4 pending", logs.output[0])
+
+    def test_deliver_passes_the_pacing_override(self) -> None:
+        app = Mock()
+        app.sink_ids = ["chat"]
+        app.deliver.return_value = RunSummary(done=1)
+        app.unconfigured_pending.return_value = {}
+
+        result = invoke(app, "deliver", "--ignore-interval", "--ignore-max-per-run")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            app.deliver.call_args.args[2],
+            PacingOverride(ignore_interval=True, ignore_max_per_run=True),
+        )
+        result = invoke(app, "deliver", "--ignore-max-per-run", "--max-per-run", "3")
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("exclude each other", result.output)
 
     def test_writing_commands_take_the_write_lock(self) -> None:
         app = Mock()

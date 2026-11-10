@@ -42,7 +42,7 @@ from .models import (
 from .plugins import ClassRegister, Services
 from .processors import RunSummary
 from .providers import PreflightProvider
-from .sinks import Deliverer
+from .sinks import Deliverer, PacingOverride, accepts
 
 PLUGINS_NAMESPACE = "newstool.plugins"
 PLUGIN_ENTRY_POINT = "__newstool_plugin__"
@@ -79,14 +79,16 @@ class DeleteSummary:
 @dataclasses.dataclass(frozen=True, slots=True)
 class AppReport:
     """What a run of an applet instance did, or would do: whether it was
-    due, its error, and the `(output, key)` of the documents it emitted, new
-    or already stored."""
+    due, its error, the `(output, key)` of the documents it emitted, new or
+    already stored, and how many rows it queued for stored ones routed
+    since they were emitted."""
 
     app: str
     due: bool
     error: str | None = None
     new: tuple[tuple[str, str], ...] = ()
     ignored: tuple[tuple[str, str], ...] = ()
+    routed: int = 0
     state: JsonCompatible = None
 
 
@@ -348,19 +350,22 @@ class Application:
                 due=True,
                 new=tuple(pair for pair in emitted if pair not in existing),
                 ignored=tuple(pair for pair in emitted if pair in existing),
+                routed=self._db.count_missing_routes(app_id, existing, app.routes),
                 state=result.state,
             )
-        stored = self._db.commit_app_run(app_id, now, result, app.routes)
-        new = {(d.output, d.key) for d in stored}
+        committed = self._db.commit_app_run(app_id, now, result, app.routes)
+        new = {(d.output, d.key) for d in committed.documents}
         LOGGER.info(
             f"{app_id}: {len(new)} new document(s),"
-            f" {len(emitted) - len(new)} already stored"
+            f" {len(emitted) - len(new)} already stored,"
+            f" {committed.routed} delivery(ies) queued for stored ones"
         )
         return AppReport(
             app_id,
             due=True,
             new=tuple(pair for pair in emitted if pair in new),
             ignored=tuple(pair for pair in emitted if pair not in new),
+            routed=committed.routed,
             state=result.state,
         )
 
@@ -381,22 +386,42 @@ class Application:
     def sink_profile(self, sink_id: str) -> Profile:
         return lookup(self._catalog.sinks, sink_id, "sink")
 
-    def _deliverer(self, sink_id: str) -> Deliverer:
+    def _deliverer(
+        self, sink_id: str, pacing: PacingOverride | None = None
+    ) -> Deliverer:
         profile = self.sink_profile(sink_id)
-        return Deliverer(self._db, sink_id, self._object(profile), profile.options)
+        return Deliverer(
+            self._db, sink_id, self._object(profile), profile.options, pacing
+        )
+
+    def routed_sinks(self, app_ids: Iterable[str]) -> list[str]:
+        """The sink instances the applet instances' outputs are routed to,
+        in configuration order."""
+        routed = {
+            sink
+            for app_id in app_ids
+            for sinks in self.app_instance(app_id).routes.values()
+            for sink in sinks
+        }
+        return [sink for sink in self._catalog.sinks if sink in routed]
 
     @property
     def sink_ids(self) -> list[str]:
         """Every sink instance, in configuration order."""
         return list(self._catalog.sinks)
 
-    def plan_delivery(self, sink_id: str, now: datetime) -> list[Delivery]:
+    def plan_delivery(
+        self, sink_id: str, now: datetime, pacing: PacingOverride | None = None
+    ) -> list[Delivery]:
         """The rows a delivery run of the sink instance would send now."""
-        return [delivery for delivery, _ in self._deliverer(sink_id).plan(now)]
+        return [delivery for delivery, _ in self._deliverer(sink_id, pacing).plan(now)]
 
-    def deliver(self, sink_id: str, now: datetime) -> RunSummary:
-        """Send the sink instance's pending rows, paced."""
-        return self._deliverer(sink_id).deliver(now)
+    def deliver(
+        self, sink_id: str, now: datetime, pacing: PacingOverride | None = None
+    ) -> RunSummary:
+        """Send the sink instance's pending rows, paced by its options or by
+        `pacing`."""
+        return self._deliverer(sink_id, pacing).deliver(now)
 
     def unconfigured_pending(self) -> dict[str, int]:
         """Pending rows of sinks no longer configured, counted by sink."""
@@ -559,6 +584,27 @@ class Application:
             summaries[sink_id] = self._deliverer(sink_id).send_rows(rows)
         return summaries
 
+    def selected_documents(
+        self, sink_id: str, selection: DocumentFilter
+    ) -> list[Document]:
+        """The documents `selection` names, whatever their routes; raise if
+        the sink instance does not accept the content type of any."""
+        profile = self.sink_profile(sink_id)
+        documents = self._db.find_documents(selection)
+        refused = sorted(
+            {
+                d.content_type
+                for d in documents
+                if not accepts(profile.cls, {d.content_type})
+            }
+        )
+        if refused:
+            raise ConfigError(
+                f"sink '{sink_id}' ({profile.name}) does not accept"
+                f" {', '.join(refused)}; narrow the selection"
+            )
+        return documents
+
     def routed_documents(
         self, sink_id: str, selection: DocumentFilter | None = None
     ) -> list[Document]:
@@ -590,13 +636,17 @@ class Application:
         overwrite: bool = False,
         dry_run: bool = False,
     ) -> MarkSummary:
-        """Give the documents `selection` names among those routed to the
-        sink instance (every one without filters) a row in `status`.
-        Existing rows are left as they are unless `overwrite`. `dry_run`
-        only counts."""
+        """Give the documents `selection` names a row of the sink instance
+        in `status`, routed to it or not; without filters, every document
+        routed to it. Existing rows are left as they are unless `overwrite`.
+        `dry_run` only counts. A document whose content type the sink does
+        not accept is a configuration error, and nothing is marked."""
         if status == DeliveryStatus.SENDING:
             raise ValueError("a delivery is only `sending` while it is sent")
-        documents = self.routed_documents(sink_id, selection)
+        if selection is not None and selection.is_set():
+            documents = self.selected_documents(sink_id, selection)
+        else:
+            documents = self.routed_documents(sink_id, selection)
         existing = {
             delivery.document_id: delivery
             for delivery in self._db.find_deliveries(
@@ -631,7 +681,8 @@ class Application:
 
     def delete_deliveries(self, delivery_ids: Iterable[int]) -> int:
         """Delete these ledger rows; return how many. Their documents are
-        not delivered again unless rows are created for them."""
+        not delivered again unless rows are created for them, by hand or by
+        their applet emitting them again while routed to the sink."""
         return self._db.delete_deliveries(delivery_ids)
 
     # --- Deletion ----------------------------------------------------------

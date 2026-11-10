@@ -525,12 +525,6 @@ apps:
         )
         (row,) = self.app.find_deliveries()
         self.assertEqual((row.sink, row.status), ("site", DeliveryStatus.ERROR))
-        self.assertEqual(
-            self.app.mark_deliveries(
-                "site", DeliveryStatus.DONE, DocumentFilter(app="other")
-            ),
-            MarkSummary(),
-        )
         with self.assertRaisesRegex(ConfigError, "sink 'nope' is not configured"):
             self.app.mark_deliveries("nope", DeliveryStatus.DONE)
 
@@ -538,6 +532,69 @@ apps:
         self.app.mark_deliveries("site", DeliveryStatus.ERROR)
         (row,) = self.app.find_deliveries()
         self.assertEqual(row.last_error, SET_BY_HAND)
+
+    def test_routed_sinks_of_applet_instances(self) -> None:
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+
+        self.assertEqual(self.app.routed_sinks(["news", "other"]), ["site"])
+        self.assertEqual(self.app.routed_sinks(["other"]), [])
+
+    def test_mark_with_filters_queues_documents_not_routed_to_the_sink(self) -> None:
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app.run_app("other", NOW)  # not routed to `site`
+
+        # --all takes the routed documents only.
+        self.assertEqual(
+            self.app.mark_deliveries("site", DeliveryStatus.QUEUED), MarkSummary()
+        )
+        self.assertEqual(
+            self.app.mark_deliveries(
+                "site", DeliveryStatus.QUEUED, DocumentFilter(app="other")
+            ),
+            MarkSummary(created=1),
+        )
+        (row,) = self.app.find_deliveries()
+        self.assertEqual((row.sink, row.status), ("site", DeliveryStatus.QUEUED))
+        self.assertEqual(self.app.deliver("site", NOW).done, 1)
+        self.assertTrue((self.tmp_dir / "site" / "other.xml").exists())
+
+    def test_mark_refuses_content_types_the_sink_does_not_accept(self) -> None:
+        self.app.close()
+        self.app = self.make_app(
+            catalog="""
+sinks:
+  - {id: chat, sink: telegram, options: {bot_token: t, chat_id: c}}
+apps:
+  - {id: news, app: feed}
+"""
+        )
+        self.app.run_app("news", NOW)
+
+        with self.assertRaisesRegex(ConfigError, "does not accept application/rss"):
+            self.app.mark_deliveries(
+                "chat", DeliveryStatus.QUEUED, DocumentFilter(app="news")
+            )
+        self.assertEqual(self.app.find_deliveries(), [])
+
+    def test_a_route_added_later_queues_what_the_applet_emits_again(self) -> None:
+        self.app.close()
+        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app.run_app("other", NOW)
+        self.app.close()
+        self.app = self.make_app(
+            catalog=self.routed_catalog(self.tmp_dir / "site").replace(
+                "{id: other, app: feed}", "{id: other, app: feed, sink: site}"
+            )
+        )
+
+        dry = self.app.run_app("other", NOW, force=True, dry_run=True)
+        report = self.app.run_app("other", NOW, force=True)
+
+        self.assertEqual((dry.routed, report.routed, report.new), (1, 1, ()))
+        (row,) = self.app.find_deliveries()
+        self.assertEqual((row.sink, row.status), ("site", DeliveryStatus.QUEUED))
 
     def test_documents_with_pending_deliveries_are_not_deleted(self) -> None:
         self.app.close()

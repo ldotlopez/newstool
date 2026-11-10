@@ -4,6 +4,7 @@ regenerated (decision 0015)."""
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from collections.abc import Collection
@@ -58,6 +59,24 @@ class SinkType(Protocol):
     def __call__(self, options: Any, services: Services) -> Sink: ...
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PacingOverride:
+    """Pacing set for one delivery run, over the sink instance's options,
+    one flag per option: `ignore_interval` drops the interval (its wait and
+    its one row per run), so `max_per_run` alone limits the run;
+    `ignore_max_per_run` drops that limit, and `max_per_run` replaces it."""
+
+    ignore_interval: bool = False
+    ignore_max_per_run: bool = False
+    max_per_run: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_per_run is not None and self.max_per_run < 1:
+            raise ValueError("max_per_run must be at least 1")
+        if self.ignore_max_per_run and self.max_per_run is not None:
+            raise ValueError("ignore_max_per_run takes no max_per_run")
+
+
 def accepts(sink_type: SinkType, content_types: Collection[str]) -> bool:
     """Whether the sink type renders every one of `content_types`."""
     return ANY_CONTENT_TYPE in sink_type.accepts or set(content_types) <= set(
@@ -79,12 +98,18 @@ class Deliverer:
     """
 
     def __init__(
-        self, db: Database, sink_id: str, sink: Sink, options: SinkOptions
+        self,
+        db: Database,
+        sink_id: str,
+        sink: Sink,
+        options: SinkOptions,
+        pacing: PacingOverride | None = None,
     ) -> None:
         self.db = db
         self.sink_id = sink_id
         self.sink = sink
         self.options = options
+        self.pacing = pacing or PacingOverride()
 
     def plan(self, now: datetime) -> list[tuple[Delivery, Document]]:
         """The rows a delivery run would send now."""
@@ -130,14 +155,17 @@ class Deliverer:
         self, pending: list[tuple[Delivery, Document]], now: datetime
     ) -> list[tuple[Delivery, Document]]:
         """With an `interval`, the first pending row once the last delivery
-        is that old; then at most `max_per_run` rows."""
-        interval = self.options.interval
+        is that old; then at most `max_per_run` rows. `pacing` may drop
+        either."""
+        interval = 0 if self.pacing.ignore_interval else self.options.interval
         if interval:
             last = self.db.last_delivered_at(self.sink_id)
             if last is not None and now - last < timedelta(seconds=interval):
                 return []
             pending = pending[:1]
-        return pending[: self.options.max_per_run]
+        if self.pacing.ignore_max_per_run:
+            return pending
+        return pending[: self.pacing.max_per_run or self.options.max_per_run]
 
     def send_rows(self, rows: list[tuple[Delivery, Document]]) -> RunSummary:
         """Send these rows now, whatever their state."""

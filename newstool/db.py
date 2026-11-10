@@ -405,6 +405,15 @@ class DBDocument(Base):
         self.emitted_at = dto.emitted_at
 
 
+@dataclasses.dataclass(slots=True)
+class CommittedRun:
+    """What `commit_app_run` stored: the new documents, and how many rows it
+    added for documents already stored, routed since they were emitted."""
+
+    documents: list[Document] = dataclasses.field(default_factory=list)
+    routed: int = 0
+
+
 class DeliveryStatus(enum.StrEnum):
     QUEUED = "queued"
     SENDING = "sending"  # committed before the external call
@@ -1216,17 +1225,52 @@ class Database:
             )
             return {(output, key) for output, key in rows}
 
+    @staticmethod
+    def _missing_routes(
+        sess: Session, document_id: int, sinks: Sequence[str]
+    ) -> tuple[str, ...]:
+        """The sinks among `sinks` the document has no row of."""
+        present = {
+            sink
+            for (sink,) in sess.query(DBDelivery.sink).filter(
+                DBDelivery.document_id == document_id
+            )
+        }
+        return tuple(sink for sink in sinks if sink not in present)
+
+    def count_missing_routes(
+        self,
+        app: str,
+        keys: Iterable[tuple[str, str]],
+        routes: Mapping[str, Sequence[str]],
+    ) -> int:
+        """How many rows `commit_app_run` would add for the documents among
+        `keys` (`(output, key)`) the instance already stored."""
+        keys = list(keys)
+        if not keys:
+            return 0
+        with self.session_scope() as sess:
+            rows = sess.query(DBDocument.id, DBDocument.output).filter(
+                DBDocument.app == app,
+                tuple_(DBDocument.output, DBDocument.key).in_(keys),
+            )
+            return sum(
+                len(self._missing_routes(sess, document_id, routes.get(output, ())))
+                for document_id, output in rows
+            )
+
     def commit_app_run(
         self,
         app: str,
         started: datetime,
         result: AppletResult,
         routes: Mapping[str, Sequence[str]],
-    ) -> list[Document]:
+    ) -> CommittedRun:
         """Store a successful run in one transaction: its new documents, a
-        `queued` delivery per route of each new document's output, its state,
-        and `last_success = started`. Documents whose key the instance already
-        stored are ignored. Returns the new documents.
+        `queued` delivery per route of each emitted document's output, its
+        state, and `last_success = started`. A document whose key the
+        instance already stored is not stored again; it only gets a row for
+        each route it has none of (a route added since it was emitted).
 
         Contents are written first, so a failed commit leaves unused files,
         never rows pointing at nothing.
@@ -1239,33 +1283,43 @@ class Database:
             self.contents.set(document.content_sha256, document.content.encode())
 
         now = datetime.now(UTC)
-        stored: list[Document] = []
+        committed = CommittedRun()
         with self.session_scope() as sess:
             existing = {
-                (output, key)
-                for output, key in sess.query(DBDocument.output, DBDocument.key).filter(
-                    DBDocument.app == app
-                )
+                (output, key): document_id
+                for document_id, output, key in sess.query(
+                    DBDocument.id, DBDocument.output, DBDocument.key
+                ).filter(DBDocument.app == app)
             }
             for document in documents:
-                if (document.output, document.key) in existing:
-                    continue
-                row = DBDocument.from_dto(dataclasses.replace(document, emitted_at=now))
-                sess.add(row)
-                sess.flush()
+                sinks = routes.get(document.output, ())
+                document_id = existing.get((document.output, document.key))
+                if document_id is None:
+                    row = DBDocument.from_dto(
+                        dataclasses.replace(document, emitted_at=now)
+                    )
+                    sess.add(row)
+                    sess.flush()
+                    document_id = row.id
+                    existing[(document.output, document.key)] = document_id
+                    committed.documents.append(
+                        dataclasses.replace(document, emitted_at=now, id=row.id)
+                    )
+                else:
+                    sinks = self._missing_routes(sess, document_id, sinks)
+                    committed.routed += len(sinks)
                 sess.add_all(
                     DBDelivery.from_dto(
                         Delivery(
                             sink=sink,
-                            document_id=row.id,
+                            document_id=document_id,
                             status=DeliveryStatus.QUEUED,
                             created_at=now,
                             updated_at=now,
                         )
                     )
-                    for sink in routes.get(document.output, ())
+                    for sink in sinks
                 )
-                stored.append(dataclasses.replace(document, emitted_at=now, id=row.id))
 
             run = AppletRun(
                 app=app,
@@ -1279,7 +1333,7 @@ class Database:
                 sess.add(DBApp.from_dto(run))
             else:
                 row.update(run)
-        return stored
+        return committed
 
     def reset_app(self, app: str, *, with_documents: bool = False) -> int:
         """Delete the instance's run record; with `with_documents`, also its

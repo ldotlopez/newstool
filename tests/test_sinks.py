@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import shutil
 import tempfile
 import unittest
@@ -10,8 +13,8 @@ from sqlalchemy.exc import IntegrityError
 
 from newstool.db import Database, DeliveryStatus
 from newstool.models import AppletResult, Delivery, Document, EmittedDocument
-from newstool.plugins import Services, filesink, googlechat, telegram
-from newstool.sinks import Deliverer, SinkOptions, accepts
+from newstool.plugins import Services, filesink, googlechat, stdout, telegram
+from newstool.sinks import Deliverer, PacingOverride, SinkOptions, accepts
 
 NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
 
@@ -50,7 +53,9 @@ class LedgerTestCase(unittest.TestCase):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def emit(self, *keys: str, app: str = "a", sinks: tuple[str, ...] = ("chat",)):
-        return self.db.commit_app_run(app, NOW, emitted(*keys), {"out": sinks})
+        return self.db.commit_app_run(
+            app, NOW, emitted(*keys), {"out": sinks}
+        ).documents
 
     def statuses(self, sink: str = "chat") -> dict[str, str]:
         return {
@@ -64,14 +69,15 @@ class LedgerTestCase(unittest.TestCase):
 
 class CommitTests(LedgerTestCase):
     def test_stores_documents_their_deliveries_and_the_run(self) -> None:
-        stored = self.db.commit_app_run(
+        committed = self.db.commit_app_run(
             "a",
             NOW,
             AppletResult(state={"n": 1}, documents=emitted("k1").documents),
             {"out": ("chat", "file")},
         )
 
-        (document,) = stored
+        (document,) = committed.documents
+        self.assertEqual(committed.routed, 0)
         self.assertEqual(
             (document.app, document.output, document.key), ("a", "out", "k1")
         )
@@ -89,6 +95,26 @@ class CommitTests(LedgerTestCase):
 
         self.assertEqual([d.key for d in stored], ["k2"])
         self.assertEqual(len(self.db.find_deliveries()), 2)
+
+    def test_a_route_added_later_queues_the_documents_emitted_again(self) -> None:
+        self.emit("k1", "k2", sinks=())
+
+        committed = self.db.commit_app_run(
+            "a", NOW, emitted("k1"), {"out": ("chat", "file")}
+        )
+
+        self.assertEqual((committed.documents, committed.routed), ([], 2))
+        self.assertEqual(self.statuses("chat"), {"k1": "queued"})
+        self.assertEqual(self.statuses("file"), {"k1": "queued"})
+        # Emitted again with its rows in place: nothing more.
+        again = self.db.commit_app_run("a", NOW, emitted("k1"), {"out": ("chat",)})
+        self.assertEqual(again.routed, 0)
+        self.assertEqual(
+            self.db.count_missing_routes(
+                "a", [("out", "k1"), ("out", "k2")], {"out": ("chat",)}
+            ),
+            1,
+        )
 
     def test_an_output_without_route_stores_its_documents_only(self) -> None:
         self.emit("k1", sinks=())
@@ -147,6 +173,38 @@ class DelivererTests(LedgerTestCase):
         self.assertEqual(sink.sent, ["k1", "k2"])  # the last one was just now
         paced.deliver(datetime.now(UTC) + timedelta(minutes=31))
         self.assertEqual(sink.sent, ["k1", "k2", "k3"])
+
+    def test_a_pacing_override_replaces_the_options_for_one_run(self) -> None:
+        self.emit("k1", "k2", "k3", "k4")
+        sink = RecordingSink()
+        options = SinkOptions(interval="1h", max_per_run=1)
+
+        def run(pacing: PacingOverride) -> None:
+            Deliverer(self.db, "chat", sink, options, pacing).deliver(NOW)
+
+        run(PacingOverride())
+        run(PacingOverride())  # the interval has not passed
+        self.assertEqual(sink.sent, ["k1"])
+        run(PacingOverride(ignore_interval=True))
+        self.assertEqual(sink.sent, ["k1", "k2"])  # max_per_run still holds
+        run(PacingOverride(ignore_interval=True, max_per_run=5))
+        self.assertEqual(sink.sent, ["k1", "k2", "k3", "k4"])
+
+    def test_ignore_max_per_run_sends_every_due_row(self) -> None:
+        self.emit("k1", "k2", "k3")
+        sink = RecordingSink()
+
+        Deliverer(
+            self.db,
+            "chat",
+            sink,
+            SinkOptions(max_per_run=1),
+            PacingOverride(ignore_max_per_run=True),
+        ).deliver(NOW)
+
+        self.assertEqual(sink.sent, ["k1", "k2", "k3"])
+        with self.assertRaises(ValueError):
+            PacingOverride(ignore_max_per_run=True, max_per_run=2)
 
     def test_two_applets_share_the_sink_pacing(self) -> None:
         self.emit("k1", app="a")
@@ -212,6 +270,19 @@ class DelivererTests(LedgerTestCase):
             )
 
 
+class DeliveryOrderTests(LedgerTestCase):
+    def test_documents_go_out_oldest_emitted_first(self) -> None:
+        # Two runs: each run's documents in emission order, the earlier run's
+        # before the later one's, whatever their keys.
+        self.emit("z", "m")
+        self.emit("a")
+        sink = RecordingSink()
+
+        self.deliverer(sink, max_per_run=10).deliver(NOW)
+
+        self.assertEqual(sink.sent, ["z", "m", "a"])
+
+
 class AcceptsTests(unittest.TestCase):
     def test_content_types_must_all_be_accepted(self) -> None:
         self.assertTrue(accepts(telegram.TelegramSink, {"text/plain"}))
@@ -259,6 +330,41 @@ class FileSinkTests(unittest.TestCase):
         for path in ("relative.xml", "/x/{name}.xml"):
             with self.subTest(path=path), self.assertRaises(pydantic.ValidationError):
                 filesink.FileOptions(path=path)
+
+
+class StdoutSinkTests(unittest.TestCase):
+    def test_prints_each_document_as_a_json_line(self) -> None:
+        sink = stdout.StdoutSink(SinkOptions(), Services(db=Mock(), fetcher=Mock()))
+        documents = [
+            Document(
+                "news",
+                "items",
+                "s/1",
+                "text/plain",
+                "Resumen ñ",
+                title="T",
+                url="https://s.test/1",
+                emitted_at=NOW,
+                id=7,
+            ),
+            Document("news", "items", "s/2", "text/plain", "Otro"),
+        ]
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            references = [sink.send(document) for document in documents]
+
+        self.assertEqual(references, [None, None])
+        lines = output.getvalue().splitlines()
+        self.assertIn("Resumen ñ", lines[0])
+        first = json.loads(lines[0])
+        self.assertEqual(first["emitted_at"], NOW.isoformat())
+        self.assertEqual(
+            {name: first[name] for name in ("app", "output", "key", "id", "title")},
+            {"app": "news", "output": "items", "key": "s/1", "id": 7, "title": "T"},
+        )
+        self.assertEqual(json.loads(lines[1])["content"], "Otro")
+        self.assertTrue(accepts(stdout.StdoutSink, {"application/rss+xml"}))
 
 
 if __name__ == "__main__":

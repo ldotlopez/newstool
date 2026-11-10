@@ -614,7 +614,7 @@ class DocumentTests(DatabaseTestCase):
                 for key in keys
             )
         )
-        return self.db.commit_app_run(app, self.NOW, result, {output: routes})
+        return self.db.commit_app_run(app, self.NOW, result, {output: routes}).documents
 
     def test_find_documents_filters_and_loads_content_on_request(self):
         self.emit("a", "k1", "k2")

@@ -42,6 +42,7 @@ from .db import (
 from .errors import EXPECTED_ERRORS, describe, log_failure
 from .models import Delivery, DocumentFilter, ProcessingScope, SourceItem
 from .processors import RunSummary
+from .sinks import PacingOverride
 
 # Help goes to stdout: rich only when stdout is a terminal.
 click = plain_click if RICH_STDOUT_DISABLED else rich_click
@@ -300,13 +301,14 @@ def print_apps(reports: dict[str, AppReport]) -> int:
     """Print the applet runs' summary; return how many failed."""
     print_table(
         "Apps",
-        ["App", "Due", "New", "Already stored", "Error"],
+        ["App", "Due", "New", "Already stored", "Routed", "Error"],
         [
             [
                 name,
                 "yes" if r.due else "no",
                 len(r.new) if r.due else "-",
                 len(r.ignored) if r.due else "-",
+                r.routed if r.due else "-",
                 r.error or "",
             ]
             for name, r in reports.items()
@@ -1134,10 +1136,11 @@ def deliveries_set_status_cmd(
 ) -> None:
     """Set the state of deliveries.
 
-    With --sink and document filters (or --all), every selected document
-    routed to that sink gets a row of it; --limit counts documents. Existing
-    rows are left as they are unless --overwrite. That queues documents
-    emitted before a route was added (`--as queued`).
+    With --sink and document filters, every selected document gets a row of
+    that sink, routed to it or not (its content type must be one the sink
+    accepts); with --sink and --all, every document routed to it. --limit
+    counts documents. Existing rows are left as they are unless --overwrite.
+    That queues documents for a sink by hand (`--as queued`).
 
     Otherwise, or with --delivery or --status, it changes the selected rows;
     --limit counts rows. That settles an interrupted `sending` row (`--as
@@ -1222,12 +1225,50 @@ def deliveries_send_cmd(
 @click.option(
     "--sink", "sink_ids", multiple=True, help="Only this sink instance (repeatable)"
 )
+@click.option(
+    "--ignore-interval",
+    is_flag=True,
+    help="Send now even if the interval has not passed, up to max_per_run",
+)
+@click.option(
+    "--ignore-max-per-run",
+    is_flag=True,
+    help="Every due row; on a sink with an interval, with --ignore-interval",
+)
+@click.option(
+    "--max-per-run",
+    type=click.IntRange(min=1),
+    help="At most this many per sink instance, instead of its max_per_run",
+)
 @dry_run_option
 @click.pass_context
 @report_user_errors
-def deliver_cmd(ctx: click.Context, sink_ids: tuple[str, ...], dry_run: bool) -> None:
+def deliver_cmd(
+    ctx: click.Context,
+    sink_ids: tuple[str, ...],
+    ignore_interval: bool,
+    ignore_max_per_run: bool,
+    max_per_run: int | None,
+    dry_run: bool,
+) -> None:
     """Send every sink instance's pending deliveries, paced; `apps run`
-    does this after running the applets."""
+    does this after running the applets.
+
+    --ignore-interval and --ignore-max-per-run each drop one of the sinks'
+    pacing options for this run, and --max-per-run replaces one. A sink
+    with an interval sends one row per run, so emptying its queue takes
+    both --ignore-interval and --ignore-max-per-run. Retries still wait for
+    their backoff, and a failed delivery does not stop the others.
+    """
+    if ignore_max_per_run and max_per_run is not None:
+        raise click.UsageError(
+            "--ignore-max-per-run and --max-per-run exclude each other"
+        )
+    pacing = PacingOverride(
+        ignore_interval=ignore_interval,
+        ignore_max_per_run=ignore_max_per_run,
+        max_per_run=max_per_run,
+    )
     app = app_from_context(ctx, write=not dry_run)
     now = datetime.now(UTC)
     selected = list(sink_ids) or app.sink_ids
@@ -1235,19 +1276,26 @@ def deliver_cmd(ctx: click.Context, sink_ids: tuple[str, ...], dry_run: bool) ->
         rows = [
             [d.id, d.sink, f"{d.document_id} {d.document_label}", d.status]
             for sink_id in selected
-            for d in app.plan_delivery(sink_id, now)
+            for d in app.plan_delivery(sink_id, now, pacing)
         ]
         print_table("Would deliver", ["ID", "Sink", "Document", "Status"], rows)
         return
-    if failed := run_delivery(app, selected, now):
+    if failed := run_delivery(app, selected, now, pacing):
         raise click.ClickException(f"{failed} delivery(ies) failed")
 
 
-def run_delivery(app: Application, sink_ids: list[str], now: datetime) -> int:
+def run_delivery(
+    app: Application,
+    sink_ids: list[str],
+    now: datetime,
+    pacing: PacingOverride | None = None,
+) -> int:
     """Deliver for each sink instance and print the summary; return how many
     deliveries failed."""
     with progress_rows() as progress:
-        summaries = run_each(progress, sink_ids, lambda sink: app.deliver(sink, now))
+        summaries = run_each(
+            progress, sink_ids, lambda sink: app.deliver(sink, now, pacing)
+        )
     for sink, count in app.unconfigured_pending().items():
         LOGGER.warning(
             f"{sink}: not configured, {count} pending delivery(ies) left as they are"
@@ -1268,13 +1316,27 @@ def apps_group() -> None:
     "--app", "app_ids", multiple=True, help="Only this applet instance (repeatable)"
 )
 @click.option("--force", is_flag=True, help="Run even if not due")
+@click.option(
+    "--no-deliver",
+    is_flag=True,
+    help="Store and queue what they emit, but send nothing; `deliver` sends it",
+)
 @dry_run_option
 @click.pass_context
 @report_user_errors
 def apps_run_cmd(
-    ctx: click.Context, app_ids: tuple[str, ...], force: bool, dry_run: bool
+    ctx: click.Context,
+    app_ids: tuple[str, ...],
+    force: bool,
+    no_deliver: bool,
+    dry_run: bool,
 ) -> None:
-    """Run the applet instances that are due, then deliver.
+    """Run the applet instances that are due, then deliver: with --app,
+    for the sink instances those are routed to; without it, for all.
+
+    Each emitted document gets a queued delivery per sink its output is
+    routed to, including one already stored that has no row of a sink
+    routed since (the Routed column). --no-deliver stops there.
 
     --dry-run runs them and shows the documents they would emit, storing and
     delivering nothing. Exits non-zero if anything failed.
@@ -1293,8 +1355,9 @@ def apps_run_cmd(
     failures = print_apps(reports)
     if dry_run:
         print_emitted(reports)
-    else:
-        failures += run_delivery(app, app.sink_ids, now)
+    elif not no_deliver:
+        sinks = app.routed_sinks(selected) if app_ids else app.sink_ids
+        failures += run_delivery(app, sinks, now)
     if failures:
         raise click.ClickException(f"{failures} failure(s); see the log above")
 
