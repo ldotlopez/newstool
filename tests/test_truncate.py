@@ -57,7 +57,12 @@ class TruncateTests(unittest.TestCase):
 
     def test_accepts_and_ignores_the_options_of_summarize(self) -> None:
         self.assertEqual(
-            self.summary(llm="nonexistent", model="big", prompt="Resume: "),
+            self.summary(
+                llm="nonexistent",
+                model="big",
+                prompt="Resume: ",
+                source_prompts={"s": "Resume: "},
+            ),
             MARKDOWN[:200],
         )
 

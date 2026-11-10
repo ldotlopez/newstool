@@ -16,6 +16,7 @@ class TruncateOptions(ProcessorOptions):
     llm: str | None = None
     model: str | None = None
     prompt: str | None = None
+    source_prompts: dict[str, str] | None = None
 
 
 class TruncateProcessor(BaseProcessor):
