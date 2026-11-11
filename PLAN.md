@@ -560,13 +560,12 @@ Risks:
   chat --status queued --until DATE --as done` (`--dry-run` first).
 - **Database layer audit** (audited 2026-11-10). Done: `processing_state`
   merged into `item_annotations`, and a content change deletes the item's
-  annotations through a trigger (decision 0018; the older one-shot
+  annotations through a trigger (decision 0018); JSON columns are stored
+  encoded once, as TEXT, `None` as SQL `NULL` (`CustomJSON` encoded twice,
+  over a `JSON` column with numeric affinity). The older one-shot
   scripts are retired, production migrations live in the git-ignored
   `private/`). A schema version waits until the schema settles. Pending
   findings, each schema change with a private migration and its test:
-  - `CustomJSON` encodes twice: `JSON` over a string already dumped, so
-    values are JSON strings inside JSON and `None` is stored as `"null"`,
-    never SQL `NULL`. Needs a script that rewrites the stored values.
   - `DBDelivery.update` rewrites `sink`, `document_id` and `created_at`;
     `save_delivery` should only write the state.
   - No index on `deliveries.document_id`: lookups by document and the
