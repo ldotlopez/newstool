@@ -235,14 +235,23 @@ class DocumentFilter:
 
 @dataclasses.dataclass(slots=True)
 class Annotation:
-    """One key a processor stored for an item, with its value."""
+    """The run of one key on one item (decision 0018): the state of its last
+    run and, once a run finished, its value. `status` is a
+    `db.ProcessingStatus`; `processor` is the one that ran last."""
 
-    id: int
     item_id: int
     processor: str
     key: str
-    updated_at: datetime
-    value: JsonCompatible
+    status: str
+    attempts: int = 0
+    last_error: str | None = None
+    processor_version: str | None = None
+    value_sha256: str | None = None  # None until a run finished
+    value: JsonCompatible = None  # loaded only by the reads that return values
+    created_at: datetime | None = None
+    attempted_at: datetime | None = None  # the last run; retries back off from it
+    updated_at: datetime | None = None  # when the value last changed
+    id: int | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

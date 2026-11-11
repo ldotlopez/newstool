@@ -21,6 +21,7 @@ from typing import Any, Self
 from foundation.jsonlib import dump_json_compatible, load_json_compatible
 from foundation.storage import DiskStorage
 from sqlalchemy import (
+    DDL,
     JSON,
     CheckConstraint,
     DateTime,
@@ -239,15 +240,18 @@ def backoff_seconds(
     return min(base * (factor ** max(attempts - 1, 0)), max_seconds)
 
 
-class DBProcessingState(Base):
-    """Per-(item, key) run state; no row means never attempted. `key` is the
-    annotation the run writes; `processor` is the one that ran it.
+class DBItemAnnotation(Base):
+    """The run of one key on one item (decision 0018): no row means never
+    attempted; the value lives in storage once a run finished. `processor`
+    is the one that ran last.
 
     `ignored` is the processor's own permanent skip for that content.
-    `error` rows count attempts for retries with backoff.
+    `error` rows count attempts for retries with backoff. A later failed or
+    ignored run of the same content keeps the value. The rows of an item
+    whose content changes are deleted by `CONTENT_CHANGED_TRIGGER`.
     """
 
-    __tablename__ = "processing_state"
+    __tablename__ = "item_annotations"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     source_item_id: Mapped[int] = mapped_column(
@@ -260,42 +264,136 @@ class DBProcessingState(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # A different VERSION on the processor makes `done` items eligible again.
     processor_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Item content this state was computed from; a different one on the item
-    # makes it eligible again.
-    content_sha256: Mapped[str] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime)
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
-
-    __table_args__ = (
-        UniqueConstraint("source_item_id", "key"),
-        Index("ix_processing_state_processor_status", "processor", "status"),
-        CheckConstraint(
-            "status IN ('done', 'error', 'ignored')", name="ck_processing_state_status"
-        ),
-        AUTOINCREMENT,
+    value_sha256: Mapped[str | None] = mapped_column(
+        String(64), index=True, nullable=True
     )
-
-
-class DBItemAnnotation(Base):
-    """One key a processor produced for an item; the value lives in storage.
-    A key is unique per item, whichever processor wrote it."""
-
-    __tablename__ = "item_annotations"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    source_item_id: Mapped[int] = mapped_column(
-        ForeignKey("source_items.id", ondelete="CASCADE")
-    )
-    processor: Mapped[str] = mapped_column(String(255))
-    key: Mapped[str] = mapped_column(String(255))
-    content_sha256: Mapped[str] = _sha256_column()
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    attempted_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    updated_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("source_item_id", "key"),
         Index("ix_item_annotations_processor", "processor"),
+        CheckConstraint(
+            "status IN ('done', 'error', 'ignored')", name="ck_item_annotations_status"
+        ),
+        CheckConstraint("attempts >= 0", name="ck_item_annotations_attempts"),
+        CheckConstraint(
+            "value_sha256 IS NULL OR length(value_sha256) = 64",
+            name="ck_item_annotations_value_sha256",
+        ),
+        CheckConstraint(
+            "status <> 'done' OR value_sha256 IS NOT NULL",
+            name="ck_item_annotations_done_has_value",
+        ),
         AUTOINCREMENT,
+    )
+
+    @classmethod
+    def from_dto(cls, dto: Annotation) -> Self:
+        return cls(
+            source_item_id=dto.item_id,
+            processor=dto.processor,
+            key=dto.key,
+            status=dto.status,
+            attempts=dto.attempts,
+            last_error=dto.last_error,
+            processor_version=dto.processor_version,
+            value_sha256=dto.value_sha256,
+            created_at=dto.created_at,
+            attempted_at=dto.attempted_at,
+            updated_at=dto.updated_at,
+        )
+
+    def to_dto(self) -> Annotation:
+        """The row without its value, which `Database` loads from storage."""
+        return Annotation(
+            item_id=self.source_item_id,
+            processor=self.processor,
+            key=self.key,
+            status=self.status,
+            attempts=self.attempts,
+            last_error=self.last_error,
+            processor_version=self.processor_version,
+            value_sha256=self.value_sha256,
+            created_at=self.created_at,
+            attempted_at=self.attempted_at,
+            updated_at=self.updated_at,
+            id=self.id,
+        )
+
+    def update(self, dto: Annotation) -> None:
+        self.source_item_id = dto.item_id
+        self.processor = dto.processor
+        self.key = dto.key
+        self.status = dto.status
+        self.attempts = dto.attempts
+        self.last_error = dto.last_error
+        self.processor_version = dto.processor_version
+        self.value_sha256 = dto.value_sha256
+        self.created_at = dto.created_at
+        self.attempted_at = dto.attempted_at
+        self.updated_at = dto.updated_at
+
+
+# An item whose content changes loses its annotations, so every key is
+# processed again on the new content (decision 0018). In the database, so
+# no write path can skip it; the values' files are released by the caller.
+CONTENT_CHANGED_TRIGGER = DDL(
+    "CREATE TRIGGER IF NOT EXISTS trg_source_items_content_changed"
+    " AFTER UPDATE OF content_sha256 ON source_items"
+    " WHEN OLD.content_sha256 IS NOT NEW.content_sha256"
+    " BEGIN"
+    " DELETE FROM item_annotations WHERE source_item_id = NEW.id;"
+    " END"
+)
+event.listen(DBItemAnnotation.__table__, "after_create", CONTENT_CHANGED_TRIGGER)
+
+
+def next_annotation(
+    previous: Annotation | None,
+    *,
+    item_id: int,
+    processor: str,
+    key: str,
+    status: ProcessingStatus,
+    value_sha256: str | None,
+    error: str | None,
+    version: str | None,
+    reset_attempts: bool,
+    now: datetime,
+) -> Annotation:
+    """The row a run's result leaves: `error` counts an attempt (from zero
+    with `reset_attempts`), `done` and `ignored` clear them; `done` sets the
+    value, other results keep the previous one."""
+    if status == ProcessingStatus.ERROR:
+        start = 0 if previous is None or reset_attempts else previous.attempts
+        attempts, last_error = start + 1, error
+    else:
+        attempts, last_error = 0, None
+
+    kept_sha256 = previous.value_sha256 if previous is not None else None
+    updated_at = previous.updated_at if previous is not None else None
+    if status == ProcessingStatus.DONE:
+        if value_sha256 is None:
+            raise ValueError(f"a finished run of {key} needs a value")
+        if value_sha256 != kept_sha256:
+            updated_at = now
+        kept_sha256 = value_sha256
+
+    return Annotation(
+        item_id=item_id,
+        processor=processor,
+        key=key,
+        status=status,
+        attempts=attempts,
+        last_error=last_error,
+        processor_version=version,
+        value_sha256=kept_sha256,
+        created_at=previous.created_at if previous is not None else now,
+        attempted_at=now,
+        updated_at=updated_at,
+        id=previous.id if previous is not None else None,
     )
 
 
@@ -610,7 +708,7 @@ class Database:
         with self.session_scope() as sess:
             for column in (
                 DBSourceItem.content_sha256,
-                DBItemAnnotation.content_sha256,
+                DBItemAnnotation.value_sha256,
                 DBDocument.content_sha256,
             ):
                 referenced.update(
@@ -653,7 +751,9 @@ class Database:
     def _upsert_source_items(
         self, session: Session, source: SourceData, items: list[SourceItem]
     ) -> set[str]:
-        """Returns the sha256 of the contents the updated items stopped using."""
+        """Returns the sha256 of the contents the updated items stopped using:
+        their old contents and the values of the annotations their content
+        change deleted."""
         items_by_uid = {item.uid: item for item in items}
         existing_by_uid = {
             db_item.uid: db_item
@@ -666,6 +766,7 @@ class Database:
         now = datetime.now(UTC)
         replaced: set[str] = set()
         rows: list[tuple[SourceItem, DBSourceItem]] = []
+        changed_ids: list[int] = []
         created = updated = 0
 
         for uid, item in items_by_uid.items():
@@ -693,10 +794,15 @@ class Database:
             if db_item.content_sha256 != item.content_sha256:
                 self.contents.set(item.content_sha256, item.content)
                 replaced.add(db_item.content_sha256)
+                changed_ids.append(db_item.id)
 
             if self._apply_source_item_changes(session, db_item, item, now=now):
                 updated += 1
 
+        # Read before the flush, whose update fires CONTENT_CHANGED_TRIGGER:
+        # it deletes these items' annotations.
+        with session.no_autoflush:
+            replaced |= self._value_sha256s(session, changed_ids)
         session.flush()
         for item, db_item in rows:
             item.id = db_item.id
@@ -810,29 +916,26 @@ class Database:
     ) -> list[SourceItem]:
         """Items a run writing `key` should process, oldest first.
 
-        With `requires`, only items whose run of that key finished on their
-        current content are candidates, even with `force`: the rest wait
-        instead of failing here. `force` skips eligibility, including
-        `ignored` items.
+        With `requires`, only items whose run of that key finished are
+        candidates, even with `force`: the rest wait instead of failing here.
+        `force` skips eligibility, including `ignored` items.
         """
         scope = scope or ProcessingScope()
         now = datetime.now(UTC)
 
         with self.session_scope() as sess:
-            query = sess.query(DBSourceItem, DBProcessingState).outerjoin(
-                DBProcessingState,
-                (DBProcessingState.source_item_id == DBSourceItem.id)
-                & (DBProcessingState.key == key),
+            query = sess.query(DBSourceItem, DBItemAnnotation).outerjoin(
+                DBItemAnnotation,
+                (DBItemAnnotation.source_item_id == DBSourceItem.id)
+                & (DBItemAnnotation.key == key),
             )
             if requires is not None:
                 query = self._join_finished(query, requires)
             query = self._apply_scope(query, scope).order_by(DBSourceItem.published_at)
 
             result = []
-            for db_item, state in query:
-                if not force and not self._is_eligible(
-                    state, db_item.content_sha256, version, max_retries, now
-                ):
+            for db_item, row in query:
+                if not force and not self._is_eligible(row, version, max_retries, now):
                     continue
                 result.append(db_item.to_dto())
                 if scope.limit and len(result) >= scope.limit:
@@ -841,36 +944,33 @@ class Database:
 
     @staticmethod
     def _join_finished(query: Query, key: str) -> Query:
-        """Keep the items whose run of `key` finished on their current content."""
-        upstream = aliased(DBProcessingState)
+        """Keep the items whose run of `key` finished. Rows are of the
+        current content: a content change deletes them."""
+        upstream = aliased(DBItemAnnotation)
         return query.join(
             upstream,
             (upstream.source_item_id == DBSourceItem.id)
             & (upstream.key == key)
-            & (upstream.status == ProcessingStatus.DONE)
-            & (upstream.content_sha256 == DBSourceItem.content_sha256),
+            & (upstream.status == ProcessingStatus.DONE),
         )
 
     @staticmethod
     def _is_eligible(
-        state: DBProcessingState | None,
-        content_sha256: str,
+        row: DBItemAnnotation | None,
         version: str | None,
         max_retries: int,
         now: datetime,
     ) -> bool:
-        if state is None:
-            return True  # never attempted
-        if state.content_sha256 != content_sha256:
-            return True  # the item's content changed since the last run
-        if state.status == ProcessingStatus.IGNORED:
+        if row is None:
+            return True  # never attempted, or its content changed since
+        if row.status == ProcessingStatus.IGNORED:
             return False  # permanent for this content; only force revisits it
-        if state.status == ProcessingStatus.DONE:
-            return state.processor_version != version
-        if state.attempts >= max_retries:
+        if row.status == ProcessingStatus.DONE:
+            return row.processor_version != version
+        if row.attempts >= max_retries:
             return False
-        elapsed = (now - state.updated_at).total_seconds()
-        return elapsed >= backoff_seconds(state.attempts)
+        elapsed = (now - row.attempted_at).total_seconds()
+        return elapsed >= backoff_seconds(row.attempts)
 
     def record_result(
         self,
@@ -884,112 +984,43 @@ class Database:
         version: str | None = None,
         reset_attempts: bool = False,
     ) -> None:
-        """Save a run's state and, when `done`, its annotation `key` with
-        `value`, in one transaction.
+        """Save a run's result for the item's `key`: its state and, when
+        `done`, its `value`, which is stored first. `reset_attempts` starts
+        the retry count afresh (forced runs)."""
+        value_sha256 = None
+        if status == ProcessingStatus.DONE:
+            value_sha256, encoded = _encode_value(value)
+            self.contents.set(value_sha256, encoded)
 
-        The state records `item.content_sha256`, the content the run used.
-        `reset_attempts` starts the retry count afresh (forced runs).
-        """
-        replaced: set[str] = set()
         with self.session_scope() as sess:
-            db_item = self._get_item_row(sess, item)
-            now = datetime.now(UTC)
-            if status == ProcessingStatus.DONE:
-                replaced = self._save_annotation(
-                    sess, db_item.id, processor, key, value, now
-                )
-            self._save_state(
-                sess,
-                db_item,
-                processor,
-                key,
-                status,
-                error,
-                version,
-                reset_attempts,
-                now,
+            item_id = self._get_item_row(sess, item).id
+            row = (
+                sess.query(DBItemAnnotation)
+                .filter_by(source_item_id=item_id, key=key)
+                .one_or_none()
             )
-        self._release_contents(replaced)
-
-    @staticmethod
-    def _save_state(
-        session: Session,
-        db_item: DBSourceItem,
-        processor: str,
-        key: str,
-        status: ProcessingStatus,
-        error: str | None,
-        version: str | None,
-        reset_attempts: bool,
-        now: datetime,
-    ) -> None:
-        state = (
-            session.query(DBProcessingState)
-            .filter_by(source_item_id=db_item.id, key=key)
-            .one_or_none()
-        )
-        if state is None:
-            state = DBProcessingState(
-                source_item_id=db_item.id,
+            previous = row.to_dto() if row is not None else None
+            annotation = next_annotation(
+                previous,
+                item_id=item_id,
+                processor=processor,
                 key=key,
-                attempts=0,
-                created_at=now,
+                status=status,
+                value_sha256=value_sha256,
+                error=error,
+                version=version,
+                reset_attempts=reset_attempts,
+                now=datetime.now(UTC),
             )
-            session.add(state)
-        elif reset_attempts or state.content_sha256 != db_item.content_sha256:
-            state.attempts = 0
+            if row is None:
+                sess.add(DBItemAnnotation.from_dto(annotation))
+            else:
+                row.update(annotation)
 
-        state.processor = processor
-        state.status = status
-        state.content_sha256 = db_item.content_sha256
-        state.processor_version = version
-        state.updated_at = now
-        if status == ProcessingStatus.ERROR:
-            state.attempts += 1
-            state.last_error = error
-        else:
-            state.attempts = 0
-            state.last_error = None
+        if previous is not None and previous.value_sha256 is not None:
+            self._release_contents({previous.value_sha256} - {value_sha256})
 
     # --- Annotations -------------------------------------------------------
-
-    def _save_annotation(
-        self,
-        session: Session,
-        source_item_id: int,
-        processor: str,
-        key: str,
-        value: Any,
-        now: datetime,
-    ) -> set[str]:
-        """Store the value, then upsert its row; returns the replaced content."""
-        sha256, encoded = _encode_value(value)
-        self.contents.set(sha256, encoded)
-
-        row = (
-            session.query(DBItemAnnotation)
-            .filter_by(source_item_id=source_item_id, key=key)
-            .one_or_none()
-        )
-        if row is None:
-            session.add(
-                DBItemAnnotation(
-                    source_item_id=source_item_id,
-                    processor=processor,
-                    key=key,
-                    content_sha256=sha256,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-            return set()
-        row.processor = processor
-        if row.content_sha256 == sha256:
-            return set()
-        replaced = {row.content_sha256}
-        row.content_sha256 = sha256
-        row.updated_at = now
-        return replaced
 
     def _load_value(self, sha256: str) -> Any:
         return load_json_compatible(self.contents.get(sha256).decode())
@@ -1001,14 +1032,12 @@ class Database:
         Nothing found is `{}`."""
         with self.session_scope() as sess:
             query = (
-                sess.query(
-                    DBItemAnnotation.key,
-                    DBItemAnnotation.content_sha256,
-                )
+                sess.query(DBItemAnnotation.key, DBItemAnnotation.value_sha256)
                 .join(DBSourceItem, DBItemAnnotation.source_item_id == DBSourceItem.id)
                 .filter(
                     DBSourceItem.source_id == item.source.id,
                     DBSourceItem.uid == item.uid,
+                    DBItemAnnotation.value_sha256.is_not(None),
                 )
             )
             if key is not None:
@@ -1033,7 +1062,10 @@ class Database:
                     DBItemAnnotation.processor,
                     DBItemAnnotation.key,
                 )
-                .filter(DBItemAnnotation.source_item_id.in_(item_ids))
+                .filter(
+                    DBItemAnnotation.source_item_id.in_(item_ids),
+                    DBItemAnnotation.value_sha256.is_not(None),
+                )
                 .order_by(DBItemAnnotation.processor, DBItemAnnotation.key)
                 .all()
             )
@@ -1053,13 +1085,15 @@ class Database:
     ) -> list[Annotation]:
         """Annotations of the items in scope, with their values, by an
         `ANNOTATION_SORTS` key. Every filter combines; `limit` counts
-        annotations."""
+        annotations. Runs that never finished have no value and are absent."""
         scope = scope or ProcessingScope()
         with self.session_scope() as sess:
             query = sess.query(DBItemAnnotation).join(
                 DBSourceItem, DBItemAnnotation.source_item_id == DBSourceItem.id
             )
-            query = self._apply_scope(query, scope)
+            query = self._apply_scope(query, scope).filter(
+                DBItemAnnotation.value_sha256.is_not(None)
+            )
             if processor is not None:
                 query = query.filter(DBItemAnnotation.processor == processor)
             if key is not None:
@@ -1069,28 +1103,11 @@ class Database:
             query = query.order_by(*ANNOTATION_SORTS[sort], DBItemAnnotation.id)
             if scope.limit:
                 query = query.limit(scope.limit)
-            rows = [
-                (
-                    row.id,
-                    row.source_item_id,
-                    row.processor,
-                    row.key,
-                    row.updated_at,
-                    row.content_sha256,
-                )
-                for row in query
-            ]
-        return [
-            Annotation(
-                id=annotation_id,
-                item_id=item_id,
-                processor=row_processor,
-                key=row_key,
-                updated_at=updated_at,
-                value=self._load_value(sha256),
-            )
-            for annotation_id, item_id, row_processor, row_key, updated_at, sha256 in rows
-        ]
+            annotations = [row.to_dto() for row in query]
+        for annotation in annotations:
+            assert annotation.value_sha256 is not None
+            annotation.value = self._load_value(annotation.value_sha256)
+        return annotations
 
     def get_annotation_values(
         self, items: Iterable[SourceItem], *, key: str
@@ -1107,7 +1124,7 @@ class Database:
                 sess.query(
                     DBSourceItem.source_id,
                     DBSourceItem.uid,
-                    DBItemAnnotation.content_sha256,
+                    DBItemAnnotation.value_sha256,
                 )
                 .join(
                     DBItemAnnotation, DBItemAnnotation.source_item_id == DBSourceItem.id
@@ -1115,6 +1132,7 @@ class Database:
                 .filter(
                     tuple_(DBSourceItem.source_id, DBSourceItem.uid).in_(keys),
                     DBItemAnnotation.key == key,
+                    DBItemAnnotation.value_sha256.is_not(None),
                 )
                 .all()
             )
@@ -1124,8 +1142,8 @@ class Database:
         }
 
     def delete_annotations(self, annotation_ids: Iterable[int]) -> int:
-        """Delete the annotations with these ids, each with the processing
-        state of its (item, key), so its run finds the item pending again.
+        """Delete the annotations with these ids, with the state of their
+        runs, so each run finds its item pending again with fresh attempts.
 
         Returns the number of annotations deleted.
         """
@@ -1133,26 +1151,18 @@ class Database:
         if not annotation_ids:
             return 0
         with self.session_scope() as sess:
-            annotations = sess.query(DBItemAnnotation).filter(
-                DBItemAnnotation.id.in_(annotation_ids)
+            query = sess.query(DBItemAnnotation).filter(
+                DBItemAnnotation.id.in_(annotation_ids),
+                DBItemAnnotation.value_sha256.is_not(None),
             )
-            rows = [
-                (row.source_item_id, row.key, row.content_sha256) for row in annotations
-            ]
-            deleted = annotations.delete(synchronize_session=False)
-            sess.query(DBProcessingState).filter(
-                tuple_(DBProcessingState.source_item_id, DBProcessingState.key).in_(
-                    [(item_id, key) for item_id, key, _ in rows]
-                )
-            ).delete(synchronize_session=False)
-
-        self._release_contents({sha256 for _, _, sha256 in rows})
+            released = {row.value_sha256 for row in query if row.value_sha256}
+            deleted = query.delete(synchronize_session=False)
+        self._release_contents(released)
         return deleted
 
     def delete_items(self, item_ids: Iterable[int]) -> int:
-        """Delete items with everything that references them (processing
-        state, annotations) and release their contents; return how many were
-        deleted. Documents built from them stay."""
+        """Delete items with their annotations and release their contents;
+        return how many were deleted. Documents built from them stay."""
         item_ids = list(item_ids)
         if not item_ids:
             return 0
@@ -1163,13 +1173,8 @@ class Database:
                     DBSourceItem.id.in_(item_ids)
                 )
             }
-            released |= {
-                sha256
-                for (sha256,) in sess.query(DBItemAnnotation.content_sha256).filter(
-                    DBItemAnnotation.source_item_id.in_(item_ids)
-                )
-            }
-            # The foreign keys cascade to state and annotations.
+            released |= self._value_sha256s(sess, item_ids)
+            # The foreign key cascades to the annotations.
             deleted = (
                 sess.query(DBSourceItem)
                 .filter(DBSourceItem.id.in_(item_ids))
@@ -1177,6 +1182,19 @@ class Database:
             )
         self._release_contents(released)
         return deleted
+
+    @staticmethod
+    def _value_sha256s(session: Session, item_ids: list[int]) -> set[str]:
+        """The stored values of these items' annotations."""
+        if not item_ids:
+            return set()
+        return {
+            sha256
+            for (sha256,) in session.query(DBItemAnnotation.value_sha256).filter(
+                DBItemAnnotation.source_item_id.in_(item_ids),
+                DBItemAnnotation.value_sha256.is_not(None),
+            )
+        }
 
     # --- Applet runs -------------------------------------------------------
 

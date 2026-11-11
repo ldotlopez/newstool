@@ -571,7 +571,15 @@ ITEM = SourceItem(
 
 
 def annotation(annotation_id: int, key: str, value: object) -> Annotation:
-    return Annotation(annotation_id, 7, "tagger", key, NOW, value)
+    return Annotation(
+        item_id=7,
+        processor="tagger",
+        key=key,
+        status="done",
+        value=value,
+        updated_at=NOW,
+        id=annotation_id,
+    )
 
 
 class LogLevelTests(unittest.TestCase):
@@ -763,8 +771,15 @@ class InspectCommandTests(unittest.TestCase):
                     "item_id": 7,
                     "processor": "tagger",
                     "key": "tags",
-                    "updated_at": "2026-10-18T12:00:00+00:00",
+                    "status": "done",
+                    "attempts": 0,
+                    "last_error": None,
+                    "processor_version": None,
+                    "value_sha256": None,
                     "value": ["a", "b"],
+                    "created_at": None,
+                    "attempted_at": None,
+                    "updated_at": "2026-10-18T12:00:00+00:00",
                 }
             ],
         )

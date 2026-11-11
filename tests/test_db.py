@@ -20,13 +20,15 @@ from newstool.db import (
     Database,
     DBDelivery,
     DBDocument,
-    DBProcessingState,
+    DBItemAnnotation,
     DBSource,
     DBSourceItem,
     DeliveryStatus,
     ProcessingStatus,
+    next_annotation,
 )
 from newstool.models import (
+    Annotation,
     AppletResult,
     Delivery,
     Document,
@@ -391,7 +393,7 @@ class ProcessingTests(DatabaseTestCase):
 
     def attempts(self, key: str) -> int:
         with self.db.session_scope() as sess:
-            return sess.query(DBProcessingState).filter_by(key=key).one().attempts
+            return sess.query(DBItemAnnotation).filter_by(key=key).one().attempts
 
     def test_done_item_is_eligible_again_after_its_content_changes(self):
         self.db.record_result(
@@ -584,7 +586,7 @@ class AnnotationTests(DatabaseTestCase):
             ],
             ["a1"],
         )
-        self.assertEqual(self.count(DBProcessingState), 1)
+        self.assertEqual(self.count(DBItemAnnotation), 1)
         self.assertEqual(len(self.stored_contents()), 2)  # item content + tags
 
     def test_delete_keeps_the_same_key_on_other_items(self):
@@ -599,7 +601,173 @@ class AnnotationTests(DatabaseTestCase):
 
         (kept,) = self.db.find_annotations()
         self.assertNotEqual(kept.item_id, first.item_id)
-        self.assertEqual(self.count(DBProcessingState), 1)
+        self.assertEqual(self.count(DBItemAnnotation), 1)
+
+    def test_runs_without_a_value_are_not_annotations(self):
+        self.db.record_result(
+            self.item, "summarize", "summary", ProcessingStatus.ERROR, error="down"
+        )
+
+        self.assertEqual(self.db.find_annotations(), [])
+        self.assertEqual(self.db.get_annotation_keys([self.item.id]), {})
+        self.assertEqual(self.db.get_annotation_values([self.item], key="summary"), {})
+
+    def test_a_failed_run_after_a_finished_one_keeps_the_value(self):
+        self.annotate(self.item, "summarize", "summary", "S")
+
+        self.db.record_result(
+            self.item,
+            "summarize",
+            "summary",
+            ProcessingStatus.ERROR,
+            error="down",
+            reset_attempts=True,
+        )
+
+        (annotation,) = self.db.find_annotations()
+        self.assertEqual(
+            (annotation.status, annotation.attempts, annotation.value),
+            (ProcessingStatus.ERROR, 1, "S"),
+        )
+
+    def test_a_finished_run_needs_a_value_in_the_schema(self):
+        with self.assertRaises(IntegrityError), self.db.session_scope() as sess:
+            sess.execute(
+                text(
+                    "INSERT INTO item_annotations (source_item_id, processor, key,"
+                    " status, attempts, created_at, attempted_at)"
+                    " VALUES (:item, 'p', 'k', 'done', 0, :now, :now)"
+                ),
+                {"item": self.item.id, "now": "2026-11-11 00:00:00"},
+            )
+
+
+class ContentChangeTests(DatabaseTestCase):
+    """A content change deletes the item's annotations (decision 0018)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = make_source()
+        self.db.upsert_source_items([make_item(self.source, uid="a1", content=b"v1")])
+        (self.item,) = self.db.get_items()
+        for key, value in (("summary", "S"), ("tags", ["a"])):
+            self.db.record_result(
+                self.item, "p", key, ProcessingStatus.DONE, value=value
+            )
+        self.db.record_result(
+            self.item, "p", "broken", ProcessingStatus.ERROR, error="down"
+        )
+
+    def test_content_change_deletes_annotations_and_releases_their_values(self):
+        self.db.upsert_source_items([make_item(self.source, uid="a1", content=b"v2")])
+
+        self.assertEqual(self.count(DBItemAnnotation), 0)
+        self.assertEqual(self.stored_contents(), {self.get_item("a1").content_sha256})
+        self.assertEqual(
+            [
+                i.uid
+                for i in self.db.get_unprocessed_items(
+                    "broken", version=None, max_retries=1
+                )
+            ],
+            ["a1"],
+        )
+
+    def test_other_changes_keep_annotations(self):
+        later = datetime(2030, 1, 1, tzinfo=UTC)
+        self.db.upsert_source_items(
+            [
+                make_item(
+                    self.source,
+                    uid="a1",
+                    content=b"v1",
+                    title="New title",
+                    data={"section": "x"},
+                    modified_at=later,
+                )
+            ]
+        )
+        self.db.advance_modified_times(self.source.id, {"a1": later})
+
+        self.assertEqual(self.get_item("a1").title, "New title")
+        self.assertEqual(self.count(DBItemAnnotation), 3)
+        self.assertEqual(
+            self.db.get_annotations(self.item), {"summary": "S", "tags": ["a"]}
+        )
+
+    def test_the_trigger_applies_to_any_write(self):
+        with self.db.session_scope() as sess:
+            sess.execute(
+                text("UPDATE source_items SET content_sha256 = :sha"),
+                {"sha": "0" * 64},
+            )
+
+        self.assertEqual(self.count(DBItemAnnotation), 0)
+
+    def test_a_shared_value_is_kept(self):
+        other = make_item(self.source, uid="a2", content=b"other")
+        self.db.upsert_source_items([other])
+        self.db.record_result(other, "p", "summary", ProcessingStatus.DONE, value="S")
+
+        self.db.upsert_source_items([make_item(self.source, uid="a1", content=b"v2")])
+
+        self.assertEqual(self.db.get_annotations(other), {"summary": "S"})
+
+
+class NextAnnotationTests(unittest.TestCase):
+    NOW = datetime(2026, 11, 11, tzinfo=UTC)
+
+    def result(self, previous, status, **kwargs) -> Annotation:
+        kwargs.setdefault("value_sha256", "1" * 64 if status == "done" else None)
+        return next_annotation(
+            previous,
+            item_id=1,
+            processor="p",
+            key="k",
+            status=ProcessingStatus(status),
+            error=kwargs.pop("error", None),
+            version=kwargs.pop("version", None),
+            reset_attempts=kwargs.pop("reset_attempts", False),
+            now=kwargs.pop("now", self.NOW),
+            **kwargs,
+        )
+
+    def test_errors_count_attempts_and_reset_starts_afresh(self):
+        first = self.result(None, "error", error="e1")
+        second = self.result(first, "error", error="e2")
+        forced = self.result(second, "error", reset_attempts=True)
+
+        self.assertEqual((first.attempts, second.attempts), (1, 2))
+        self.assertEqual(second.last_error, "e2")
+        self.assertEqual(forced.attempts, 1)
+
+    def test_done_and_ignored_clear_attempts(self):
+        failed = self.result(None, "error", error="e")
+
+        self.assertEqual(self.result(failed, "done").attempts, 0)
+        self.assertIsNone(self.result(failed, "ignored").last_error)
+
+    def test_value_time_moves_only_when_the_value_changes(self):
+        later = self.NOW + timedelta(days=1)
+        done = self.result(None, "done")
+        same = self.result(done, "done", now=later)
+        changed = self.result(same, "done", value_sha256="2" * 64, now=later)
+
+        self.assertEqual(
+            (same.updated_at, same.attempted_at, same.created_at),
+            (self.NOW, later, self.NOW),
+        )
+        self.assertEqual(changed.updated_at, later)
+
+    def test_other_results_keep_the_value(self):
+        done = self.result(None, "done")
+
+        self.assertEqual(self.result(done, "ignored").value_sha256, "1" * 64)
+        self.assertEqual(self.result(done, "error").value_sha256, "1" * 64)
+
+    def test_done_without_a_value_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.result(None, "done", value_sha256=None)
 
 
 class DocumentTests(DatabaseTestCase):
@@ -758,7 +926,7 @@ class DeleteTests(DatabaseTestCase):
         self.assertEqual(self.db.delete_items([]), 0)
 
         self.assertEqual([item.uid for item in self.db.get_items()], ["a1"])
-        self.assertEqual(self.count(DBProcessingState), 1)
+        self.assertEqual(self.count(DBItemAnnotation), 1)
         self.assertEqual(len(self.stored_contents()), 2)  # a1 content + summary
 
 
