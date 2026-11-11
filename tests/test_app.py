@@ -975,7 +975,7 @@ class ClassRegisterTests(unittest.TestCase):
 
         self.assertEqual(
             sorted(register.classes(ProcessorType)),
-            ["embed", "markdownify", "summarize", "tagger", "truncate"],
+            ["classify", "embed", "markdownify", "summarize", "tagger", "truncate"],
         )
 
     def test_entry_points_must_return_classes(self) -> None:
