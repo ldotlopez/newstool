@@ -12,7 +12,7 @@ import pydantic
 from newstool.db import Database, ProcessingStatus
 from newstool.llms import LLMType, LLMUnavailableError
 from newstool.models import SourceData, SourceItem
-from newstool.plugins import Services, embed, ollama, summarize, tagger
+from newstool.plugins import Services, classify, embed, ollama, summarize, tagger
 from newstool.processors import Processor, ProcessorType
 
 SOURCE = SourceData(id="s", name="S", url="https://s.test/", provider="plaza")
@@ -240,6 +240,29 @@ class TaggerTests(ProcessorTestCase):
 
         self.assertIn("tagged the article with: bce.", llm.calls[0][1])
         self.assertEqual(tags, ["Pleno", "bce"])
+
+
+class ClassifyTests(ProcessorTestCase):
+    def test_keeps_only_the_configured_labels(self) -> None:
+        llm = StubLLM('{"labels": ["Vivienda", "astrology", "cultura"]}')
+        processor = self.build(
+            classify.ClassifyProcessor,
+            llm,
+            labels=["cultura", "vivienda", "deportes"],
+            question="Which topics?",
+        )
+
+        self.assertEqual(self.annotation(processor, "topics"), ["cultura", "vivienda"])
+        prompt = llm.calls[0][1]
+        self.assertTrue(prompt.startswith("Which topics?"))
+        self.assertIn("Labels: cultura, vivienda, deportes", prompt)
+        self.assertIn("tagged the article with: bce.", prompt)
+        self.assertTrue(prompt.endswith("# T\n\nBody"))
+
+    def test_an_invalid_answer_fails_the_item(self) -> None:
+        processor = self.build(classify.ClassifyProcessor, StubLLM("[]"), labels=["a"])
+
+        self.assertEqual(processor.process(key="topics", force=True).failed, 1)
 
 
 class EmbedTests(ProcessorTestCase):
