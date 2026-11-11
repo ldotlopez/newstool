@@ -379,6 +379,127 @@ Risks:
 - An existing `telegram:` section with `interval` at the top level is now
   rejected: it moves to the `telegram:` subsection (`config.example.yaml`).
 
+## Story digests across sources (replaces `digest`)
+
+Agreed 2026-11-11. One `digest` instance writes one digest of the stories
+its sources covered over whole days: items about the same story merged,
+topics dropped or weighted, written by an LLM from the items' summaries.
+It replaces today's per-source `digest`; one instance per source gives the
+old behaviour. **No decision record until the design is tested** on the two
+reference instances; write it after step 7.
+
+Reference instances, the yardstick for every step:
+
+- `castello-weekly`: local media (Spanish and Valencian), 7 days, sports and
+  crime dropped, housing and urbanism weighted up, neutral editor's voice.
+- `spain-abroad`: foreign media (EN/FR/DE) on Spain, 1 day, only items about
+  Spain, outlets weighted, a reporter's voice that names each outlet,
+  written in Spanish.
+
+Design:
+
+- **Two annotation roles.** `tags` (free entities) find stories; `topics`
+  (a closed label list) filter and rank. Relevance ("about Spain") is one
+  more closed label set, but the first filter is the source: point foreign
+  sources at Spain-section feeds.
+- **One working language.** Summaries in the output language
+  (`summary/es`) are what gets embedded, grouped and written from, so
+  ES/CA and EN/FR/DE items about one story meet.
+- **Groups are computed, not stored.** A group is a property of a window
+  and parameters, not of an item; per-item annotations would be rewritten
+  on every new member and fix one answer. The clustering becomes a pure
+  module the applets call.
+- **Plan, then write.** The selection (filter, group, rank, select) is
+  deterministic and emitted as a `plan` JSON document, so it can be tuned
+  without LLM cost (`write: false`); the LLM only writes the chosen
+  stories.
+- **Ranking is code**: topic weights, source weights, how many distinct
+  sources covered the story, its size and recency.
+
+Steps (each usable on its own, tests with each; docs with the code):
+
+- [ ] **1. `classify` processor** (`plugins/classify.py`): options `labels`
+  (required), `question` (default: the article's topics), `multiple`
+  (default true; false: exactly one label), `input` (default `markdown`),
+  `model`. Key from config (`topics`, `about/spain`); `required_key` from
+  `input`. The prompt lists the labels; the response is parsed as a JSON
+  list and must be a subset of `labels` (one element with `multiple:
+  false`), otherwise `PluginFailure`, retried by `max_retries`. The `LLM`
+  protocol keeps `json_mode` only (no schema parameter).
+  Tests: fake LLM; valid, unknown-label, empty and multi-on-single answers.
+- [ ] **2. Any annotation as embedding input.** `embed.input` becomes any
+  annotation key (`tags` still embedded as `tags_text`, a string as is,
+  anything else rejected), key `<input>_embedding` as today
+  (`summary/es_embedding`). The `embeddings` applet's `embedding` option the
+  same, its `requirements` from it. Existing configs keep working.
+- [ ] **3. `newstool/clustering.py`.** First characterization tests for the
+  three grouping applets (none exist): fixture items, tags and embeddings,
+  the groups each emits. Then move `ScoredItem`, the scoring, `UnionFind`,
+  `single_link_groups`, `average_link_cluster` and `cosine_similarity` into
+  `clustering.py`, returning typed frozen `Story` groups (members, pair
+  scores, shared tags) instead of dicts; `plugins/grouping.py` keeps the
+  applets and turns `Story` into today's JSON. The tests pass unchanged.
+- [ ] **4. `digest` plan stage** (rewrite of `plugins/digest.py`). Options:
+  `sources`; `span_days` (default 7: whole local days ending at today's
+  midnight, system time zone like `Schedule`; not `days`, which already
+  names the schedule's weekdays); `input` (default `summary`);
+  `filters` (list of `{key, include | exclude}` over any list or string
+  annotation; an item without the key is dropped by `include`, kept by
+  `exclude`); `grouping` (`algorithm`: `singlelink | avglink | embeddings`,
+  with that algorithm's options; `tau` default `null`); `topics` (the
+  annotation key ranked, default `topics`), `topic_weights`,
+  `source_weights`, `coverage_weight`, `size_weight`, `recency_weight`;
+  `max_stories` (default 8); `write` (default true).
+  `requirements(options)` lists `input`, `tags`, the filter keys, `topics`
+  when weighted and the embedding key. The core is pure functions on typed
+  frozen models: `select_items` → `filter_items` (returns kept and dropped
+  with the rule) → `clustering` → `rank` → `select`, giving a `DigestPlan`.
+  Output `plan` (`application/json`): window, options, the chosen stories
+  with scores and score parts, members (source, title, link), and what was
+  dropped and why. Key `<from>_<to>` (YYYY-MM-DD, instance-scoped). With
+  `write: false` only `plan` is emitted. Tests: each stage on fixture
+  items, the window at day boundaries, `requirements`.
+- [ ] **5. `digest` write stage.** Per chosen story, one LLM call with its
+  members' `input` text, source names and links: JSON `{headline, body}`.
+  Then one call for the opening paragraph from the headlines. Options
+  `language` (default: the items'), `story_prompt`, `intro_prompt`,
+  `context_length`, `model`. Output `digest` (`text/markdown`) rendered
+  from the structured entries: `# <instance title>: <from> – <to>`, the
+  opening, a `##` per story with its body and links. An empty plan emits
+  only `plan`. Tests: fake LLM, rendering, an invalid story answer fails the
+  run.
+- [ ] **6. HTML page.** Optional output `page` (`text/html`), rendered from
+  the same entries with `html.escape` (no Markdown library), a minimal
+  inline stylesheet; routed to a `file` sink to publish. Tests: rendering
+  and escaping.
+- [ ] **7. Novelty** (for `spain-abroad`). Option `novelty` (default off):
+  read the instance's earlier `plan` documents (`reader.documents(app=
+  run.app, output="plan")`) over a `novelty_days` window; a story whose
+  members all appeared there is dropped, one with new members is marked an
+  update and scored by `update_weight`. Tests with stored plans.
+- [ ] **8. Configs and docs**: `config.example.yaml` (the two reference
+  instances, `classify` runs, `summary/es`, Spain-section feeds), README
+  (applet table and options, `classify`, `embed.input`), SPECIFICATION,
+  ARCHITECTURE (`clustering.py`, `digest`). The user's `config.yaml`
+  (git-ignored) needs the same edit by hand. Then the decision record.
+
+Tuning loop between steps 4 and 5: run with `write: false`, read the plan
+with `inspect documents`, `apps reset --app <id> --with-documents` to re-run the
+same window.
+
+Risks:
+
+- The old options (`lookback`, `max_items`, `max_article_chars`) are
+  rejected after step 4: `weekly-digest` in `config.yaml` must change in the
+  same deploy.
+- The key changes from `<source>/<since>_<until>` to `<from>_<to>`: the
+  first run over a period already sent emits it again. Deploy after a
+  Monday run, or reset the instance. Stored documents stay; no migration.
+- Cost: `classify` and `summary/es` add LLM calls per item; foreign sources
+  should come from section feeds so few irrelevant items are processed.
+- `classify` quality on local models with long label lists: keep lists
+  short, check with `inspect annotations` before tuning the ranking.
+
 ---
 
 ## Done
