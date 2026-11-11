@@ -430,16 +430,33 @@ code and one test per piece; validations, corner cases and polish go to
   answer is a JSON list, labels outside `labels` are dropped. Test: fake
   LLM, an unknown label left out.
 - [ ] **3. `embed.input` any annotation key**, a list joined as
-  `tags_text`, anything else as text; key `<input>_embedding`
-  (`summary/es_embedding`). The `embeddings` applet's `embedding` the same.
-  Test: a string annotation embedded.
-- [ ] **4. `digest` rewrite**, one document pair per run over the last
-  `span_days` whole local days (key `<from>_<to>`, YYYY-MM-DD). It reuses
-  `plugins/grouping.py` as is (`tagged_items`, `jaccard`, `time_decay`,
-  `cosine_similarity`, `single_link_groups`; member refs mapped back to
-  items). Options: `sources`, `span_days` (7), `input` (`summary`),
-  `include` and `exclude` (`{annotation key: [labels]}`), `min_score`,
-  `tau` (`null`), `embedding` (annotation key or `null`: tags only),
+  `tags_text`, anything else as text. The key inserts `embedding` after
+  the input's first part: `tags/embedding`, `markdown/embedding`,
+  `summary/embedding/es` (was `<input>_embedding`). One core function,
+  `embedding_key(input)` in `processors.py`, used by `embed` and its
+  readers (bundles never import each other). The `embeddings` applet's
+  `embedding` option takes any key too. No stored embeddings in
+  production (`embed` is commented out in `config.yaml`): no migration.
+  Tests: a string annotation embedded; the `_embedding` keys in
+  `test_llm`, `test_delete_cli`, `test_db` and `test_applets` renamed.
+- [ ] **4. `digest` rewrite absorbing `plugins/grouping.py`**, which
+  nothing uses (its applets are commented out in `config.yaml`). One
+  document pair per run over the last `span_days` whole local days (key
+  `<from>_<to>`, YYYY-MM-DD). The grouping code moves into
+  `plugins/digest.py` as functions: `tagged_items`, the scoring
+  (`jaccard`, `time_decay`, `cosine_similarity`), `single_link_groups`
+  and `average_link_cluster`, all three algorithms selectable with
+  `algorithm: singlelink | avglink | embeddings` (default `singlelink`);
+  groups map back to items. `plugins/grouping.py` and its three applet
+  types are deleted. Its tests in `tests/test_applets.py` (chaining
+  through a bridge item, variants without shared tags, the configured
+  embedding, the requirements) move to `tests/test_digest.py` against the
+  digest's functions; the registered-names test and the two
+  `test_app.py` cases naming `singlelink` switch to `digest`.
+  Options: `sources`, `span_days` (7), `input` (`summary`),
+  `include` and `exclude` (`{annotation key: [labels]}`), `algorithm`,
+  `min_score`, `tau` (`null`), `embedding` (the embedded annotation key,
+  for `embeddings`; default `tags`),
   `embedding_weight`, `topic_weights` (over `topics`), `source_weights`,
   `max_stories` (8), `write` (true), `story_prompt`, `intro_prompt`,
   `model`. Score: distinct sources + the sum of the story's topic weights
@@ -452,9 +469,13 @@ code and one test per piece; validations, corner cases and polish go to
   story merged into one, an excluded topic left out, `write: false` emits
   only `plan`.
 - [ ] **5. Configs and docs**: the two reference instances, the `classify`
-  runs and `summary/es` in `config.example.yaml`; README (the `digest`
-  row and options, `classify`, `embed.input`), ARCHITECTURE's `digest`
-  paragraph. `config.yaml` (git-ignored) by hand.
+  runs and `summary/es` in `config.example.yaml`, the commented `avglink`
+  instance and the `_embedding` comments replaced; README (the `digest`
+  row and options, `classify`, `embed.input` and its keys, the three
+  grouping rows and their options removed), ARCHITECTURE (the `digest`
+  paragraph, the `grouping` bundle, applet and key references).
+  `config.yaml` (git-ignored) by hand, its commented `embed` and grouping
+  lines included.
 
 Tuning loop: run with `write: false`, read the plan with `inspect
 documents`, `apps reset --app <id> --with-documents` to re-run the same
@@ -470,6 +491,8 @@ Risks:
   Monday run, or reset the instance. Stored documents stay; no migration.
 - Cost: `classify` and `summary/es` add LLM calls per item; foreign sources
   come from Spain-section feeds so few irrelevant items are processed.
+- A config naming `singlelink`, `avglink` or `embeddings` fails at startup
+  after step 4 (none does today).
 
 ---
 
@@ -747,10 +770,8 @@ Risks:
     `max_retries`) instead of being dropped; `multiple: false` (exactly one
     label); an `input` option; label lists checked against the digest's
     `topic_weights` and filters at startup.
-  - `newstool/clustering.py`: characterization tests for the three
-    grouping applets first (none exist), then the clustering as a pure
-    module returning typed frozen `Story` groups; `grouping` and `digest`
-    call it; `avglink` selectable in `digest` (`algorithm`).
+  - The absorbed clustering returns typed frozen `Story` groups instead of
+    the old payload dicts.
   - Filters as rules (`[{key, include | exclude}]`) with a defined rule for
     items missing the key; the plan lists what was dropped and why.
   - Ranking: weights for coverage, size and recency; the score's parts in
