@@ -743,14 +743,14 @@ apps:
                 r"apps\.0: itemfeed reads 'summary', and no process run writes it",
             ),
             (
-                "apps: [{id: a, app: singlelink}]\n",
+                "apps: [{id: a, app: digest}]\n",
                 "",
-                r"apps\.0: singlelink reads 'tags', and no process run",
+                r"apps\.0: digest reads 'summary', and no process run",
             ),
             (
                 (
                     "processors: [{processor: markdownify, skip_default: true}]\n"
-                    "apps: [{id: a, app: digest, options: {sources: [juntas]}}]\n"
+                    "apps: [{id: a, app: digest, options: {sources: [juntas], input: markdown}}]\n"
                 ),
                 "workflows:\n  - {name: w, sources: [mediterraneo], process: [markdownify]}\n",
                 r"apps\.0: digest reads 'markdown'",
@@ -947,8 +947,8 @@ processors:
                 r"sources\.a: no plugin provides the provider 'nope'",
             ),
             (
-                "sources:\n  - {id: a, name: A, url: 'https://a.test/', provider: singlelink}\n",
-                r"sources\.a: no plugin provides the provider 'singlelink'",
+                "sources:\n  - {id: a, name: A, url: 'https://a.test/', provider: digest}\n",
+                r"sources\.a: no plugin provides the provider 'digest'",
             ),
             (
                 "processors: [nope]\n",

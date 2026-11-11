@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 import tempfile
 import unittest
@@ -29,7 +28,7 @@ from newstool.models import (
     SourceData,
     SourceItem,
 )
-from newstool.plugins import Services, feed, grouping, itemfeed
+from newstool.plugins import Services, digest, feed, itemfeed
 
 SOURCE = SourceData(id="s", name="S", url="https://s.test/", provider="plaza")
 NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
@@ -354,114 +353,16 @@ class ItemFeedTests(AppletTestCase):
         )
 
 
-class GroupingTests(AppletTestCase):
-    def tag(self, item: SourceItem, tags: list[str]) -> None:
-        self.annotate(item, "tags", tags)
-
-    def groups(self, applet_class) -> list[list[str]]:
-        options = grouping.GroupingOptions(tau=None, lookback="10000d")
-        result = applet_class(options, self.services).run(NOW, NEVER_RUN, self.reader)
-        (document,) = result.documents
-        return [
-            sorted(member["uid"] for member in group["members"])
-            for group in json.loads(document.content)["groups"]
-        ]
-
-    def test_groups_by_tag_overlap_and_keeps_singletons(self) -> None:
-        d1, d2, d3, _untagged = self.add_items(1, 2, 3, 4)
-        self.tag(d1, ["fiestas", "grau"])
-        self.tag(d2, ["fiestas", "grau"])
-        self.tag(d3, ["pleno"])
-        # The fourth item has no tags: it can't be grouped and is left out.
-
-        for applet_class in (grouping.SingleLinkApplet, grouping.AverageLinkApplet):
-            self.assertEqual(
-                self.groups(applet_class), [["d1", "d2"], ["d3"]], applet_class
-            )
-
-    def test_avglink_does_not_chain_through_a_bridge_item(self) -> None:
-        d1, d2, d3 = self.add_items(1, 2, 3)
-        self.tag(d1, ["a", "b"])
-        self.tag(d2, ["b", "c"])  # bridges d1 and d3
-        self.tag(d3, ["c", "d"])
-
-        self.assertEqual(self.groups(grouping.SingleLinkApplet), [["d1", "d2", "d3"]])
-        self.assertEqual(len(self.groups(grouping.AverageLinkApplet)), 2)
-
-    def test_nothing_to_group_emits_nothing(self) -> None:
-        self.add_items(1)
-        applet = grouping.SingleLinkApplet(grouping.GroupingOptions(), self.services)
-
-        self.assertEqual(applet.run(NOW, NEVER_RUN, self.reader).documents, ())
-
-
-class EmbeddingGroupingTests(AppletTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self.d1, self.d2, self.d3, self.d4 = self.add_items(1, 2, 3, 4)
-        # No tag overlap at all: only the embeddings can relate them.
-        for item, tags, embedding in (
-            (self.d1, ["BCE"], [1.0, 0.0]),
-            (self.d2, ["Banco Central Europeo"], [0.9, 0.1]),
-            (self.d3, ["pleno"], [0.0, 1.0]),
-            (self.d4, ["BCE"], None),  # tagged, but not embedded yet
-        ):
-            self.annotate(item, "tags", tags)
-            if embedding is not None:
-                self.annotate(item, "tags/embedding", embedding)
-
-    def groups_of(self, **options) -> tuple[list[list[str]], dict]:
-        cfg = grouping.EmbeddingsOptions(tau=None, lookback="10000d", **options)
-        result = grouping.EmbeddingsApplet(cfg, self.services).run(
-            NOW, NEVER_RUN, self.reader
-        )
-        (document,) = result.documents
-        payload = json.loads(document.content)
-        groups = [
-            sorted(member["uid"] for member in group["members"])
-            for group in payload["groups"]
-        ]
-        return groups, payload["params"]
-
-    def test_embeddings_group_variants_without_shared_tags(self) -> None:
-        groups, params = self.groups_of(embedding_weight=0.5)
-
-        # d4 has no embedding: it is left out.
-        self.assertEqual(groups, [["d1", "d2"], ["d3"]])
-        self.assertEqual(params["algorithm"], "embeddings")
-        self.assertEqual(params["embedding"], "tags")
-        self.assertEqual(params["embedding_weight"], 0.5)
-
-    def test_zero_weight_is_plain_tag_overlap(self) -> None:
-        groups, _ = self.groups_of(embedding_weight=0.0)
-
-        self.assertEqual(groups, [["d1"], ["d2"], ["d3"]])
-
-    def test_reads_the_configured_embedding(self) -> None:
-        groups, _ = self.groups_of(embedding="markdown")
-
-        self.assertEqual(groups, [])
-
-    def test_requirements_include_the_embedding(self) -> None:
-        options = grouping.EmbeddingsOptions(embedding="markdown")
-
-        requirements = grouping.EmbeddingsApplet.requirements(options)
-
-        self.assertEqual(requirements.keys, ("tags", "markdown/embedding"))
-
-
 class PluginRegistrationTests(unittest.TestCase):
     def test_registers_every_applet_class(self) -> None:
         registered = [
-            *grouping.__newstool_plugin__(),
+            *digest.__newstool_plugin__(),
             *feed.__newstool_plugin__(),
             *itemfeed.__newstool_plugin__(),
         ]
 
         names = [name for name, _, _ in registered]
-        self.assertEqual(
-            names, ["singlelink", "avglink", "embeddings", "feed", "itemfeed"]
-        )
+        self.assertEqual(names, ["digest", "feed", "itemfeed"])
         for _, protocol, cls in registered:
             self.assertIs(protocol, AppletType)
             self.assertIsInstance(cls, AppletType)
