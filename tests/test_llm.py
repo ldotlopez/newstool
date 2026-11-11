@@ -228,6 +228,19 @@ class TaggerTests(ProcessorTestCase):
         self.assertEqual(self.annotation(processor, "tags"), ["BCE", "Pleno"])
         self.assertEqual(llm.calls[0][2], {"model": "small", "json_mode": True})
 
+    def test_the_prompt_carries_the_publisher_tags(self) -> None:
+        self.assertIn(
+            "tagged the article with: bce, Pleno.",
+            tagger.tags_prompt("Body", ["bce", "Pleno"]),
+        )
+        self.assertNotIn("Publisher's Tags", tagger.tags_prompt("Body", []))
+        llm = StubLLM('{"items": ["Pleno"]}')
+
+        tags = self.annotation(self.build(tagger.TaggerProcessor, llm), "tags")
+
+        self.assertIn("tagged the article with: bce.", llm.calls[0][1])
+        self.assertEqual(tags, ["Pleno", "bce"])
+
 
 class EmbedTests(ProcessorTestCase):
     def test_embeds_the_tags_text_by_default(self) -> None:

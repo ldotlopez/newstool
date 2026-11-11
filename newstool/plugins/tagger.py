@@ -9,7 +9,12 @@ import pydantic
 from ..errors import PluginFailure
 from ..llms import strip_code_fence
 from ..models import SourceItem
-from ..processors import BaseProcessor, ProcessorOptions, ProcessorType
+from ..processors import (
+    BaseProcessor,
+    ProcessorOptions,
+    ProcessorType,
+    publisher_tags,
+)
 from . import PluginTypes, Services, UsesLLMOptions
 
 LOGGER = logging.getLogger(__name__)
@@ -47,7 +52,16 @@ You are an expert entity extraction and content tagging assistant. Your sole tas
 
 {{"items": ["Category", "Topic", "Persona Name", "Location Name", "Organization"]}}
 
-### Input Text:
+"""
+
+PUBLISHER_TAGS_PROMPT = """### Publisher's Tags:
+
+The publisher tagged the article with: {tags}. Reuse their spelling for the
+tags that apply.
+
+"""
+
+INPUT_PROMPT = """### Input Text:
 
 """
 
@@ -69,9 +83,10 @@ class TaggerProcessor(BaseProcessor):
 
     def process_item(self, item: SourceItem) -> list[str]:
         markdown = self.require_annotation(item, "markdown")
+        item_tags = publisher_tags(item)
 
         response = self.llm.prompt(
-            TAGS_PROMPT + markdown, model=self.options.model, json_mode=True
+            tags_prompt(markdown, item_tags), model=self.options.model, json_mode=True
         )
 
         try:
@@ -85,12 +100,15 @@ class TaggerProcessor(BaseProcessor):
         ) as e:
             raise PluginFailure(f"invalid tags response {response!r}: {e}") from e
 
-        item_tags = item.data.get("tags", [])
-        tags = (
-            merge_tags(llm_tags, item_tags) if isinstance(item_tags, list) else llm_tags
-        )
+        tags = merge_tags(llm_tags, item_tags)
         LOGGER.debug(f"Tags for {item.title}: {tags!r}")
         return tags
+
+
+def tags_prompt(markdown: str, item_tags: list[str]) -> str:
+    """The prompt for `markdown`, with the publisher's tags when there are any."""
+    hint = PUBLISHER_TAGS_PROMPT.format(tags=", ".join(item_tags)) if item_tags else ""
+    return TAGS_PROMPT + hint + INPUT_PROMPT + markdown
 
 
 def merge_tags(existing_tags: list[str], new_tags: list[str]) -> list[str]:

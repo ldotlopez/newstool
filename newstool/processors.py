@@ -175,3 +175,18 @@ class BaseProcessor:
         Raise `SkipItem` if the item doesn't apply. Any other exception marks
         the item `error`.
         """
+
+
+def publisher_tags(item: SourceItem) -> list[str]:
+    """The tags the item came with from its source (`data["tags"]`)."""
+    tags = item.data.get("tags", [])
+    if not isinstance(tags, list):
+        return []
+    return [tag for tag in tags if isinstance(tag, str)]
+
+
+def embedding_key(input_key: str) -> str:
+    """The key `embed` writes for `input_key`: `embedding` after its first
+    part (`tags/embedding`, `summary/embedding/es`)."""
+    first, _, rest = input_key.partition("/")
+    return f"{first}/embedding/{rest}" if rest else f"{first}/embedding"
