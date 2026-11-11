@@ -621,7 +621,34 @@ Risks:
   update of `config.example.yaml` and the docs, and clear errors for the
   old names. Stored data keyed by config values (source `id`s, process
   `key`s, applet and sink `id`s) must not change meaning.
+- **One command per phase, selection without `-w`** (2026-11-11, idea;
+  revises decision 0017):
+  - `process` only runs processors, never imports (as today; keep it so).
+  - `import` and `process` drop `-w/--workflow`. Selection:
+    `--default` (the root configuration without `skip_default`), `--all`
+    (the root configuration, `skip_default` ignored), or a name:
+    `import --source <source_id>` or `--source <workflow_name>/<source_id>`;
+    `process --processor <processor_name>` or
+    `--processor <workflow_name>/<processor_name>`.
+  - Commands, one per phase plus the chain: `import` (only imports),
+    `process` (only processes), `apps` (runs the applets, with or without
+    delivery), the delivery command (runs the sinks) and `run` (the whole
+    chain).
+  To settle before planning:
+  - `workflows` is not in the list: drop it, or keep it as import + process
+    of a workflow?
+  - `apps` and the delivery command: renames of `apps run` (then where
+    does `apps reset` go?) and of `deliver`?
+  - does a bare `--source <id>` / `--processor <name>` mean the root
+    configuration's entry, and does `--all` cover the `workflows` entries
+    too or only the root ones?
+  - `--processor` takes a processor type today (`process PROCESSOR`); with
+    several runs of one type, a catalog `id` or a process `key` may be
+    needed to name one.
+  - how `run` selects (`--default`/`--all` only, or names too).
+  Needs a decision record superseding the CLI part of 0017, and breaks the
+  cron lines and examples again.
 
 ---
 
-*Last updated: 2026-11-10*
+*Last updated: 2026-11-11*
