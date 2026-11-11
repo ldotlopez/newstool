@@ -1,7 +1,7 @@
 # Graph Report - digest-plan  (2026-11-11)
 
 ## Corpus Check
-- 80 files · ~194,601 words
+- 80 files · ~195,033 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 5 file(s) not represented in the graph (top: (none) 4, .lock 1)
 
@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `82830e37`
+- Built from commit: `6f344646`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
