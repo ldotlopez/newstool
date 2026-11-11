@@ -63,7 +63,7 @@ uv run ruff format .
 - A source's `id` is part of every item's key: renaming a source in config re-imports it from scratch.
 - The DB schema is created, never migrated. Schema or stored-data changes need a one-shot script in `scripts/` (with a test).
 - Config is YAML passed with `-c`. `config.yaml` and `.env` are git-ignored; `config.example.yaml` is the tracked reference. `${VAR}` resolves from the environment, falling back to a `.env` next to the config file; a missing variable is an error.
-- Providers can yield `LazySourceItemData` so already-stored items are skipped without fetching them; use it when loading an item is expensive.
+- Providers can implement `PreflightProvider`: `iter_items` yields `PreflightSourceItemData` (uid, an opaque `ref`, the listed `modified_at`) and the core calls `retrieve_item` only for items that are new or listed as modified since stored, so unchanged items are skipped without fetching them; use it when loading an item is expensive.
 
 ## Git
 
