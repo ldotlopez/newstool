@@ -3,6 +3,7 @@ paths:
   - "newstool/db.py"
   - "newstool/models.py"
   - "scripts/**"
+  - "private/**"
 ---
 
 # Database & ORM Conventions
@@ -15,7 +16,7 @@ paths:
     - `update(self, dto: DTOType) -> None`: Instance method to update all fields on the DB object from the DTO except the primary key/ID. Use explicit field assignment (`self.field = dto.field`) rather than reflective loops or `setattr` iterations.
 - **Database-Native Integrity:** Prefer database-level constraints and triggers over ORM-level or Python-level validation hooks.
   - Define `CheckConstraint`, `UniqueConstraint`, and foreign key cascade rules directly in SQLAlchemy model table definitions so they execute natively in SQL.
-- **No Migrations Framework:** The schema is created, never migrated. Changes to existing tables or stored data need a one-shot script in `scripts/` plus a test.
+- **No Migrations Framework:** The schema is created, never migrated. Changes to existing tables or stored data need a one-shot migration plus its test in `private/`, which is git-ignored: they run once in production and are never committed.
 - **Content on Disk:** Annotation and artifact values are stored as files under `content_dir`, not in the DB (ADR 0004).
 
 ## DTO, Protocol & ORM Implementation Reference

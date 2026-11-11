@@ -61,7 +61,7 @@ uv run ruff format .
 
 - Plugins are modules in `newstool/plugins/` exposing `__newstool_plugin__()`; a module that fails to import breaks plugin discovery for the whole app.
 - A source's `id` is part of every item's key: renaming a source in config re-imports it from scratch.
-- The DB schema is created, never migrated. Schema or stored-data changes need a one-shot script in `scripts/` (with a test).
+- The DB schema is created, never migrated. Schema or stored-data changes need a one-shot migration with its test in `private/`, git-ignored: run once in production, never committed (tests: `DISABLE_RICH=1 uv run python -m unittest private/test_<name>.py`).
 - Config is YAML passed with `-c`. `config.yaml` and `.env` are git-ignored; `config.example.yaml` is the tracked reference. `${VAR}` resolves from the environment, falling back to a `.env` next to the config file; a missing variable is an error.
 - Providers can implement `PreflightProvider`: `iter_items` yields `PreflightSourceItemData` (uid, an opaque `ref`, the listed `modified_at`) and the core calls `retrieve_item` only for items that are new or listed as modified since stored, so unchanged items are skipped without fetching them; use it when loading an item is expensive.
 

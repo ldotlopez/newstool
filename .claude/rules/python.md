@@ -10,7 +10,7 @@ Generic Python conventions live in the user-level `rules/python.md`; this file a
 
 ## Framework Usage
 
-- **CLI:** The app has subcommands and uses `click` / `rich-click`; `cli.py` selects plain click or rich-click depending on `DISABLE_RICH`. Use click's parameter types for CLI arguments, never pydantic. Use stdlib `argparse` only for standalone scripts in `scripts/`.
+- **CLI:** The app has subcommands and uses `click` / `rich-click`; `cli.py` selects plain click or rich-click depending on `DISABLE_RICH`. Use click's parameter types for CLI arguments, never pydantic. Use stdlib `argparse` only for standalone scripts in `scripts/` or `private/`.
 - **Plugin options:** subclass `PluginOptions` (pydantic, `extra="forbid"`).
 - **DTOs:** This app has a DB layer; see `.claude/rules/database.md`.
 - **Logging:** handlers are configured only in `cli.py` (`setup_logging`).
