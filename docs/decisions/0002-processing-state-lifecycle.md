@@ -51,6 +51,11 @@ processor, waits for upstream processors, and reprocesses on a version bump.
 
 ## Revisions
 
+- **2026-11-11 (0018).** Discarded: "the item's content changes: every
+  state becomes eligible" by comparing the content each state recorded,
+  which left the annotation of the old content readable. Remains: a content
+  change reprocesses every key with zero attempts; it now deletes the
+  item's annotations, which hold their run state.
 - **2026-10-27 (0009).** Discarded: "a key is written by one entry only",
   across the whole configuration. Remains: one writer per `(item, key)`.
 - **2026-10-26.** One key per run, keyed by `(item, key)`. Discarded:

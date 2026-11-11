@@ -24,3 +24,10 @@ returns, plus metadata:
 - All bulky content follows the same storage path, and the database stays
   small.
 - Backups must cover the content directory as well as the database.
+
+## Revisions
+
+- **2026-11-11 (0018).** The annotation's metadata also holds the state of
+  its last run (status, attempts, last error, processor version,
+  `attempted_at`); `updated_at` is when its value last changed. Remains:
+  the value on disk, its reference in the database.

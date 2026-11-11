@@ -5,7 +5,7 @@ behavior rules (identity, change detection, retries, dependencies) are
 defined there and not repeated here.
 
 ```
-config.yaml ─► Config ─► Application (app.py) ◄── cli.py, scripts/, external tools
+config.yaml ─► Config ─► Application (app.py) ◄── cli.py, external tools
                           │
         HTTPClient ◄──────┤ import
         (cached)          ▼
@@ -47,7 +47,6 @@ config.yaml ─► Config ─► Application (app.py) ◄── cli.py, scripts/
 | `sinks.py` | The `Sink` and `SinkType` protocols, `SinkOptions`, `accepts`, and `Deliverer`, the delivery cycle of one sink instance over the ledger. |
 | `llms.py` | The `LLM` and `LLMType` protocols, `LLMUnavailableError` and `strip_code_fence`, for answers wrapped in a code fence. |
 | `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `embed`, `truncate` (a test stand-in for `summarize`), the applets `digest`, `grouping` (`singlelink`, `avglink`, `embeddings`), `feed` and `itemfeed`, and the sinks `telegram`, `googlechat`, `filesink` (`file`) and `stdout`. `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
-| `scripts/` | The one-shot migrations `migrate_autoincrement.py`, `migrate_applets.py` and `migrate_annotation_keys.sql`. |
 
 ## Plugins
 
@@ -285,11 +284,13 @@ SQLite tables:
   `content_sha256`, `data`, `published_at`, `modified_at`, `imported_at`),
   unique per `(source_id, uid)`. `uri` is not unique; `imported_at` is set
   on creation and never changed.
-- `processing_state`: per item and annotation key, the processor that ran,
-  the status (`done`, `error`, `ignored`), attempts, processor version and
-  the `content_sha256` the run used.
-- `item_annotations`: per item and key, the processor that wrote it and the
-  `content_sha256` of the value (e.g. `markdown`, `summary`, `summary/es`).
+- `item_annotations`: per item and annotation key (e.g. `markdown`,
+  `summary`, `summary/es`), the state of its last run (processor, status
+  `done`, `error` or `ignored`, attempts, last error, processor version,
+  `attempted_at`) and, once a run finished, the `value_sha256` of its value
+  and `updated_at` (decision 0018). A `done` row has a value (`CHECK`).
+  The trigger `trg_source_items_content_changed` deletes an item's rows
+  when its `content_sha256` changes; `Database` releases their values.
 - `apps`: one row per applet instance that ever ran, keyed by its id:
   `last_started`, `last_success`, `last_error` and `state` (JSON).
 - `documents`: what applet instances emitted, unique per `(app, output,
@@ -367,8 +368,7 @@ The eligibility and retry rules are in spec §4.2; this is where they live:
 - Dependencies: `summarize` and `tagger` read `markdown`; `embed` reads
   `tags` or `markdown`.
 - `Database.delete_annotations` removes annotations by id, each with the
-  processing state of its (item, key), so their runs find the items
-  pending. `delete annotations` passes what `find_annotations` selects.
+  state of its run (one row), so their runs find the items pending. `delete annotations` passes what `find_annotations` selects.
 
 ## Applets
 

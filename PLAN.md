@@ -558,33 +558,43 @@ Risks:
   first, with no order options. A backlog that grows too big is the user's
   to clear: mark the older rows `done`, e.g. `deliveries set-status --sink
   chat --status queued --until DATE --as done` (`--dry-run` first).
-- **Database layer audit** (2026-11-10, plan): review `db.py` code and
-  schema, simplify and formalize where possible. It has gone through many
-  architecture changes (decisions 0001, 0002, 0004, 0007, 0012, 0014, 0015,
-  0016) and may carry leftovers or debt. Today: 7 tables (`sources`,
-  `source_items`, `processing_state`, `item_annotations`, `apps`,
-  `documents`, `deliveries`), ~1500 lines and ~67 methods in one
-  `Database` class; the schema is created, never migrated, with one-shot
-  scripts in `scripts/` (`migrate_applets.py`, `migrate_autoincrement.py`,
-  the older `migrate_annotation_keys.sql`). Things to look at:
-  - overlapping queries: `deliveries_of` vs `find_deliveries`;
-    `existing_document_keys` vs `count_missing_routes`; filters applied in
-    Python after the query (`Application.routed_documents` filters by
-    route, then applies `limit`);
-  - the DTO/ORM conventions (`from_dto`/`to_dto`/`update` on every model,
-    `.claude/rules/database.md`) applied evenly, and no ORM row leaking;
-  - which rules live in the schema (`UniqueConstraint`, `CheckConstraint`,
-    cascades) and which only in Python, e.g. delivery states, the
-    one-row-per-(sink, document) rule, document immutability;
-  - the split between `processing_state` and `item_annotations`, and
-    whether `sources` still earns its table;
-  - the custom column types (`CustomJSON`, `UTCDateTime`) and index
-    coverage for the queries actually run;
-  - whether to adopt real migrations (e.g. a schema version) instead of
-    one-shot scripts, and whether to split `Database` by aggregate (items,
-    applets, ledger).
-  Plan vs apply: audit first, as a written list of findings, before
-  changing anything; any schema change needs a script with a test.
+- **Database layer audit** (audited 2026-11-10). Done: `processing_state`
+  merged into `item_annotations`, and a content change deletes the item's
+  annotations through a trigger (decision 0018; the older one-shot
+  scripts are retired, production migrations live in the git-ignored
+  `private/`). A schema version waits until the schema settles. Pending
+  findings, each schema change with a private migration and its test:
+  - `CustomJSON` encodes twice: `JSON` over a string already dumped, so
+    values are JSON strings inside JSON and `None` is stored as `"null"`,
+    never SQL `NULL`. Needs a script that rewrites the stored values.
+  - `DBDelivery.update` rewrites `sink`, `document_id` and `created_at`;
+    `save_delivery` should only write the state.
+  - No index on `deliveries.document_id`: lookups by document and the
+    cascade from `documents` scan the table.
+  - Overlapping queries: `existing_document_keys`, `count_missing_routes`
+    and `commit_app_run` (which loads every document id of the app, and
+    queries routes per document) as one `plan_app_run` for the dry run and
+    the commit; `deliveries_of` and `find_deliveries` as one (`statuses`, a
+    document sort, the document joined instead of `document_label` loaded
+    per row); `get_annotations` and `get_annotation_keys` folded into
+    `get_annotation_values` and `find_annotations`; `ProcessingScope.source`
+    into `sources`.
+  - Filters in Python: `Application.routed_documents` (by route, then
+    `limit`), `unconfigured_pending` (a `GROUP BY sink` count),
+    `delete_documents`, `reset_app --dry-run`, and `get_unprocessed_items`,
+    which loads every item in scope (only the backoff needs Python).
+  - Leftovers: lookups by `(source_id, uid)` where the item id is known;
+    `DeliveryStatus`, `ProcessingStatus` and `backoff_seconds` in `db.py`
+    though `sinks.py` and `processors.py` use them (`backoff_seconds`
+    perhaps in foundation); `CommittedRun` outside `models.py`;
+    `Delivery.status` a `str`; `SourceData` (pydantic, config) as a DTO
+    read back with default options; `DBDocument.update`, unused, against
+    immutability (a `BEFORE UPDATE` trigger could enforce it); the dead
+    `DBSource.items` cascade; `session_scope`, `engine` and `contents`
+    public.
+  - Structure: the ORM models in their own module first; splitting
+    `Database` by aggregate pays less (content release and `commit_app_run`
+    span them). `sources` stays: it keeps the names of removed sources.
 - **Configuration keys review** (2026-11-10, plan): review the names of
   the configuration file's keys, look for names that say better what they
   stand for, and make them consistent across subsystems. Seen so far, to

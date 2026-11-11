@@ -821,20 +821,7 @@ it), not by copying `data.db` alone.
 
 The schema is created, never migrated: after an upgrade that changes it,
 move the old `data.db` and `content/` aside and re-import. New tables are
-added on their own. Three upgrades come with a one-shot script for existing
-databases (back up first):
-
-- `scripts/migrate_autoincrement.py -c config.yaml`: ids that are never
-  reused, which `--item` and `--annotation` rely on.
-- `sqlite3 -bail data.db < scripts/migrate_annotation_keys.sql`: keys
-  processing state and annotations by annotation key,
-  keeping every row and id. Run it before the first `process` on the new
-  schema.
-- `scripts/migrate_applets.py -c config.yaml`: applets (decision 0015).
-  Adds each item's import date (its publication date, for the items
-  already stored), and drops the remixers' artifacts and the old delivery
-  history. `itemfeed` instances start counting on their first run, so
-  nothing already posted is posted again.
+added on their own.
 
 The plugin catalog (decision 0010) needs a new database and a rewritten
 configuration: `process` moves to `processors` (or to workflows),

@@ -164,9 +164,10 @@ article.
   count. Re-importing an identical item writes nothing but a listed date
   (above).
 - **Interrupted import:** the items fetched before an error are stored.
-- **Changed item:** it is overwritten. Its annotations are kept, but if its
-  content changed, all its processing states become eligible again with
-  attempts reset to zero. Documents are not invalidated.
+- **Changed item:** it is overwritten. If its content changed, its
+  annotations are deleted with their processing state, so every key is
+  processed again with attempts at zero (decision 0018); other changes keep
+  them. Documents are not invalidated.
 - **Duplicates:** the same article in two sources is two items, even if both
   sources use the same provider. Deduplication, if wanted, is the applets'
   job.
@@ -315,9 +316,9 @@ The database is not exposed: every query goes through `Application`.
 - **Items:** content on disk through `foundation.storage.DiskStorage`, keyed
   by its sha256. Metadata goes in the database (title, URI, MIME type,
   `content_sha256`, `data`, `published_at`, `modified_at`, `imported_at`).
-- **Processing state:** in the database, per `(item, key)`: the processor
-  that ran, status, attempts, last error, processor version and the
-  `content_sha256` used.
+- **Processing state:** in the database, per `(item, key)`, in the same
+  row as the annotation (decision 0018): the processor that ran last,
+  status, attempts, last error, processor version and when it ran.
 - **Annotations and documents:** content is stored on disk through
   `foundation.storage.DiskStorage` and the database keeps the reference it
   returns. Their metadata:
