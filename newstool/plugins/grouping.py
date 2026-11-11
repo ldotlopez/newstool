@@ -27,7 +27,7 @@ import math
 from abc import abstractmethod
 from datetime import datetime, timedelta
 from itertools import combinations
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 
 import pydantic
 
@@ -48,6 +48,7 @@ from ..models import (
     ItemKey,
     SourceItem,
 )
+from ..processors import embedding_key
 from . import PluginTypes
 
 LOGGER = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ class GroupingOptions(SourcesOptions):
 
 
 class EmbeddingsOptions(GroupingOptions):
-    embedding: Literal["tags", "markdown"] = "tags"
+    embedding: str = "tags"  # the annotation `embed` embedded
     embedding_weight: float = pydantic.Field(default=0.5, ge=0.0, le=1.0)
 
 
@@ -320,7 +321,7 @@ class EmbeddingsApplet(GroupingApplet):
     def requirements(cls, options: EmbeddingsOptions) -> Requirements:
         sources = tuple(options.sources) if options.sources is not None else None
         return Requirements(
-            sources=sources, keys=("tags", f"{options.embedding}_embedding")
+            sources=sources, keys=("tags", embedding_key(options.embedding))
         )
 
     @staticmethod
@@ -344,11 +345,11 @@ class EmbeddingsApplet(GroupingApplet):
         self, items: list[ScoredItem], reader: AppletReader
     ) -> list[dict[str, Any]]:
         options = self.options
-        embedding_key = f"{options.embedding}_embedding"
-        vectors = reader.annotations([scored.item for scored in items], embedding_key)
+        key = embedding_key(options.embedding)
+        vectors = reader.annotations([scored.item for scored in items], key)
         embedded = [scored for scored in items if scored.item.key in vectors]
         if skipped := len(items) - len(embedded):
-            LOGGER.info(f"{self.name}: {skipped} item(s) without {embedding_key}")
+            LOGGER.info(f"{self.name}: {skipped} item(s) without {key}")
         embeddings = [vectors[scored.item.key] for scored in embedded]
 
         scores = [[0.0] * len(embedded) for _ in embedded]

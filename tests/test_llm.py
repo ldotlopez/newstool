@@ -270,14 +270,14 @@ class EmbedTests(ProcessorTestCase):
         llm = StubLLM()
         processor = self.build(embed.EmbedProcessor, llm, model="embedder")
 
-        self.assertEqual(self.annotation(processor, "tags_embedding"), [0.0])
+        self.assertEqual(self.annotation(processor, "tags/embedding"), [0.0])
         self.assertEqual(llm.calls, [("embed", ["BCE, pleno"], {"model": "embedder"})])
 
     def test_embeds_the_input_its_options_name(self) -> None:
         llm = StubLLM()
         processor = self.build(embed.EmbedProcessor, llm, input="markdown")
 
-        self.annotation(processor, "markdown_embedding")
+        self.annotation(processor, "markdown/embedding")
 
         self.assertEqual(llm.calls, [("embed", ["# T\n\nBody"], {"model": None})])
         options = embed.EmbedOptions(input="markdown")
@@ -285,13 +285,23 @@ class EmbedTests(ProcessorTestCase):
 
     def test_output_key_follows_the_input(self) -> None:
         for overrides, key in (
-            ({}, "tags_embedding"),
-            ({"input": "markdown"}, "markdown_embedding"),
+            ({}, "tags/embedding"),
+            ({"input": "markdown"}, "markdown/embedding"),
+            ({"input": "summary/es"}, "summary/embedding/es"),
         ):
             options = embed.EmbedOptions.model_validate(overrides)
             self.assertEqual(embed.EmbedProcessor.output_key(options), key)
-        with self.assertRaises(pydantic.ValidationError):
-            embed.EmbedOptions.model_validate({"input": "title"})
+
+    def test_embeds_a_text_annotation_of_any_key(self) -> None:
+        self.db.record_result(
+            self.item, "summarize", "summary/es", ProcessingStatus.DONE, value="Resumen"
+        )
+        llm = StubLLM()
+        processor = self.build(embed.EmbedProcessor, llm, input="summary/es")
+
+        self.annotation(processor, "summary/embedding/es")
+
+        self.assertEqual(llm.calls, [("embed", ["Resumen"], {"model": None})])
 
 
 class ConsumerPluginTests(unittest.TestCase):

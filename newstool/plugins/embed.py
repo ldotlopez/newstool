@@ -1,25 +1,29 @@
-"""Embeds the item's tags or markdown with an LLM, for the `embeddings`
-grouping applet."""
+"""Embeds one of the item's annotations with an LLM, for `digest`'s
+`embeddings` grouping."""
 
-from typing import Literal
-
+from ..errors import PluginFailure
 from ..models import SourceItem
-from ..processors import BaseProcessor, ProcessorOptions, ProcessorType
+from ..processors import (
+    BaseProcessor,
+    ProcessorOptions,
+    ProcessorType,
+    embedding_key,
+)
 from . import PluginTypes, Services, UsesLLMOptions
 
 
 class EmbedOptions(ProcessorOptions, UsesLLMOptions):
-    input: Literal["tags", "markdown"] = "tags"  # the annotation embedded
+    input: str = "tags"  # the annotation embedded
     model: str | None = None
 
 
 class EmbedProcessor(BaseProcessor):
-    """Annotates `<input>_embedding`: the embedding of the `tags` (as
-    `tags_text`) or the `markdown` annotation, as the run's `input` option
-    says (default `tags`)."""
+    """Annotates `embedding_key(input)` (`tags/embedding`,
+    `summary/embedding/es`): the embedding of the `input` annotation
+    (default `tags`), a list as `tags_text`, a string as it is."""
 
     name = "embed"
-    key = "tags_embedding"
+    key = "tags/embedding"
     options_model = EmbedOptions
     options: EmbedOptions
 
@@ -29,7 +33,7 @@ class EmbedProcessor(BaseProcessor):
 
     @classmethod
     def output_key(cls, options: EmbedOptions) -> str:
-        return f"{options.input}_embedding"
+        return embedding_key(options.input)
 
     @classmethod
     def required_key(cls, options: EmbedOptions) -> str | None:
@@ -37,7 +41,13 @@ class EmbedProcessor(BaseProcessor):
 
     def process_item(self, item: SourceItem) -> list[float]:
         value = self.require_annotation(item, self.options.input)
-        text = tags_text(value) if self.options.input == "tags" else value
+        match value:
+            case list():
+                text = tags_text(value)
+            case str():
+                text = value
+            case _:
+                raise PluginFailure(f"{self.options.input} is not text or a list")
         return self.llm.embed([text], model=self.options.model)[0]
 
 

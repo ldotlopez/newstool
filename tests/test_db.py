@@ -551,7 +551,7 @@ class AnnotationTests(DatabaseTestCase):
         other = make_item(self.source, uid="a2", content=b"x")
         self.db.upsert_source_items([other])
         self.annotate(self.item, "tagger", "tags", ["a"])
-        self.annotate(self.item, "embed", "tags_embedding", [0.5])
+        self.annotate(self.item, "embed", "tags/embedding", [0.5])
         self.annotate(self.item, "markdownify", "markdown", "# T")
 
         keys = self.db.get_annotation_keys([self.item.id, other.id])
@@ -560,7 +560,7 @@ class AnnotationTests(DatabaseTestCase):
             keys,
             {
                 self.item.id: [
-                    (2, "embed", "tags_embedding"),
+                    (2, "embed", "tags/embedding"),
                     (3, "markdownify", "markdown"),
                     (1, "tagger", "tags"),
                 ]
@@ -571,7 +571,7 @@ class AnnotationTests(DatabaseTestCase):
         other = make_item(self.source, uid="a2", content=b"x")
         self.db.upsert_source_items([other])
         self.annotate(self.item, "tagger", "tags", ["a"])
-        self.annotate(self.item, "embed", "tags_embedding", [0.5])
+        self.annotate(self.item, "embed", "tags/embedding", [0.5])
         self.annotate(other, "tagger", "tags", ["b"])
         self.annotate(other, "markdownify", "markdown", "# T")
 
@@ -593,7 +593,7 @@ class AnnotationTests(DatabaseTestCase):
             [(self.item.id, "tagger.tags", ["a"]), (other.id, "tagger.tags", ["b"])],
         )
         self.assertEqual(
-            found(annotation_ids=[2]), [(self.item.id, "embed.tags_embedding", [0.5])]
+            found(annotation_ids=[2]), [(self.item.id, "embed.tags/embedding", [0.5])]
         )
         self.assertEqual(len(found(ProcessingScope(limit=3))), 3)
 

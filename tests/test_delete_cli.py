@@ -39,7 +39,7 @@ class DeleteCommandTests(unittest.TestCase):
         self.db.upsert_source_items(self.items)
         # Two runs of one processor, each with its own key and state.
         for item in self.items:
-            for key in ("tags_embedding", "markdown_embedding"):
+            for key in ("tags/embedding", "markdown/embedding"):
                 self.db.record_result(
                     item, "embed", key, ProcessingStatus.DONE, value=[0.5]
                 )
@@ -83,30 +83,30 @@ class DeleteCommandTests(unittest.TestCase):
     def test_annotations_are_deleted_per_processor(self) -> None:
         args = ("annotations", "--processor", "embed", "--item", "1")
         listed = self.run_cli("inspect", *args)
-        self.assertIn("embed.markdown_embedding", listed.output)
+        self.assertIn("embed.markdown/embedding", listed.output)
 
         result = self.run_cli("delete", *args)
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Deleted 2 annotation(s)", result.stdout)
         self.assertEqual([a.item_id for a in self.db.find_annotations()], [2, 2])
-        for key in ("tags_embedding", "markdown_embedding"):
+        for key in ("tags/embedding", "markdown/embedding"):
             pending = self.db.get_unprocessed_items(key, version=None, max_retries=3)
             self.assertEqual([item.uid for item in pending], ["i1"])
 
     def test_annotations_are_deleted_by_key_without_a_processor(self) -> None:
-        args = ("annotations", "--key", "tags_embedding")
+        args = ("annotations", "--key", "tags/embedding")
         listed = self.run_cli("inspect", *args)
-        self.assertEqual(listed.output.count("embed.tags_embedding"), 2)
+        self.assertEqual(listed.output.count("embed.tags/embedding"), 2)
 
         result = self.run_cli("delete", *args)
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Deleted 2 annotation(s)", result.stdout)
         self.assertEqual(
-            {a.key for a in self.db.find_annotations()}, {"markdown_embedding"}
+            {a.key for a in self.db.find_annotations()}, {"markdown/embedding"}
         )
-        for key, uids in (("tags_embedding", ["i1", "i2"]), ("markdown_embedding", [])):
+        for key, uids in (("tags/embedding", ["i1", "i2"]), ("markdown/embedding", [])):
             pending = self.db.get_unprocessed_items(key, version=None, max_retries=3)
             self.assertEqual([item.uid for item in pending], uids)
 

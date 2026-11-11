@@ -408,7 +408,7 @@ class EmbeddingGroupingTests(AppletTestCase):
         ):
             self.annotate(item, "tags", tags)
             if embedding is not None:
-                self.annotate(item, "tags_embedding", embedding)
+                self.annotate(item, "tags/embedding", embedding)
 
     def groups_of(self, **options) -> tuple[list[list[str]], dict]:
         cfg = grouping.EmbeddingsOptions(tau=None, lookback="10000d", **options)
@@ -447,7 +447,7 @@ class EmbeddingGroupingTests(AppletTestCase):
 
         requirements = grouping.EmbeddingsApplet.requirements(options)
 
-        self.assertEqual(requirements.keys, ("tags", "markdown_embedding"))
+        self.assertEqual(requirements.keys, ("tags", "markdown/embedding"))
 
 
 class PluginRegistrationTests(unittest.TestCase):
