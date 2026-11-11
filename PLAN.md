@@ -420,16 +420,16 @@ First version: the minimum to test the pieces on real data. Happy-path
 code and one test per piece; validations, corner cases and polish go to
 *Story digests, second version* in the backlog.
 
-- [ ] **1. `tagger` reads the upstream tags.** The item's `data["tags"]`
+- [x] **1. `tagger` reads the upstream tags.** The item's `data["tags"]`
   (feed categories, `article:tag`) go into the prompt as the publisher's
   tags, to reuse their spelling where they apply; the result is merged with
   them as today (`merge_tags`). Test: the fake LLM receives them.
-- [ ] **2. `classify` processor** (`plugins/classify.py`): options `labels`
+- [x] **2. `classify` processor** (`plugins/classify.py`): options `labels`
   and `question`; key from config (`topics`, `about/spain`). Prompt: the
   question, the labels, the upstream tags as hints, the `markdown`; the
   answer is a JSON list, labels outside `labels` are dropped. Test: fake
   LLM, an unknown label left out.
-- [ ] **3. `embed.input` any annotation key**, a list joined as
+- [x] **3. `embed.input` any annotation key**, a list joined as
   `tags_text`, anything else as text. The key inserts `embedding` after
   the input's first part: `tags/embedding`, `markdown/embedding`,
   `summary/embedding/es` (was `<input>_embedding`). One core function,
@@ -439,7 +439,7 @@ code and one test per piece; validations, corner cases and polish go to
   production (`embed` is commented out in `config.yaml`): no migration.
   Tests: a string annotation embedded; the `_embedding` keys in
   `test_llm`, `test_delete_cli`, `test_db` and `test_applets` renamed.
-- [ ] **4. `digest` rewrite absorbing `plugins/grouping.py`**, which
+- [x] **4. `digest` rewrite absorbing `plugins/grouping.py`**, which
   nothing uses (its applets are commented out in `config.yaml`). One
   document pair per run over the last `span_days` whole local days (key
   `<from>_<to>`, YYYY-MM-DD). The grouping code moves into
@@ -468,7 +468,7 @@ code and one test per piece; validations, corner cases and polish go to
   key. Tests (rewritten `tests/test_digest.py`): two sources' items on one
   story merged into one, an excluded topic left out, `write: false` emits
   only `plan`.
-- [ ] **5. Configs and docs**: the two reference instances, the `classify`
+- [x] **5. Configs and docs**: the two reference instances, the `classify`
   runs and `summary/es` in `config.example.yaml`, the commented `avglink`
   instance and the `_embedding` comments replaced; README (the `digest`
   row and options, `classify`, `embed.input` and its keys, the three
@@ -476,6 +476,12 @@ code and one test per piece; validations, corner cases and polish go to
   paragraph, the `grouping` bundle, applet and key references).
   `config.yaml` (git-ignored) by hand, its commented `embed` and grouping
   lines included.
+
+Done 2026-11-11, untested on real data. Beyond the steps: a `title`
+option for the heading; items without tags or vectors stay as stories of
+their own (the old applets dropped them); `castello-weekly` replaces
+`weekly-digest` in `config.example.yaml`, and `spain-abroad` is there
+commented out with the runs it needs.
 
 Tuning loop: run with `write: false`, read the plan with `inspect
 documents`, `apps reset --app <id> --with-documents` to re-run the same

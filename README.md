@@ -1,8 +1,8 @@
 # newstool
 
 Collects news from several websites, keeps the articles, and builds things
-from them: markdown copies, LLM summaries and tags, event groupings, RSS
-feeds and digests, and Telegram posts. It was written for local news (Castelló), but any
+from them: markdown copies, LLM summaries, tags and topics, RSS feeds,
+digests of the stories several sources covered, and Telegram posts. It was written for local news (Castelló), but any
 site can be added with a provider.
 
 It works in two stages:
@@ -31,7 +31,7 @@ more. Applets and sinks belong to no workflow.
 - Python 3.13+
 - [uv](https://docs.astral.sh/uv/)
 - Optionally, an Ollama server for the `ollama` LLM plugin, which
-  `summarize`, `tagger`, `embed` and `digest` use
+  `summarize`, `tagger`, `classify`, `embed` and `digest` use
 
 ## Install
 
@@ -241,12 +241,12 @@ it). Every key a run reads must be written by a process run on its
 workflow's sources, in any workflow. Ids, workflow names and output names
 use lowercase letters, digits, `_` and `-`; `default` is reserved.
 
-`summarize`, `tagger`, `embed` and `digest` use an LLM: `llm` names an
+`summarize`, `tagger`, `classify`, `embed` and `digest` use an LLM: `llm` names an
 `llms` entry by `id`, or an LLM type (with its section's options), and
 defaults to the first `llms` entry; `model` defaults to that LLM's default
 model. A name that resolves to no LLM, or an LLM consumer with `llms`
 empty, fails every command at start-up. Everything else works without an
-LLM, but `grouping` and `itemfeed` read the tags and summaries those
+LLM, but `digest` and `itemfeed` read the tags and summaries those
 processors write.
 
 Changing a type's or an entry's options never regenerates existing
@@ -637,25 +637,30 @@ To support a new site, see
 | :--- | :--- | :--- | :--- | :--- |
 | `markdownify` | `markdownify` | item content | `markdown` | Extracts the article's markdown from HTML and PDF items |
 | `summarize` | `summarize` | `markdown` | `summary` | Summarizes the article with an LLM |
-| `tagger` | `tagger` | `markdown` | `tags` | Extracts entity tags with an LLM |
-| `embed` | `embed` | `tags` or `markdown` | `<input>_embedding` | Embeds the tags (sorted and comma-separated) or the markdown with an LLM |
+| `tagger` | `tagger` | `markdown` | `tags` | Extracts entity tags with an LLM, given the publisher's tags as hints and merged with them |
+| `classify` | `classify` | `markdown` | `topics` | Picks the labels that apply from its `labels` with an LLM, given the publisher's tags as hints; answers outside the list are left out |
+| `embed` | `embed` | any annotation (`tags`) | `<first part>/embedding/<rest>` (`tags/embedding`, `summary/embedding/es`) | Embeds the annotation with an LLM: a list sorted and comma-separated, a string as it is |
 | `truncate` | `truncate` | `markdown` | `summary` | The markdown's first `length` characters (default 200): a fast, offline stand-in for `summarize` in tests |
 
 Every option can be set in the type's section, as the default, or per
 entry. Every processor takes `max_retries` (default 3), and `summarize`,
-`tagger` and `embed` take `llm` (see above) and `model`; `summarize` takes
+`tagger`, `classify` and `embed` take `llm` (see above) and `model`; `summarize` takes
 `prompt` (followed by the article's markdown) and `source_prompts`, a map
 from source `id` to the prompt for that source's items, in place of
 `prompt` (a source it does not name uses `prompt`; ids are not checked
-against `sources`), and `embed` takes `input`
-(`tags`, the default, or `markdown`; one entry per input). `truncate`
+against `sources`); `classify` takes `labels` (required) and `question`
+(default: which of the labels' topics the article covers), one entry per
+label set, each with its `key` (`topics`, `about/spain`); and `embed`
+takes `input` (the annotation key embedded, default `tags`; one entry per
+input). `truncate`
 accepts `summarize`'s options and ignores them, so an entry swaps one for
 the other by its type alone; its `llm` is not checked, so it needs no
 `llms`. On shared sources, two types cannot write one key: give each its
 own. Consumers read annotations by key:
-`itemfeed` reads `summary` (or its `annotation` option's key), `grouping`
-reads `tags` and
-`<embedding>_embedding`, and `digest` reads `markdown`.
+`itemfeed` reads `summary` (or its `annotation` option's key), and
+`digest` its `input` (`summary`), `tags`, the keys of its filters,
+`topics` when it weights them and, with `algorithm: embeddings`, the
+embedding of its `embedding`.
 
 ### LLMs
 
@@ -673,10 +678,7 @@ Options of `ollama`: `api_base` (default `http://localhost:11434`),
 | :--- | :--- | :--- | :--- | :--- |
 | `itemfeed` | `itemfeed` | `items` (`text/plain`) | `item:<source>/<uid>` | One document per newly imported item with its `annotation`: the annotation as text, with the item's title, link and image |
 | `feed` | `feed` | `feed` (`application/rss+xml`) | the run's time | RSS feed of the newest items of its sources |
-| `digest` | `digest` | `digest` (`text/markdown`) | `<source id>/<since>_<until>` | Markdown digest of the highlights of each source over the last `lookback`, written with an LLM from `markdown` |
-| `grouping` | `singlelink` | `groups` (`application/json`) | the run's time | Clusters tagged items into events (single-link over tag overlap) |
-| `grouping` | `avglink` | `groups` (`application/json`) | the run's time | Clusters tagged items into events (average-link over tag overlap) |
-| `grouping` | `embeddings` | `groups` (`application/json`) | the run's time | Clusters tagged items by tag overlap blended with the similarity of their `tags_embedding` or `markdown_embedding` (single-link) |
+| `digest` | `digest` | `plan` (`application/json`), `digest` (`text/markdown`) | `<from>_<to>` (first and last day) | One digest of the stories its sources covered over the last `span_days` days: items filtered by their annotations, grouped into stories, ranked, and each chosen story written with an LLM from its items' `input` |
 
 Options, in the type's section as defaults or per instance. Every applet
 takes `sources` (the source ids it reads; default every source). Lengths
@@ -693,18 +695,36 @@ unit suffix: `90s`, `5m`, `2h`, `3d`, `1h30m`.
 - `feed`: `title` (default `newstool feed`), `link`, `description`
   (default: the title), `max_items` (default 100). Route it to a `file`
   sink to publish it.
-- `digest`: `llm` and `model` (see above), `lookback` (default 7d: the
-  period each run covers), `max_items` (newest items per source, default
-  50), `max_article_chars` (each article's markdown is cut to this, default
-  3000) and `context_length` (the model's context window in tokens, default
-  32768). Schedule it for its period (`days: [mon]`, `at: "07:00"`); a
-  second run over the same period emits nothing new.
-- `singlelink`, `avglink` and `embeddings`: `min_score` (default 0.3), `tau` (time
-  decay, default 24h; `null` disables it), `lookback` (default 7d: the
-  items each run groups). `embeddings` adds `embedding` (`tags` or
-  `markdown`, default `tags`) and `embedding_weight` (0 to 1, default 0.5).
-  Items without the annotations an applet reads are left out of its groups,
-  so `embeddings` needs `process` to have run `embed` with that input first.
+- `digest`: reads the items published in the last `span_days` whole local
+  days (default 7, ending at today's midnight) that have its `input`
+  annotation (default `summary`).
+  - Filters: `include` and `exclude`, maps from an annotation key to labels
+    (`{topics: [deportes]}`, `{about/spain: ["yes"]}`): an item is kept
+    only with one of each `include` key's labels, and dropped with any of
+    an `exclude` key's; labels compare ignoring case.
+  - Grouping into stories: `algorithm` (`singlelink`, the default:
+    connected components over tag overlap, where one bridge item can chain
+    two stories; `avglink`: average-link, which a bridge can't chain;
+    `embeddings`: single-link over tag overlap blended with the cosine
+    similarity of the vectors `embed` wrote for the `embedding` annotation),
+    `min_score` (default 0.3), `tau` (time decay; default `null`, none),
+    `embedding` (default `tags`) and `embedding_weight` (default 0.5).
+    Items without tags or vectors stay as stories of their own.
+  - Ranking: a story scores its number of distinct sources, plus the
+    `topic_weights` of its items' `topics`, plus the highest of its
+    sources' `source_weights`; the `max_stories` best (default 8) are kept.
+  - Writing: with `write` (default true), one LLM call per story
+    (`story_prompt`, followed by its items' title, source, link and
+    `input`) and one for the opening paragraph (`intro_prompt`, followed by
+    the entries), under a `# <title>: <from> – <to>` heading (`title`,
+    default `Digest`); `llm`, `model` and `context_length` (default 32768)
+    as above. `write: false` emits only the `plan`, to tune the options
+    without the LLM: read it with `inspect documents`, and `apps reset
+    --app ID --with-documents` to run the same days again.
+
+  Schedule it for its period (`days: [mon]`, `at: "07:00"`); a second run
+  over the same days emits nothing new, and a period with no stories
+  emits nothing.
 
 Applets never act outside newstool: they emit documents, and sinks deliver
 them. A document is never rewritten; one emitted again under the same key

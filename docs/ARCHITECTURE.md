@@ -42,11 +42,11 @@ config.yaml ─► Config ─► Application (app.py) ◄── cli.py, external
 | `errors.py` | How failures reach the user: `PluginFailure`, the exception a plugin raises, with a message written for the user, when it cannot do its job in an expected way; `EXPECTED_ERRORS`, that and the failures of the network, the LLM backend and the database; `describe` (the message of a `PluginFailure`, `Type: message` for any other exception) and `log_failure` (error-level log; the traceback only with debug logging or when the exception is unexpected). |
 | `db.py` | SQLAlchemy models and `Database`, the only code that touches SQLite or the content storage. |
 | `providers.py` | The `Provider`, `PreflightProvider` and `ProviderType` protocols, `BaseProvider` and `IndexSiteProvider`, optional base classes. |
-| `processors.py` | The `Processor` and `ProcessorType` protocols, `ProcessorOptions`, `BaseProcessor`, `SkipItem` and `RunSummary`. |
+| `processors.py` | The `Processor` and `ProcessorType` protocols, `ProcessorOptions`, `BaseProcessor`, `SkipItem` and `RunSummary`; `publisher_tags` (an item's `data["tags"]`) and `embedding_key` (the key `embed` writes for an input), shared by the bundles that need them. |
 | `applets.py` | The `Applet` and `AppletType` protocols, `BaseApplet`, `SourcesOptions`, `Schedule` (when an instance is due), `Requirements`, `AppletReader` (what applets may read), `check_result` and `run_key`. |
 | `sinks.py` | The `Sink` and `SinkType` protocols, `SinkOptions`, `accepts`, and `Deliverer`, the delivery cycle of one sink instance over the ledger. |
 | `llms.py` | The `LLM` and `LLMType` protocols, `LLMUnavailableError` and `strip_code_fence`, for answers wrapped in a code fence. |
-| `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `embed`, `truncate` (a test stand-in for `summarize`), the applets `digest`, `grouping` (`singlelink`, `avglink`, `embeddings`), `feed` and `itemfeed`, and the sinks `telegram`, `googlechat`, `filesink` (`file`) and `stdout`. `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
+| `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `classify`, `embed`, `truncate` (a test stand-in for `summarize`), the applets `digest`, `feed` and `itemfeed`, and the sinks `telegram`, `googlechat`, `filesink` (`file`) and `stdout`. `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
 
 ## Plugins
 
@@ -95,8 +95,7 @@ deliveries by the sink instance's id, never by the type name.
 first `llms` entry), built on first use by `Application._llm`. Objects that
 use one take `UsesLLMOptions` and ask for it in their constructor.
 
-A bundle may register several classes per protocol under different names:
-`grouping` registers its three applets.
+A bundle may register several classes per protocol under different names.
 
 ### The catalog
 
@@ -135,9 +134,9 @@ item writes it. Annotations and processing state are per `(item, key)`.
 Every key a process run reads (`required_key`) must be written by a process
 run on its workflow's sources, in any workflow.
 
-Bundles never import each other. `grouping.embeddings` reads the vectors
-`embed` stores as `<input>_embedding` annotations, the same way every
-grouping applet reads `tags`.
+Bundles never import each other. `digest` reads the vectors `embed`
+stores under `embedding_key(input)` (`tags/embedding`,
+`summary/embedding/es`), the same way it reads `tags`.
 
 ## Providers
 
@@ -249,7 +248,7 @@ date and fetching an item is expensive, implement `iter_items` and
 A class with options sets `options_model` to a `PluginOptions` subclass
 with defaults for the general case, so a use needs no options; its
 constructor takes `(options, services)`. `feed` and `telegram` are
-examples, `grouping` shows a bundle with several classes and `summarize` an
+examples, and `summarize` an
 LLM consumer (`UsesLLMOptions`). Use `pydantic.SecretStr` for secrets, so
 they never show in a `repr` or a traceback. Processors usually subclass
 `BaseProcessor` (`process_item(item)`, plus `key` and `requires` class
@@ -365,8 +364,8 @@ The eligibility and retry rules are in spec §4.2; this is where they live:
 - `BaseProcessor.requires` (or `required_key(options)`, which `embed`
   overrides with its `input`) names the key the run reads;
   `require_annotation()` reads its value.
-- Dependencies: `summarize` and `tagger` read `markdown`; `embed` reads
-  `tags` or `markdown`.
+- Dependencies: `summarize`, `tagger` and `classify` read `markdown`;
+  `embed` reads its `input` (`tags` by default).
 - `Database.delete_annotations` removes annotations by id, each with the
   state of its run (one row), so their runs find the items pending. `delete annotations` passes what `find_annotations` selects.
 
@@ -431,18 +430,18 @@ The applets:
   `backfill` of 0 it emits nothing. It emits the
   oldest item first (`ItemFeedApplet.age`: publication time, or import time
   without one, then id), so its sinks deliver in that order.
-- `digest` writes one Markdown document per source, keyed
-  `<source id>/<since>_<until>` (YYYY-MM-DD) over the last `lookback`. It
-  reads `markdown` of the newest `max_items` items per source, cuts each to
-  `max_article_chars`, sends them oldest first in one prompt with a
-  `context_length` window and prepends a `# <source name>: <since> –
-  <until>` title to the model's answer.
-- The three `grouping` applets share `GroupingApplet` and differ only in
-  their clustering step: single-link and average-link over tag overlap, and
-  single-link over tag overlap blended with the cosine similarity of the
-  `embed` vectors (`embeddings`, which reads `tags_embedding` or
-  `markdown_embedding` and leaves out items without one). Each run emits one
-  JSON document keyed by its time.
+- `digest` reads the items published in the `span_days` whole local days
+  before the run's day (`period`) that have its `input` annotation and
+  pass its `include`/`exclude` filters (`read_candidates`, giving frozen
+  `Candidate`s with their text, tags, topics and vector), groups them into
+  stories and keeps the `max_stories` best (`select_stories`): a pairwise
+  `score_matrix` (Jaccard tag overlap, blended with the cosine similarity
+  of the vectors with `algorithm: embeddings`, times a time decay with a
+  `tau`) clustered by the function `CLUSTERERS` maps `algorithm` to
+  (`single_link_clusters`, `average_link_clusters`), each `Story` scored by
+  `story_score`. It emits `plan` (JSON) and, with `write`, `digest`
+  (Markdown: one LLM call per story, one for the opening paragraph), both
+  keyed `<from>_<to>`; no stories, no documents.
 
 ## Sinks
 

@@ -47,8 +47,8 @@ plugins:
 
   feed:
     title: Castelló news
-  digest:                            # sends a week of articles per source
-    lookback: 7d
+  digest:                            # one digest of a week's stories
+    span_days: 7
 
   telegram:                          # instances may name their own bot
     bot_token: ${TELEGRAM_BOT_TOKEN} # and chat
@@ -117,10 +117,13 @@ processors:
   - markdownify                      # markdown
   - summarize                        # summary
   - tagger                           # tags
-  - embed                            # tags_embedding
+  - processor: classify              # topics, from a closed list
+    options:
+      labels: [política, urbanismo, vivienda, cultura, economía, deportes, sucesos]
+  - embed                            # tags/embedding
   - processor: embed
     options:
-      input: markdown                # markdown_embedding
+      input: markdown                # markdown/embedding
   # A second summary, in Spanish, with its own prompt and model, for the
   # workflows that name it:
   # - processor: summarize
@@ -130,6 +133,18 @@ processors:
   #   options:
   #     prompt: "Resume en español el siguiente artículo:\n\n"
   #     model: gemma4:27b
+  # - processor: embed                 # summary/embedding/es
+  #   id: embed-summary-es
+  #   skip_default: true
+  #   options: {input: summary/es}
+  # A yes/no label, for sources that mix in other news:
+  # - processor: classify
+  #   id: about-spain
+  #   key: about/spain
+  #   skip_default: true
+  #   options:
+  #     question: Is the article mainly about Spain or Spaniards?
+  #     labels: ["yes", "no"]          # quoted: YAML reads yes/no as booleans
 
 # Workflows, run with `-w NAME` (one cron line each), import and process. A
 # workflow sees only its sources. Entries are catalog ids, type names (the
@@ -191,17 +206,39 @@ apps:
     app: itemfeed
     options: {sources: [juntagobiernolocal]}
     sink: telegram-juntas
-  - id: weekly-digest                # Mondays from 07:00
+  - id: castello-weekly              # Mondays from 07:00, last week's stories
     app: digest
     at: "07:00"
     days: [mon]
-    options: {sources: [castellonplaza]}
-    sink: telegram-main
+    options:
+      title: Castelló
+      sources:
+        - elperiodicomediterraneo-castello
+        - castelloninformacion-castello
+        - castellonplaza
+      exclude: {topics: [deportes, sucesos]}
+      topic_weights: {vivienda: 3, urbanismo: 2}
+      # write: false                 # only the plan, to tune the options
+    routes:
+      digest: [telegram-main]        # the plan: `inspect documents`
+  # Foreign media on Spain, daily, in Spanish (needs summary-es,
+  # embed-summary-es and about-spain run on its sources):
+  # - id: spain-abroad
+  #   app: digest
+  #   at: "08:00"
+  #   options:
+  #     title: España en la prensa extranjera
+  #     sources: [the-guardian-spain]
+  #     span_days: 1
+  #     input: summary/es
+  #     include: {about/spain: ["yes"]}
+  #     algorithm: embeddings
+  #     embedding: summary/es
+  #     story_prompt: "Explica qué cuenta cada medio extranjero sobre esta noticia, citándolo por su nombre..."
+  #   routes:
+  #     digest: [chat-main]
   # - id: headlines
   #   app: feed
   #   every: 1h
   #   options: {max_items: 10}
   #   sink: site
-  # - id: events
-  #   app: avglink
-  #   every: 6h                      # no route: read with `inspect documents`
