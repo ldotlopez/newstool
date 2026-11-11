@@ -151,7 +151,9 @@ class DigestApplet(BaseApplet):
             EmittedDocument(
                 output=PLAN_OUTPUT,
                 key=key,
-                content=json.dumps(plan_payload(stories, len(candidates)), indent=2),
+                content=json.dumps(
+                    plan_payload(stories, len(candidates)), indent=2, ensure_ascii=False
+                ),
                 content_type="application/json",
                 title=title,
             )
