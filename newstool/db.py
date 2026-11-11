@@ -22,7 +22,6 @@ from foundation.jsonlib import dump_json_compatible, load_json_compatible
 from foundation.storage import DiskStorage
 from sqlalchemy import (
     DDL,
-    JSON,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -82,16 +81,20 @@ class Base(DeclarativeBase):
 
 
 class CustomJSON(TypeDecorator):
-    """JSON column with pluggable encode/decode for non-standard Python types."""
+    """JSON stored as text, encoded once with foundation's helpers (they
+    round-trip types plain JSON lacks); `None` is SQL `NULL`.
 
-    impl = JSON
+    The column is declared TEXT: SQLite gives a column declared JSON numeric
+    affinity, which would turn a stored `42` or `1.50` into a number."""
+
+    impl = Text
     cache_ok = True
 
-    def process_bind_param(self, value: Any, dialect: Any) -> Any:
-        return dump_json_compatible(value)
+    def process_bind_param(self, value: Any, dialect: Any) -> str | None:
+        return None if value is None else dump_json_compatible(value)
 
-    def process_result_value(self, value: Any, dialect: Any) -> Any:
-        return load_json_compatible(value)
+    def process_result_value(self, value: str | None, dialect: Any) -> Any:
+        return None if value is None else load_json_compatible(value)
 
 
 class UTCDateTime(TypeDecorator):

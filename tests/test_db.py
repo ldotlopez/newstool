@@ -379,6 +379,35 @@ class ConnectionTests(DatabaseTestCase):
         self.assertEqual(enabled, 1)
 
 
+class JSONColumnTests(DatabaseTestCase):
+    def stored(self, app: str) -> tuple[str, object]:
+        with self.db.session_scope() as sess:
+            return sess.execute(
+                text("SELECT typeof(state), state FROM apps WHERE id = :app"),
+                {"app": app},
+            ).one()
+
+    def test_values_are_encoded_once_and_none_is_null(self):
+        started = datetime(2026, 11, 11, tzinfo=UTC)
+        for app, state in (("dict", {"cursor": "c"}), ("number", 42), ("none", None)):
+            self.db.commit_app_run(app, started, AppletResult(state=state), {})
+
+        self.assertEqual(self.stored("dict"), ("text", '{"cursor": "c"}'))
+        self.assertEqual(self.stored("number"), ("text", "42"))
+        self.assertEqual(self.stored("none"), ("null", None))
+        runs = self.db.get_app_runs()
+        self.assertEqual(
+            [runs[app].state for app in ("dict", "number", "none")],
+            [{"cursor": "c"}, 42, None],
+        )
+
+    def test_types_beyond_plain_json_round_trip(self):
+        when = datetime(2026, 11, 11, 9, 30, tzinfo=UTC)
+        self.db.commit_app_run("app", when, AppletResult(state={"at": when}), {})
+
+        self.assertEqual(self.db.get_app_run("app").state, {"at": when})
+
+
 class ProcessingTests(DatabaseTestCase):
     def setUp(self) -> None:
         super().setUp()
