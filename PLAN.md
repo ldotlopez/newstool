@@ -386,6 +386,194 @@ data. Design decisions, roadmap, plan and backlog: `docs/DIGESTS.md`.
 
 ---
 
+## Workflows as chains of global entities (decision 0019)
+
+Agreed 2026-11-14 (decision 0019 holds the model and its reasons). The
+catalog defines, workflows run: no `skip_default`, no implicit `default`
+workflow, workflow entries are catalog ids, a process key has one writer,
+an applet instance belongs to one workflow and reads its sources, and a
+workflow is the whole chain. CLI: `import`, `process`, `apps`, `deliver`
+and `run`, all with `-w NAME… | --all`. Each step leaves the suite green;
+code, tests and docs land together, then a `graphify:` commit.
+
+- [ ] **1. Config models** (`config.py`, `models.py`):
+  - `Workflow`: `name`, `sources`, `process`, `apps`, each `list[str]` of
+    ids. A mapping in `process` fails with "define it in `processors` with
+    an `id` and refer to it" (decision 0019).
+  - Drop `skip_default` from `SourceData`, `ProcessEntry` and `AppEntry`;
+    a `skip_default` key fails with "removed: list what runs in
+    `workflows`" (a before-validator, so the message beats pydantic's
+    "extra field").
+  - `ProcessEntry.ref`: its `id`, else its type name.
+  - Drop `Config.default_workflow()`, `all_workflows()`,
+    `default_app_ids()`, `DEFAULT_WORKFLOW` and the reservation of
+    `default`; `Config.workflows` is the list as written.
+  - Tests (`tests/test_config.py`): the removed shapes fail with their
+    messages; `ref` falls back to the type name.
+- [ ] **2. Catalog** (`catalog.py`):
+  - Processors by `ref`; two entries with one `ref` fail ("give each an
+    `id`"); a reference that is no `ref` fails, saying so when it is a type
+    name with no root entry ("add `- <type>` to `processors`").
+  - Keys unique across `processors`: a repeated key fails at load. Drop the
+    cross-workflow checks and the warning of `_add_process`, `in_default`
+    and `share_sources`. `process` stays keyed by (workflow, key), from
+    the workflows only.
+  - Applet ownership: `AppInstance.workflow` (the workflow that refers to
+    it, or None); an instance in two workflows, or an unknown id in
+    `apps:`, fails.
+  - `_check_app_requirements(profile, workflow)`: every key in
+    `requirements().keys` is written by a process run of that workflow.
+  - Load warnings for sources, processors and applet instances no workflow
+    refers to.
+  - Tests (`tests/test_app.py`, where the catalog rules are tested today
+    through `Application`): each error and warning above, and a processor
+    shared by two workflows.
+- [ ] **3. Applets** (`applets.py`, `plugins/feed.py`, `plugins/itemfeed.py`,
+  `plugins/digest.py`):
+  - Drop `SourcesOptions` (its options models subclass `PluginOptions`)
+    and `Requirements.sources`.
+  - `AppletReader` scoped to an instance's sources: `Application` builds
+    one per run (`AppletReader(db, sources)`), and `items()` loses its
+    `sources` argument; a reader of no workflow has no sources.
+  - The applets stop passing `options.sources`.
+  - Tests (`tests/test_applets.py`, the plugins' tests):
+    `test_reads_only_its_sources` reads through the scoped reader; the
+    `sources` option is rejected.
+- [ ] **4. Application** (`app.py`):
+  - `workflows` in configuration order; `workflow_apps(name)` and
+    `workflow_sinks(name)` (the sinks its instances are routed to).
+  - `process_keys(workflow, processor=None)` takes a processor `ref`, not a
+    type; drop the `DEFAULT_WORKFLOW` defaults of `workflow` arguments.
+  - `run_app` reads through the instance's workflow reader; an instance of
+    no workflow is an error ("not in any workflow").
+  - Drop `default_app_ids`.
+  - Tests (`tests/test_app.py`): `make_app` writes an explicit workflow;
+    the workflow's applets read only its sources; `workflow_sinks`.
+- [ ] **5. CLI** (`cli.py`):
+  - `selection_options` keeps one shape: `-w/--workflow` (repeatable) or
+    `--all`, exactly one, resolved to workflow names. Drop
+    `DEFAULT_SELECTION`, `app_selection`, `sink_selection`,
+    `selected_apps`, `selected_sinks` and `routed_from`.
+  - Narrowing within the selection: `--source` on `import` and `process`
+    (`import`'s `SOURCE` argument goes; `process`'s scope `--source`
+    becomes this one), `--processor` on `process` (a `ref`; the
+    `PROCESSOR` argument goes), `--app` on `apps`, `--sink` on `deliver`;
+    an id outside the selection fails.
+  - `apps`, a command: runs the selected workflows' due instances, no
+    delivery; `--force`, `--dry-run`. The `apps` group goes with
+    `--no-deliver`.
+  - `deliver -w X`: `workflow_sinks` of each; `--all`: every sink. Pacing
+    options and `--dry-run` unchanged.
+  - `run -w NAME… | --all`: per workflow, its import, process and apps
+    phases; then one delivery phase for the union of their sinks (every
+    sink with `--all`). `workflows_cmd` goes.
+  - `delete apps --app ID [--with-documents] [--dry-run]` (today's
+    `apps_reset_cmd`); `inspect apps` gains a Workflow column.
+  - Tests (`tests/test_cli.py`, `tests/test_delete_cli.py`): bare commands
+    and two selections fail; `-w` repeated; `--all`; each narrowing and its
+    error; `apps` sends nothing; `deliver -w`; `run` delivers once per
+    sink after every workflow's applets; `delete apps`.
+- [ ] **6. `config.example.yaml`** — the catalog defines, workflows run.
+  Comment changes: drop the `skip_default`/`default` paragraphs; the
+  workflows section says that workflows are the only thing that runs,
+  their entries are ids and a workflow is the whole chain; the `apps`
+  comment drops `sources` and `--default`. Entries:
+  - `sources`: as today, without `skip_default` on `juntagobiernolocal`.
+  - `processors`: the two `embed` entries get ids (`embed-tags`,
+    `embed-markdown`); the commented `summary-es`, `embed-summary-es` and
+    `about-spain` lose `skip_default`. As nothing active reads the
+    embeddings, they move to the commented `spain-abroad` block, so the
+    example loads without warnings.
+  - `apps`: no `sources` in `main-items`, `juntas-items`,
+    `castello-weekly` and the commented `spain-abroad`.
+  - `workflows` (replaces today's `juntas` alone):
+
+    ```yaml
+    workflows:
+      - name: castello                     # each new summary, to Telegram and Chat
+        sources:
+          - elperiodicomediterraneo-castello
+          - castelloninformacion-castello
+          - castellonplaza
+          - the-guardian-spain
+        process: [markdownify, summarize]
+        apps: [main-items]
+      - name: castello-weekly              # Mondays from 07:00: last week's stories
+        sources:
+          - elperiodicomediterraneo-castello
+          - castelloninformacion-castello
+          - castellonplaza
+        process: [markdownify, summarize, tagger, classify]
+        apps: [castello-weekly]
+      - name: juntas
+        sources: [juntagobiernolocal]
+        process: [markdownify, summarize]
+        apps: [juntas-items]
+      # - name: spain-abroad
+      #   sources: [the-guardian-spain]
+      #   process: [markdownify, tagger, summary-es, embed-summary-es, about-spain]
+      #   apps: [spain-abroad]
+    ```
+
+    Cron comment: `*/15 * * * * newstool -c config.yaml run --all`.
+- [ ] **7. `config.yaml`** (git-ignored; the live configuration: change it
+  when the code lands, not before). Today: two sources, four processors
+  and `castello-weekly` (a plan-only digest, `write: false`), run as the
+  implicit `default` workflow. Target: the same entities, one workflow;
+  the stale comments (`remixers`, `default: false`, `deliver` entries) go.
+
+    ```yaml
+    sources:
+      - {id: elperiodicomediterraneo-castello, name: El Periódico Mediterraneo (Castelló ciudad),
+         provider: prensaiberica, url: https://www.elperiodicomediterraneo.com/castello/}
+      - {id: castelloninformacion-castello, name: Castellón información (Castelló ciudad),
+         provider: castelloninformacion, url: https://www.castelloninformacion.com/tags/castellon/}
+      # the commented sources stay as they are
+
+    llms: [ollama]
+    plugins:
+      ollama: {...}                      # unchanged
+
+    processors:
+      - markdownify
+      - summarize
+      - tagger
+      - processor: classify
+        options:
+          labels: [política, urbanismo, vivienda, cultura, economía, deportes, sucesos]
+
+    apps:
+      - id: castello-weekly
+        app: digest
+        options:
+          title: Castelló
+          span_days: 7
+          exclude: {topics: [deportes, sucesos]}
+          topic_weights: {vivienda: 3, urbanismo: 2}
+          write: false                   # plan only: no LLM cost while tuning
+
+    # Workflows are the only thing that runs: `run -w castello`.
+    workflows:
+      - name: castello
+        sources: [elperiodicomediterraneo-castello, castelloninformacion-castello]
+        process: [markdownify, summarize, tagger, classify]   # digest reads summary, tags, topics
+        apps: [castello-weekly]
+    ```
+
+    `castello-weekly` has no schedule, so it runs on every `run -w
+    castello`: give it `at: "07:00"` and `days: [mon]` before the cron line
+    calls `run` often, or run it by hand (`apps -w castello`).
+- [ ] **8. Docs** (with the code, same commit): README (configuration,
+  workflows, *Selecting what runs*, the phases, cron, applet options
+  without `sources`), SPECIFICATION (§2 config, §3.1 workflows, §4.2,
+  §4.3), ARCHITECTURE (`config.py`, `catalog.py`, `app.py`, `cli.py`,
+  applets), and remove the backlog entry "Workflows as chains of global
+  entities".
+- [ ] **9. Checks and commits:** ruff, the unittest suite, `graphify update
+  .`; commit `config: workflows as chains of global entities (0019)`, then
+  `graphify: rebuild after ...`. Production: replace `config.yaml` (step
+  7) and the cron lines together with the deploy.
+
 ## Done
 
 - [x] **Plugin bundles with `foundation.plugin.Register`** (decision 0003, revised):
@@ -626,132 +814,8 @@ data. Design decisions, roadmap, plan and backlog: `docs/DIGESTS.md`.
   update of `config.example.yaml` and the docs, and clear errors for the
   old names. Stored data keyed by config values (source `id`s, process
   `key`s, applet and sink `id`s) must not change meaning.
-- **Workflows as chains of global entities** (2026-11-14, agreed proposal;
-  replaces the 2026-11-11 "one command per phase" idea). Every decision is
-  settled (below); next: an implementation plan and a decision record.
-  - **Why.** Today a workflow can define processor entries of its own and
-    a string in `process:` is an id *or* a type name; two workflows can
-    write one key with different options on shared sources (the "one
-    type per key" rule and its warning); `process PROCESSOR` names a type,
-    ambiguous with several runs of it; applets belong to no workflow, so a
-    workflow's chain needs `workflows -w X` plus `apps run`; an applet's
-    `sources` option repeats or contradicts its workflow's; what runs
-    depends on implicit rules (`default` is whatever has no
-    `skip_default`); and selection has two models (`-w`/`--default`/
-    `--all` over workflows, `--app`/`--sink`/`--default`/`--all` over
-    instances, `--default` with three rules).
-  - **Configuration: the catalog defines, workflows run.**
-    - The catalog only defines entities: `sources`, `processors`, `apps`,
-      `sinks` (and `llms`, `plugins` as today). Every entry has an `id`; a
-      root entry without one takes its type name (`processors:
-      [markdownify]` is `markdownify`); two entries of one type need
-      explicit ids. Defining an entity never runs it.
-    - No `skip_default` anywhere and no implicit `default` workflow;
-      `default` is no longer a reserved name.
-    - Workflows are the only thing that runs: `name`, `sources`, `process`
-      and `apps`, all lists of catalog ids. No entries of their own, no
-      type names. Sinks follow from the instances' routes.
-    - A process key is written by one catalog entry: a repeated key is a
-      load error. Two workflows that run one key run the same entry, so
-      key conflicts on shared sources disappear. (0009 rejected unique keys
-      because a source outside `default` could not get `markdown`; with
-      global entries, any workflow refers to the same `markdownify`.)
-    - An applet instance belongs to at most one workflow (a load error
-      otherwise). It runs in one chain only, right after its sources are
-      processed; no applet runs twice per call (`feed` and the grouping
-      applets emit anew on every run).
-    - An instance reads exactly its workflow's sources: the applets'
-      `sources` option goes.
-    - Every key an instance requires (`requirements().keys`) must be
-      written by a process entry of its own workflow (a load error
-      otherwise), so a chain produces everything its applets read and
-      their result does not depend on other chains' timing.
-    - An entity no workflow refers to is a load warning (dead
-      configuration).
-  - **A workflow is the whole chain:** import its sources, run its
-    process entries in order on them, run its applet instances that are
-    due, then deliver to the sinks they are routed to.
-  - **CLI: one command per phase, one selection model.**
-    - `import`, `process`, `apps` (no delivery; `--no-deliver` goes) and
-      `deliver`, one phase each; `run`, the whole chain. `workflows` goes
-      (`run -w X` is its chain, applets included).
-    - Selection, exactly one, on every command: `-w NAME` (repeatable) or
-      `--all` (every workflow, in configuration order). No `--default`. A
-      bare command is a usage error, as in 0017.
-    - The phase commands narrow by id within the selection: `--source`
-      (`import`, `process`), `--processor` (`process`), `--app` (`apps`),
-      `--sink` (`deliver`); an id outside the selected workflows is an
-      error. `run` takes only the selection.
-    - `deliver -w X`: the sinks X's instances are routed to; `deliver
-      --all`: every sink, rows queued by hand for unrouted sinks included.
-    - `apps reset` becomes `delete apps --app ID [--with-documents]
-      [--dry-run]`, next to `inspect apps`: it deletes an instance's run
-      record (and its documents), and need not be configured, as today.
-    - Unchanged: `process --force` and its scope filters, `apps --force`
-      and `--dry-run`, `deliver`'s pacing overrides and `--dry-run`.
-    - Cron: `run -w X` per workflow, several `-w` on one line, or
-      `run --all`.
-  - **Example** (the Mediterraneo configuration: one workflow per channel;
-    the processors are defined once and referred to by both):
-
-    ```yaml
-    sources:
-      - {id: med-ciudad, name: ..., provider: prensaiberica, url: .../castello/}
-      - {id: med-provincia, name: ..., provider: prensaiberica, url: .../castello-provincia/}
-    processors:
-      - markdownify
-      - {id: summary-tg-es, processor: summarize, key: summary/telegram/es, options: {prompt: ...}}
-    apps:
-      - {id: app-ciudad, app: itemfeed, sink: tg-ciudad, options: {annotation: summary/telegram/es}}
-      - {id: app-provincia, app: itemfeed, sink: tg-provincia, options: {annotation: summary/telegram/es}}
-      - {id: digest-semanal, app: digest, at: "09:00", days: [mon], sink: tg-resumen}
-    workflows:
-      - {name: noticias-ciudad, sources: [med-ciudad], process: [markdownify, summary-tg-es], apps: [app-ciudad]}
-      - {name: noticias-provincia, sources: [med-provincia], process: [markdownify, summary-tg-es], apps: [app-provincia]}
-      # an aggregating applet gets a workflow of its own: importing again is
-      # cheap (preflight, HTTP cache) and `markdownify` skips what is done
-      - {name: resumen-semanal, sources: [med-ciudad, med-provincia], process: [markdownify], apps: [digest-semanal]}
-    ```
-
-    Cron: `*/15 * * * * newstool -c config.yaml run --all`.
-  - **Decisions** (settled 2026-11-14):
-    1. `apps` is a phase command; the reset moves to `delete apps --app
-       ID`, next to `inspect apps`.
-    2. An instance reads exactly its workflow's sources (no `sources`
-       option), and every key it requires is written by its own workflow.
-    3. A process key is unique across the catalog.
-    4. `run` takes only the selection; narrowing stays on the phase
-       commands, where step-by-step debugging happens.
-    5. No `skip_default` and no `default` workflow: workflows are the only
-       thing that runs, so `--default` disappears.
-    6. An applet instance belongs to at most one workflow (follows from 2).
-  - **Accepted costs.**
-    - A minimal configuration needs an explicit workflow (about four
-      lines), and adding a source or a processor to a single-chain setup
-      touches the catalog and the workflow.
-    - Processing a source without feeding a workflow's applets needs a
-      workflow of its own.
-    - An aggregating applet needs a workflow of its own.
-  - **Impact.**
-    - A decision record superseding parts of 0009 (the root keys as the
-      `default` workflow, workflow entries of their own, the rejected
-      unique keys), 0010 (strings as type names), 0015 (applets in no
-      workflow, `apps run` delivering, `apps reset`), 0016
-      (`--no-deliver`) and 0017 (`workflows`, `--default`, `skip_default`
-      on applets, `run --default|--all`).
-    - Breaks every configuration file: the root keys' implicit workflow
-      becomes a named one; workflow entries move to `processors` with an
-      `id`; workflows gain `apps`; applets lose `sources`; `skip_default`
-      goes. Clear load errors for the old shapes. Stored data does not
-      change: the database stores no workflow names, and source, applet
-      and sink ids and process keys keep their meaning.
-    - Breaks cron lines and the examples again.
-    - Touches `config.py` (`Workflow`, the entries, validation),
-      `catalog.py` (resolution by id, key uniqueness, applet ownership,
-      required keys), `app.py` (workflow applets and sinks), `applets.py`
-      (no `sources` option; the reader scoped to the workflow), `cli.py`,
-      the tests, `config.example.yaml`, README, SPECIFICATION and
-      ARCHITECTURE.
+- **Workflows as chains of global entities**: agreed, decision 0019;
+  the plan is its section above.
 - **Story digests, second version**: in `docs/DIGESTS.md` (*Backlog*).
 
 ---
