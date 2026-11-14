@@ -21,9 +21,9 @@ and reach it only through the `Application` class.
 | Term | Definition |
 | --- | --- |
 | **Source** | An entry of the `sources` configuration section, with `id`, `name`, `provider` and `url`. Its identity is its `id`. |
-| **Workflow** | Which sources to import and the process runs on them. `default` is built from the catalog; `workflows` adds more. |
+| **Workflow** | A chain, the only thing that runs: its sources, its process entries and its applet instances, by `id`; its sinks are those its instances are routed to. Each runs import, process, applets and delivery. |
 | **Plugin** | A bundle of plugin types: named classes of providers, processors, applets, sinks and LLMs. Every bundle is loaded; nothing is built until a run needs it. |
-| **Catalog** | The configured uses of the plugin types (`llms`, `sources`, `processors`), each with its options; an `id` lets workflows refer to one. Applet and sink instances (`apps`, `sinks`) are global and always have an `id`. |
+| **Catalog** | The configured uses of the plugin types (`llms`, `sources`, `processors`, `apps`, `sinks`), each with its options and an `id` workflows refer to it by. Defining a use never runs it. |
 | **Provider** | Object that knows how to handle one kind of site. One implementation serves every URL with the same structure. |
 | **Item** | A unit of acquired content. Key: `(source id, uid)`. Its `uri` is just another field and is not unique. It also has a numeric id, a local handle to select it that is never reused but changes if the database is rebuilt. |
 | **uid** | The item's identifier within its source, produced by the provider. It must be deterministic and stable across runs; how it is computed is up to the provider. |
@@ -53,18 +53,17 @@ sources:
     provider: <provider type>
     url: <url>
     options: {...}         # over the provider's plugin section
-    skip_default: false    # true: only the workflows that name it use it
 processors:
-  - <processor type>       # a run with the section's options, or
+  - <processor type>       # id: the type's name; the section's options, or
   - processor: <processor type>
-    id: <id>               # lets workflows refer to it
+    id: <id>               # default: the type's name
     key: <annotation key>  # default: the processor's own
     options: {...}         # over the processor's plugin section
-    skip_default: false    # true: left out of `default`
 workflows:
   - name: <name>
     sources: [<source id>, ...]
-    process: [...]         # catalog ids, type names or entries without id
+    process: [<processor id>, ...]   # in order
+    apps: [<applet instance id>, ...]
 sinks:
   - id: <id>               # required
     sink: <sink type>
@@ -78,7 +77,6 @@ apps:
     options: {...}         # over the applet's plugin section
     sink: <sink id>        # an applet with one output, or
     routes: {<output>: [<sink id>, ...]}
-    skip_default: false    # true: left out of `--default`
 cache:
   expiration: <duration>   # HTTP cache lifetime: seconds, or 5m, 2h, 3d
 db:
@@ -99,38 +97,44 @@ the workflow, so a bad option fails every command with its path
 (`plugins.<type>.<option>`, `sources.<id>.options.<option>`,
 `apps.<n>.options.<option>`). An object is built only when a run needs it.
 
-An `id` names a catalog entry so that workflows can refer to it; it cannot
-be a type's name. A workflow entry is a catalog id, a type name (the type
-with its section's options) or an entry of its own, without `id`; a
-reference cannot change the entry's options. An object that uses an LLM
+An `id` names a catalog entry so that workflows can refer to it; a
+`processors` entry without one takes its type's name, so two entries of
+one type need explicit ids, and an explicit `id` cannot be another type's
+name. A workflow refers to entries as they are: it has no entries of its
+own and cannot change an entry's options. An object that uses an LLM
 names it by id or type (`llm:`), or takes the first of `llms`; a name that
 resolves to none is a configuration error.
 
 ### 3.1 Workflows
 
-`default` uses every source without `skip_default: true` and runs, in
-order, every catalog processor without it. Each entry of `workflows` names
-its sources and its process runs. Each phase only touches its workflow's
-sources. Applets and sinks belong to no workflow (§4.3).
+The catalog defines; workflows are the only thing that runs. A workflow
+names, by `id`, its sources, its process entries (in order) and its applet
+instances; its sinks are those its instances are routed to. Running it
+imports its sources, runs its process entries on them, runs its instances
+that are due, then delivers to its sinks. Each phase only touches its
+workflow's sources.
 
-Every command that runs something is told what: names (`-w NAME`,
-`--app ID`, `--sink ID`), `--default` or `--all`, exactly one; a bare one
-is a usage error. `--default` is what has no `skip_default`: the `default`
-workflow, the applet instances without it and the sinks they are routed
-to. `--all` is everything, skipped or not: every workflow in turn,
-`default` first, every applet instance and every sink. `run` runs a
-workflow selection, then the applets and the delivery, both `--default` or
-both `--all`.
+Every command that runs something is told which workflows: `-w NAME`
+(repeatable) or `--all` (every workflow, in configuration order), exactly
+one; a bare one is a usage error. The phase commands narrow by id within
+that selection (a source, a processor, an applet instance, a sink); an id
+outside it is an error. `run` runs each selected workflow's import,
+process and applets in turn, then one delivery for the union of their
+sinks, every sink with `--all`: a sink delivers once per call.
 
-- A process key is written by one run within a workflow. On sources shared
-  by workflows, one processor type writes it; other options for it are a
-  warning (the first run to process an item writes it). Workflows with
-  disjoint sources may write the same key, since annotations belong to
-  items.
-- Every key a process run reads must be written by a process run on its
-  workflow's sources, in any workflow.
+- A process key is written by one catalog entry; two entries with one key
+  are a configuration error. Workflows that run a key run the same entry,
+  so a key means the same on every source.
+- Every key a process entry reads must be written by a process entry on
+  its workflow's sources, in any workflow.
+- An applet instance belongs to at most one workflow and reads exactly its
+  sources; every key it reads must be written by a process entry of that
+  workflow (§4.3).
+- A source, processor or applet instance no workflow names never runs, and
+  is reported at start-up. A sink no instance routes to still delivers the
+  rows queued for it by hand.
 - Ids, workflow names and output names are lowercase letters, digits, `_`
-  and `-`; `default` is reserved.
+  and `-`.
 
 A source's `id` is part of its items' key, so it must be stable; its `url`
 and `provider` can change without losing items.
@@ -177,9 +181,10 @@ article.
 ### 4.2 Processing
 
 Processors create annotations on items. `process` runs each selected
-workflow's process runs in order; each run writes one key, by default the processor's
-own, and keeps its own processing state per item under that key (§3.1). A
-run's options override those of the processor's plugin section.
+workflow's process entries in order, or only one entry by its id; each
+writes one key, by default the processor's own, and keeps its own
+processing state per item under that key (§3.1). An entry's options
+override those of the processor's plugin section.
 
 - **Dependencies:** a run declares the key it reads. It only picks up items
   whose run of that key finished successfully on their current content; the
@@ -210,16 +215,18 @@ run's options override those of the processor's plugin section.
 
 ### 4.3 Applets
 
-Applets are a plugin type of their own. Each configured instance decides
-when it runs, reads items, annotations and the documents of any instance,
-and returns its new state and the documents it emits. `apps run` runs the
-selected instances that are due, then delivers: with `--all` to every sink,
-otherwise to the sinks they are routed to.
+Applets are a plugin type of their own. Each configured instance belongs
+to at most one workflow, decides when it runs, reads the items of its
+workflow's sources, their annotations and the documents of any instance,
+and returns its new state and the documents it emits. `apps` runs the
+selected workflows' instances that are due and sends nothing; delivery is
+its own phase (§4.4).
 
 - **When it runs:** an instance is due when its schedule allows it:
   `every` after its last success, on its `days`, once a day from `at`
-  (local time). Without a schedule it is due on every `apps run`. An
-  applet may decide otherwise. A forced run ignores the schedule.
+  (local time). Without a schedule it is due every time its workflow's
+  applets run. An applet may decide otherwise. A forced run ignores the
+  schedule.
 - **Run record:** per instance, the start of its last run, the start of its
   last successful one, its last error, and an opaque state only that
   applet reads. The applet computes what each run covers (since its last
@@ -237,16 +244,20 @@ otherwise to the sinks they are routed to.
   rows and its new state at once. A failed run stores only its error; its
   state stays as it was, so the next run covers the same window again.
 - Applets have **no external side effects**: they never send anything.
-- **Requirements:** an applet declares the sources and annotation keys it
-  reads; an unknown source, or a key no process run writes on any of those
-  sources, is a configuration error.
-- **Reset** deletes an instance's run record, so it starts from scratch.
+- **Requirements:** an applet declares the annotation keys it reads; a key
+  no process entry of its workflow writes is a configuration error, so a
+  chain produces everything its applets read.
+- **Reset** (`delete apps`) deletes an instance's run record, so it starts
+  from scratch, configured or not.
   Its documents stay unless asked otherwise, so what it emits again under
   their keys is not delivered again.
 
 ### 4.4 Deliver
 
-Sinks deliver the documents routed to them and record every delivery.
+Sinks deliver the documents routed to them and record every delivery. A
+workflow's delivery covers its sinks, those its instances are routed to;
+delivering every sink also reaches rows queued by hand for sinks no
+instance routes to.
 
 - **Routes:** each document a run emits, new or already stored, gets a
   `queued` delivery for each sink its output is routed to that it has none
@@ -290,8 +301,9 @@ process, not a network service. It offers:
 
 - **Queries** of items, annotations, documents, applet runs and
   deliveries.
-- **Running** import and process per workflow, applet instances (due,
-  forced, or as a dry run) and the deliveries of each sink instance.
+- **Running** import and process per workflow, a workflow's applet
+  instances (due, forced, or as a dry run) and the deliveries of each sink
+  instance.
 - **Forced regeneration** of annotations, which resets the attempt counter.
 - **Deletion** of annotations, by processor, by item or both. Deleting also
   removes the processing state, so the item becomes pending again with

@@ -72,6 +72,19 @@ def retrieved(
     )
 
 
+def chain(
+    process: str = "",
+    apps: str = "",
+    sources: str = "mediterraneo, juntas",
+    name: str = "w",
+) -> str:
+    """A `workflows` section of one workflow, its lists as YAML flow items."""
+    return (
+        f"workflows:\n  - {{name: {name}, sources: [{sources}],"
+        f" process: [{process}], apps: [{apps}]}}\n"
+    )
+
+
 class ApplicationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="newstool-test-"))
@@ -85,7 +98,7 @@ class ApplicationTests(unittest.TestCase):
         self,
         plugins: str = "  feed: {title: Test feed}\n",
         catalog: str = "processors: [markdownify]\napps: [{id: news, app: feed}]\n",
-        workflows: str = "",
+        workflows: str = chain("markdownify", "news"),
     ) -> Application:
         config = Config.from_text(
             f"""
@@ -290,6 +303,7 @@ sources:
     options: {options}
 plugins:
   feedreader: {{article_selector: nav}}
+workflows: [{{name: w, sources: [blog]}}]
 storage_dir: {self.tmp_dir}/rss
 cache_dir: {self.tmp_dir}/cache
 """
@@ -303,7 +317,7 @@ cache_dir: {self.tmp_dir}/cache
     def test_objects_are_built_when_a_run_needs_them(self) -> None:
         self.assertEqual(self.app._objects, {})
         self.import_sample()
-        self.app.run_process("markdown")
+        self.app.run_process("markdown", workflow="w")
 
         self.assertEqual(
             sorted(profile.name for profile in self.app._objects),
@@ -313,8 +327,8 @@ cache_dir: {self.tmp_dir}/cache
     def test_process_then_run_an_applet(self) -> None:
         item = self.import_sample()
 
-        self.assertEqual(self.app.run_process("markdown").done, 1)
-        self.assertEqual(self.app.run_process("markdown").done, 0)
+        self.assertEqual(self.app.run_process("markdown", workflow="w").done, 1)
+        self.assertEqual(self.app.run_process("markdown", workflow="w").done, 0)
         markdown = self.app.get_annotations(item)["markdown"]
         self.assertIn("asedio carlista", markdown)
 
@@ -328,14 +342,15 @@ cache_dir: {self.tmp_dir}/cache
 
     def test_delete_annotations_makes_the_item_pending_again(self) -> None:
         item = self.import_sample()
-        self.app.run_process("markdown")
+        self.app.run_process("markdown", workflow="w")
 
         (annotation,) = self.app.find_annotations(key="markdown")
         self.assertEqual(self.app.delete_annotations([annotation.id]), 1)
 
         self.assertEqual(self.app.get_annotations(item), {})
         scope = ProcessingScope(source="mediterraneo")
-        self.assertEqual(self.app.run_process("markdown", scope=scope).done, 1)
+        run = self.app.run_process("markdown", workflow="w", scope=scope)
+        self.assertEqual(run.done, 1)
 
     def test_write_lock_is_exclusive_until_close(self) -> None:
         self.app.lock()
@@ -348,59 +363,73 @@ cache_dir: {self.tmp_dir}/cache
         self.app = other
 
     def test_only_configured_runs_run(self) -> None:
-        with self.assertRaisesRegex(ConfigError, "processor 'nope' does not exist"):
-            self.app.process_keys("nope")
+        with self.assertRaisesRegex(ConfigError, "processor 'nope' is not configured"):
+            self.app.process_runs(["w"], "nope")
         with self.assertRaisesRegex(
-            ConfigError, "no process run of workflow 'default' writes the key"
+            ConfigError, "no process run of workflow 'w' writes the key"
         ):
-            self.app.run_process("summary")
+            self.app.run_process("summary", workflow="w")
         with self.assertRaisesRegex(ConfigError, "app 'nope' is not configured"):
             self.app.run_app("nope", NOW)
         with self.assertRaisesRegex(ConfigError, "sink 'nope' is not configured"):
             self.app.deliver("nope", NOW)
         with self.assertRaisesRegex(ConfigError, "workflow 'nope' is not configured"):
-            self.app.process_keys(workflow="nope")
+            self.app.process_runs(["nope"])
 
-    def test_default_runs_the_catalog_in_order_without_skip_default(self) -> None:
+    def test_workflows_run_what_they_refer_to_in_their_order(self) -> None:
         self.app.close()
         self.app = self.make_app(
             catalog="""
 processors:
   - markdownify
-  - {processor: markdownify, key: markdown/copy, skip_default: true}
+  - {processor: markdownify, id: copy, key: markdown/copy}
 apps:
   - {id: news, app: feed}
-  - {id: short, app: feed, options: {max_items: 1}, skip_default: true}
-"""
+  - {id: short, app: feed, options: {max_items: 1}}
+""",
+            workflows="""
+workflows:
+  - {name: a, sources: [mediterraneo], process: [markdownify], apps: [news]}
+  - {name: b, sources: [juntas], process: [copy, markdownify], apps: [short]}
+""",
         )
 
-        self.assertEqual(self.app.process_keys(), ["markdown"])
+        self.assertEqual(self.app.workflows, ["a", "b"])
+        self.assertEqual(
+            self.app.process_runs(["b", "a"]),
+            [("b", "markdown/copy"), ("b", "markdown"), ("a", "markdown")],
+        )
+        self.assertEqual(
+            self.app.process_runs(["a", "b"], "copy"), [("b", "markdown/copy")]
+        )
+        with self.assertRaisesRegex(
+            ConfigError, "processor 'copy' is in none of the workflows"
+        ):
+            self.app.process_runs(["a"], "copy")
+        self.assertEqual(self.app.workflow_apps("b"), ["short"])
         self.assertEqual(self.app.app_ids, ["news", "short"])
-        self.assertEqual(self.app.default_app_ids, ["news"])
 
     def test_source_ids_of_workflows_each_once_in_configuration_order(self) -> None:
         self.app.close()
         self.app = self.make_app(
+            catalog="",
             workflows="""
 workflows:
   - {name: both, sources: [juntas, mediterraneo]}
   - {name: juntas, sources: [juntas]}
-"""
+""",
         )
 
         self.assertEqual(
             self.app.source_ids(["juntas", "both"]), ["mediterraneo", "juntas"]
         )
-        self.assertEqual(self.app.source_ids(["both"], "juntas"), ["juntas"])
-        with self.assertRaisesRegex(
-            ConfigError, "source 'mediterraneo' is not in the workflow"
-        ):
-            self.app.source_ids(["juntas"], "mediterraneo")
+        self.assertEqual(self.app.source_ids(["juntas"]), ["juntas"])
 
     def test_an_applet_runs_when_due_and_its_runs_are_recorded(self) -> None:
         self.app.close()
         self.app = self.make_app(
-            catalog="apps:\n  - {id: news, app: feed, every: 1h}\n"
+            catalog="apps:\n  - {id: news, app: feed, every: 1h}\n",
+            workflows=chain(apps="news"),
         )
         self.import_sample()
 
@@ -437,7 +466,7 @@ workflows:
     def test_routed_documents_are_delivered_by_their_sinks(self) -> None:
         site = self.tmp_dir / "site"
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(site))
+        self.app = self.routed_app(site)
         self.import_sample()
 
         self.app.run_app("news", NOW)
@@ -464,9 +493,10 @@ sinks:
 apps:
   - id: items
     app: itemfeed
-    options: {sources: [mediterraneo], backfill: all}
+    options: {backfill: all}
     sink: chat
 """,
+            workflows=chain("markdownify, summarize", "items"),
         )
         item = self.import_sample()
         self.app._db.record_result(
@@ -492,9 +522,17 @@ apps:
   - {{id: other, app: feed}}
 """
 
+    def routed_app(self, site: Path, catalog: str | None = None) -> Application:
+        """`news` routed to the file sink `site`, `other` to none, both in
+        workflow `w`."""
+        return self.make_app(
+            catalog=catalog or self.routed_catalog(site),
+            workflows=chain(apps="news, other"),
+        )
+
     def test_deliveries_are_marked_and_sent_again_by_id(self) -> None:
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app = self.routed_app(self.tmp_dir / "site")
         self.app.run_app("news", NOW)
         self.app.deliver("site", NOW)
         (row,) = self.app.find_deliveries()
@@ -517,11 +555,11 @@ apps:
     def test_rename_sink_moves_its_ledger_to_the_new_name(self) -> None:
         self.app.close()
         site = self.tmp_dir / "site"
-        self.app = self.make_app(catalog=self.routed_catalog(site))
+        self.app = self.routed_app(site)
         self.app.run_app("news", NOW)
         self.app.close()
         renamed = self.routed_catalog(site).replace("site", "web")
-        self.app = self.make_app(catalog=renamed)
+        self.app = self.routed_app(site, renamed)
 
         with self.assertRaisesRegex(ConfigError, "sink 'nope' is not configured"):
             self.app.rename_sink("site", "nope")
@@ -539,7 +577,7 @@ apps:
 
     def test_mark_gives_rows_to_documents_routed_to_the_sink(self) -> None:
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app = self.routed_app(self.tmp_dir / "site")
         self.app.run_app("other", NOW)  # not routed to `site`
         self.app.run_app("news", NOW)
         (row,) = self.app.find_deliveries()
@@ -576,16 +614,26 @@ apps:
         (row,) = self.app.find_deliveries()
         self.assertEqual(row.last_error, SET_BY_HAND)
 
-    def test_routed_sinks_of_applet_instances(self) -> None:
+    def test_routed_sinks_of_applet_instances_and_workflows(self) -> None:
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app = self.make_app(
+            catalog=self.routed_catalog(self.tmp_dir / "site"),
+            workflows="""
+workflows:
+  - {name: a, sources: [mediterraneo], apps: [news]}
+  - {name: b, sources: [juntas], apps: [other]}
+""",
+        )
 
         self.assertEqual(self.app.routed_sinks(["news", "other"]), ["site"])
         self.assertEqual(self.app.routed_sinks(["other"]), [])
+        self.assertEqual(self.app.workflow_sinks(["a"]), ["site"])
+        self.assertEqual(self.app.workflow_sinks(["b"]), [])
+        self.assertEqual(self.app.workflow_sinks(["b", "a"]), ["site"])
 
     def test_mark_with_filters_queues_documents_not_routed_to_the_sink(self) -> None:
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app = self.routed_app(self.tmp_dir / "site")
         self.app.run_app("other", NOW)  # not routed to `site`
 
         # --all takes the routed documents only.
@@ -611,7 +659,8 @@ sinks:
   - {id: chat, sink: telegram, options: {bot_token: t, chat_id: c}}
 apps:
   - {id: news, app: feed}
-"""
+""",
+            workflows=chain(apps="news"),
         )
         self.app.run_app("news", NOW)
 
@@ -623,13 +672,14 @@ apps:
 
     def test_a_route_added_later_queues_what_the_applet_emits_again(self) -> None:
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app = self.routed_app(self.tmp_dir / "site")
         self.app.run_app("other", NOW)
         self.app.close()
-        self.app = self.make_app(
-            catalog=self.routed_catalog(self.tmp_dir / "site").replace(
+        self.app = self.routed_app(
+            self.tmp_dir / "site",
+            self.routed_catalog(self.tmp_dir / "site").replace(
                 "{id: other, app: feed}", "{id: other, app: feed, sink: site}"
-            )
+            ),
         )
 
         dry = self.app.run_app("other", NOW, force=True, dry_run=True)
@@ -641,7 +691,7 @@ apps:
 
     def test_documents_with_pending_deliveries_are_not_deleted(self) -> None:
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app = self.routed_app(self.tmp_dir / "site")
         self.app.run_app("news", NOW)
         self.app.run_app("other", NOW)
         news, other = self.app.find_documents()
@@ -654,7 +704,7 @@ apps:
 
     def test_reset_forgets_the_run_and_with_documents_their_deliveries(self) -> None:
         self.app.close()
-        self.app = self.make_app(catalog=self.routed_catalog(self.tmp_dir / "site"))
+        self.app = self.routed_app(self.tmp_dir / "site")
         self.app.run_app("news", NOW)
 
         self.assertEqual(self.app.reset_app("news", dry_run=True), 0)
@@ -671,7 +721,6 @@ apps:
         self.assertEqual(len(self.app.run_app("news", NOW).new), 1)
 
     def test_invalid_entries_are_config_errors(self) -> None:
-        workflow = "workflows:\n  - {name: w, sources: [juntas], %s}\n"
         sinks = "sinks:\n  - {id: chat, sink: telegram, options: {bot_token: t, chat_id: c}}\n"
         for catalog, message in (
             (
@@ -681,6 +730,11 @@ apps:
             (
                 "apps: [{id: a, app: feed, options: {color: red}}]\n",
                 r"apps\.0\.options\.color: Extra inputs are not permitted",
+            ),
+            (
+                # An instance reads its workflow's sources: no option for them.
+                "apps: [{id: a, app: feed, options: {sources: [juntas]}}]\n",
+                r"apps\.0\.options\.sources: Extra inputs are not permitted",
             ),
             (
                 "apps: [{id: a, app: feed, sink: nope}]\n",
@@ -698,62 +752,103 @@ apps:
                 ),
             ),
             (
-                "apps: [{id: a, app: feed, options: {sources: [nope]}}]\n",
-                r"apps\.0: unknown source\(s\) nope",
-            ),
-            (
                 "sinks: [{id: s, sink: nope}]\n",
                 r"sinks\.0: no plugin provides the sink 'nope'",
             ),
             (
-                "processors: [markdownify]\n"
-                + workflow % "process: [{processor: tagger, key: markdown}]",
-                (
-                    r"workflows\.w\.process\.0: key 'markdown' is written by"
-                    r" markdownify too \(processors\.0\) on the same sources"
-                ),
-            ),
-            (
                 "processors:\n  - {processor: markdownify, id: tagger}\n",
                 r"processors\.0: the id 'tagger' is a processor type's name",
+            ),
+            (
+                "processors: [{processor: markdownify, skip_default: true}]\n",
+                r"processors\.0: `skip_default` was removed \(decision 0019\)",
+            ),
+            (
+                "apps: [{id: a, app: feed, skip_default: true}]\n",
+                r"apps\.0: `skip_default` was removed \(decision 0019\)",
             ),
         ):
             with (
                 self.subTest(catalog=catalog),
                 self.assertRaisesRegex(ConfigError, message),
             ):
-                self.make_app(catalog=catalog)
+                self.make_app(catalog=catalog, workflows="")
 
-    def test_what_runs_read_must_be_written_on_their_sources(self) -> None:
+    def test_workflows_refer_to_catalog_entries_only(self) -> None:
+        catalog = "processors: [markdownify]\napps: [{id: news, app: feed}]\n"
+        for workflows, message in (
+            (chain(sources="nope"), r"workflow 'w': unknown source\(s\) nope"),
+            (chain("tagger"), r"workflow 'w': unknown processor\(s\) tagger"),
+            (chain(apps="nope"), r"workflow 'w': unknown applet instance\(s\) nope"),
+            (
+                chain("markdownify, markdownify"),
+                r"workflow 'w': process lists markdownify twice",
+            ),
+            (
+                (
+                    "workflows:\n  - name: w\n    sources: [juntas]\n"
+                    "    process: [{processor: markdownify, key: copy}]\n"
+                ),
+                r"workflow 'w': process\.0: define it in `processors` with an `id`",
+            ),
+            (
+                (
+                    "workflows:\n"
+                    "  - {name: a, sources: [juntas], apps: [news]}\n"
+                    "  - {name: b, sources: [mediterraneo], apps: [news]}\n"
+                ),
+                r"app 'news' is in workflows 'a' and 'b'",
+            ),
+            (
+                chain(name="w") + "  - {name: w, sources: [juntas]}\n",
+                r"workflow names must be unique",
+            ),
+        ):
+            with (
+                self.subTest(workflows=workflows),
+                self.assertRaisesRegex(ConfigError, message),
+            ):
+                self.make_app(catalog=catalog, workflows=workflows)
+
+    def test_what_runs_read_must_be_written_by_its_workflow(self) -> None:
         for catalog, workflows, message in (
             (
                 "llms: [ollama]\nprocessors: [summarize]\n",
-                "",
+                chain("summarize"),
                 (
-                    r"processors\.0: summarize reads 'markdown', and no process run"
-                    r" writes it on the sources of workflow 'default'"
+                    r"workflows\.w\.process\.0: summarize reads 'markdown', and no"
+                    r" process run writes it on the sources of workflow 'w'"
                 ),
             ),
             (
+                "processors: [markdownify]\napps: [{id: a, app: itemfeed}]\n",
+                chain("markdownify", "a"),
+                (
+                    r"apps\.0: itemfeed reads 'summary', and no process entry of"
+                    r" workflow 'w' writes it"
+                ),
+            ),
+            (
+                "llms: [ollama]\napps: [{id: a, app: digest}]\n",
+                chain(apps="a"),
+                r"apps\.0: digest reads 'summary', and no process entry",
+            ),
+            (
+                # Another workflow writing it on the same sources is not enough:
+                # the chain must produce what its applets read.
                 (
                     "processors: [markdownify]\n"
-                    "apps: [{id: a, app: itemfeed, options: {sources: [juntas]}}]\n"
+                    "apps: [{id: a, app: itemfeed, options: {annotation: markdown}}]\n"
                 ),
-                "",
-                r"apps\.0: itemfeed reads 'summary', and no process run writes it",
-            ),
-            (
-                "apps: [{id: a, app: digest}]\n",
-                "",
-                r"apps\.0: digest reads 'summary', and no process run",
-            ),
-            (
                 (
-                    "processors: [{processor: markdownify, skip_default: true}]\n"
-                    "apps: [{id: a, app: digest, options: {sources: [juntas], input: markdown}}]\n"
+                    "workflows:\n"
+                    "  - {name: md, sources: [mediterraneo], process: [markdownify]}\n"
+                    "  - {name: feed, sources: [mediterraneo], apps: [a]}\n"
                 ),
-                "workflows:\n  - {name: w, sources: [mediterraneo], process: [markdownify]}\n",
-                r"apps\.0: digest reads 'markdown'",
+                (
+                    r"apps\.0: itemfeed reads 'markdown', and no process entry of"
+                    r" workflow 'feed' writes it"
+                ),
             ),
         ):
             with (
@@ -762,84 +857,78 @@ apps:
             ):
                 self.make_app(catalog=catalog, workflows=workflows)
 
-    def test_workflows_with_disjoint_sources_may_write_a_key_differently(
-        self,
-    ) -> None:
-        self.app.close()
-        self.app = self.make_app(
-            catalog="",
-            workflows="""
-workflows:
-  - {name: a, sources: [juntas], process: [markdownify]}
-  - name: b
-    sources: [mediterraneo]
-    process: [{processor: markdownify, options: {max_retries: 1}}]
-""",
-        )
-        item = self.import_sample()  # a `mediterraneo` item
-
-        self.assertEqual(self.app.run_process("markdown", workflow="a").done, 0)
-        self.assertEqual(self.app.run_process("markdown", workflow="b").done, 1)
-        self.assertIn("markdown", self.app.get_annotations(item))
-
-    def test_other_options_for_a_key_on_shared_sources_are_a_warning(self) -> None:
+    def test_what_no_workflow_refers_to_is_a_warning(self) -> None:
         self.app.close()
         with self.assertLogs("newstool.catalog", "WARNING") as logs:
-            self.app = self.make_app(
-                workflows="workflows:\n  - name: a\n    sources: [mediterraneo]\n"
-                "    process: [{processor: markdownify, options: {max_retries: 5}}]\n"
-            )
+            self.app = self.make_app(workflows=chain(sources="mediterraneo"))
 
-        self.assertIn(
-            "workflows.a.process.0: key 'markdown' is written with other options"
-            " too (processors.0) on the same sources",
-            logs.output[0],
+        self.assertEqual(
+            [line.split(":", 2)[2] for line in logs.output],
+            [
+                "sources: no workflow refers to juntas; it never runs",
+                "processors: no workflow refers to markdownify; it never runs",
+                "apps: no workflow refers to news; it never runs",
+            ],
         )
+
+    def test_an_instance_in_no_workflow_never_runs(self) -> None:
+        self.app.close()
+        with self.assertLogs("newstool.catalog", "WARNING"):
+            self.app = self.make_app(workflows=chain("markdownify"))
+
+        with self.assertRaisesRegex(ConfigError, "app 'news' is not in any workflow"):
+            self.app.run_app("news", NOW)
+
+    def test_an_applet_reads_only_its_workflows_sources(self) -> None:
+        self.app.close()
+        self.app = self.make_app(
+            workflows="""
+workflows:
+  - {name: md, sources: [mediterraneo], process: [markdownify]}
+  - {name: juntas, sources: [juntas], apps: [news]}
+"""
+        )
+        self.import_sample()  # a `mediterraneo` item
+
+        self.app.run_app("news", NOW)
+
+        (feed,) = self.app.find_documents(with_content=True)
+        self.assertNotIn(SAMPLE_UID, feed.content)
 
     def test_references_to_an_entry_share_its_run(self) -> None:
         self.app.close()
         self.app = self.make_app(
             catalog="processors: [{processor: markdownify, id: md}]\n",
-            workflows="workflows:\n  - {name: a, sources: [mediterraneo], process: [md]}\n",
+            workflows="""
+workflows:
+  - {name: a, sources: [mediterraneo], process: [md]}
+  - {name: b, sources: [mediterraneo, juntas], process: [md]}
+""",
         )
         item = self.import_sample()  # a `mediterraneo` item
 
-        self.assertIs(
-            self.object_of("a", "markdown"), self.object_of("default", "markdown")
-        )
+        self.assertIs(self.object_of("a", "markdown"), self.object_of("b", "markdown"))
         self.assertEqual(self.app.run_process("markdown", workflow="a").done, 1)
-        # The same run: `default` finds it done.
-        self.assertEqual(self.app.run_process("markdown").done, 0)
+        # The same entry: `b` finds it done.
+        self.assertEqual(self.app.run_process("markdown", workflow="b").done, 0)
         self.assertIn("markdown", self.app.get_annotations(item))
-
-    def test_default_uses_the_sources_not_skipped(self) -> None:
-        config = Config.from_text(
-            """
-sources:
-  - {id: a, name: A, url: 'https://a.test/', provider: plaza}
-  - {id: b, name: B, url: 'https://b.test/', provider: plaza, skip_default: true}
-workflows:
-  - {name: only-b, sources: [b]}
-"""
-        )
-        self.assertEqual(
-            [(workflow.name, workflow.sources) for workflow in config.all_workflows()],
-            [("default", ["a"]), ("only-b", ["b"])],
-        )
 
     def test_process_entries_run_in_order_each_with_its_key(self) -> None:
         self.app.close()
         self.app = self.make_app(
             catalog="processors:\n  - markdownify\n"
-            "  - {processor: markdownify, key: markdown/copy}\n"
+            "  - {processor: markdownify, id: copy, key: markdown/copy}\n",
+            workflows=chain("markdownify, copy"),
         )
         item = self.import_sample()
 
-        self.assertEqual(self.app.process_keys(), ["markdown", "markdown/copy"])
-        self.assertEqual(self.app.process_keys("markdownify"), self.app.process_keys())
-        self.assertEqual(self.app.run_process("markdown").done, 1)
+        self.assertEqual(
+            self.app.process_runs(["w"]), [("w", "markdown"), ("w", "markdown/copy")]
+        )
+        self.assertEqual(self.app.process_runs(["w"], "copy"), [("w", "markdown/copy")])
+        self.assertEqual(self.app.run_process("markdown", workflow="w").done, 1)
         # Its own state: the first run being done does not skip it.
-        self.assertEqual(self.app.run_process("markdown/copy").done, 1)
+        self.assertEqual(self.app.run_process("markdown/copy", workflow="w").done, 1)
         annotations = self.app.get_annotations(item)
         self.assertEqual(annotations["markdown"], annotations["markdown/copy"])
 
@@ -862,15 +951,27 @@ workflows:
                 r"processors\.0: invalid key 'Mark Down'",
             ),
             (
+                # Both are `markdownify`: an entry without id is its type name.
                 "[markdownify, markdownify]",
-                r"processors\.1: key 'markdown' is written by another entry",
+                (
+                    r"processors: id\(s\) markdownify used twice \(an entry without"
+                    r" `id` takes its type name"
+                ),
+            ),
+            (
+                # One key, one writer across the catalog.
+                "[markdownify, {processor: markdownify, id: copy}]",
+                (
+                    r"processors\.1: key 'markdown' is written by processors\.0 too;"
+                    r" give one a `key`"
+                ),
             ),
         ):
             with (
                 self.subTest(processors=processors),
                 self.assertRaisesRegex(ConfigError, message),
             ):
-                self.make_app(catalog=f"processors: {processors}\n")
+                self.make_app(catalog=f"processors: {processors}\n", workflows="")
 
     def test_invalid_plugin_sections_report_their_config_path(self) -> None:
         with self.assertRaisesRegex(
@@ -889,11 +990,12 @@ workflows:
         self.app = self.make_app(
             "  markdownify: {max_retries: 7}\n",
             catalog="processors:\n  - markdownify\n"
-            "  - {processor: markdownify, key: copy, options: {max_retries: 1}}\n",
+            "  - {processor: markdownify, id: copy, key: copy, options: {max_retries: 1}}\n",
+            workflows=chain("markdownify, copy"),
         )
 
-        self.assertEqual(self.object_of("default", "markdown").options.max_retries, 7)
-        self.assertEqual(self.object_of("default", "copy").options.max_retries, 1)
+        self.assertEqual(self.object_of("w", "markdown").options.max_retries, 7)
+        self.assertEqual(self.object_of("w", "copy").options.max_retries, 1)
 
     def test_llm_consumers_get_the_llm_they_name(self) -> None:
         self.app.close()
@@ -906,17 +1008,18 @@ llms:
 processors:
   - markdownify
   - summarize
-  - {processor: summarize, key: summary/big, options: {llm: big}}
+  - {processor: summarize, id: summary-big, key: summary/big, options: {llm: big}}
   - {processor: tagger, options: {llm: ollama}}
 """,
+            workflows=chain("markdownify, summarize, summary-big, tagger"),
         )
 
-        default = self.object_of("default", "summary").llm
+        default = self.object_of("w", "summary").llm
         self.assertIsInstance(default, OllamaLLM)
         self.assertEqual(default.chat_model, "small")
-        self.assertEqual(self.object_of("default", "summary/big").llm.chat_model, "big")
+        self.assertEqual(self.object_of("w", "summary/big").llm.chat_model, "big")
         # A type name: the type with its section's options, built once.
-        by_type = self.object_of("default", "tags").llm
+        by_type = self.object_of("w", "tags").llm
         self.assertEqual(by_type.chat_model, "small")
         self.assertIs(self.app._llm("ollama"), by_type)
 
@@ -938,7 +1041,7 @@ processors:
                 self.subTest(catalog=catalog),
                 self.assertRaisesRegex(ConfigError, message),
             ):
-                self.make_app(catalog=catalog)
+                self.make_app(catalog=catalog, workflows="")
 
     def test_a_name_no_plugin_provides_is_a_config_error(self) -> None:
         for config, message in (

@@ -388,7 +388,7 @@ data. Design decisions, roadmap, plan and backlog: `docs/DIGESTS.md`.
 
 ## Workflows as chains of global entities (decision 0019)
 
-Agreed 2026-11-14 (decision 0019 holds the model and its reasons). The
+Agreed and done 2026-11-14 (decision 0019 holds the model and its reasons). The
 catalog defines, workflows run: no `skip_default`, no implicit `default`
 workflow, workflow entries are catalog ids, a process key has one writer,
 an applet instance belongs to one workflow and reads its sources, and a
@@ -396,7 +396,7 @@ workflow is the whole chain. CLI: `import`, `process`, `apps`, `deliver`
 and `run`, all with `-w NAME… | --all`. Each step leaves the suite green;
 code, tests and docs land together, then a `graphify:` commit.
 
-- [ ] **1. Config models** (`config.py`, `models.py`):
+- [x] **1. Config models** (`config.py`, `models.py`):
   - `Workflow`: `name`, `sources`, `process`, `apps`, each `list[str]` of
     ids. A mapping in `process` fails with "define it in `processors` with
     an `id` and refer to it" (decision 0019).
@@ -410,7 +410,7 @@ code, tests and docs land together, then a `graphify:` commit.
     `default`; `Config.workflows` is the list as written.
   - Tests (`tests/test_config.py`): the removed shapes fail with their
     messages; `ref` falls back to the type name.
-- [ ] **2. Catalog** (`catalog.py`):
+- [x] **2. Catalog** (`catalog.py`):
   - Processors by `ref`; two entries with one `ref` fail ("give each an
     `id`"); a reference that is no `ref` fails, saying so when it is a type
     name with no root entry ("add `- <type>` to `processors`").
@@ -428,7 +428,7 @@ code, tests and docs land together, then a `graphify:` commit.
   - Tests (`tests/test_app.py`, where the catalog rules are tested today
     through `Application`): each error and warning above, and a processor
     shared by two workflows.
-- [ ] **3. Applets** (`applets.py`, `plugins/feed.py`, `plugins/itemfeed.py`,
+- [x] **3. Applets** (`applets.py`, `plugins/feed.py`, `plugins/itemfeed.py`,
   `plugins/digest.py`):
   - Drop `SourcesOptions` (its options models subclass `PluginOptions`)
     and `Requirements.sources`.
@@ -439,7 +439,7 @@ code, tests and docs land together, then a `graphify:` commit.
   - Tests (`tests/test_applets.py`, the plugins' tests):
     `test_reads_only_its_sources` reads through the scoped reader; the
     `sources` option is rejected.
-- [ ] **4. Application** (`app.py`):
+- [x] **4. Application** (`app.py`):
   - `workflows` in configuration order; `workflow_apps(name)` and
     `workflow_sinks(name)` (the sinks its instances are routed to).
   - `process_keys(workflow, processor=None)` takes a processor `ref`, not a
@@ -449,7 +449,7 @@ code, tests and docs land together, then a `graphify:` commit.
   - Drop `default_app_ids`.
   - Tests (`tests/test_app.py`): `make_app` writes an explicit workflow;
     the workflow's applets read only its sources; `workflow_sinks`.
-- [ ] **5. CLI** (`cli.py`):
+- [x] **5. CLI** (`cli.py`):
   - `selection_options` keeps one shape: `-w/--workflow` (repeatable) or
     `--all`, exactly one, resolved to workflow names. Drop
     `DEFAULT_SELECTION`, `app_selection`, `sink_selection`,
@@ -473,7 +473,7 @@ code, tests and docs land together, then a `graphify:` commit.
     and two selections fail; `-w` repeated; `--all`; each narrowing and its
     error; `apps` sends nothing; `deliver -w`; `run` delivers once per
     sink after every workflow's applets; `delete apps`.
-- [ ] **6. `config.example.yaml`** — the catalog defines, workflows run.
+- [x] **6. `config.example.yaml`** — the catalog defines, workflows run.
   Comment changes: drop the `skip_default`/`default` paragraphs; the
   workflows section says that workflows are the only thing that runs,
   their entries are ids and a workflow is the whole chain; the `apps`
@@ -516,7 +516,7 @@ code, tests and docs land together, then a `graphify:` commit.
     ```
 
     Cron comment: `*/15 * * * * newstool -c config.yaml run --all`.
-- [ ] **7. `config.yaml`** (git-ignored; the live configuration: change it
+- [x] **7. `config.yaml`** (git-ignored; the live configuration: change it
   when the code lands, not before). Today: two sources, four processors
   and `castello-weekly` (a plan-only digest, `write: false`), run as the
   implicit `default` workflow. Target: the same entities, one workflow;
@@ -563,13 +563,13 @@ code, tests and docs land together, then a `graphify:` commit.
     `castello-weekly` has no schedule, so it runs on every `run -w
     castello`: give it `at: "07:00"` and `days: [mon]` before the cron line
     calls `run` often, or run it by hand (`apps -w castello`).
-- [ ] **8. Docs** (with the code, same commit): README (configuration,
+- [x] **8. Docs** (with the code, same commit): README (configuration,
   workflows, *Selecting what runs*, the phases, cron, applet options
   without `sources`), SPECIFICATION (§2 config, §3.1 workflows, §4.2,
   §4.3), ARCHITECTURE (`config.py`, `catalog.py`, `app.py`, `cli.py`,
   applets), and remove the backlog entry "Workflows as chains of global
   entities".
-- [ ] **9. Checks and commits:** ruff, the unittest suite, `graphify update
+- [x] **9. Checks and commits:** ruff, the unittest suite, `graphify update
   .`; commit `config: workflows as chains of global entities (0019)`, then
   `graphify: rebuild after ...`. Production: replace `config.yaml` (step
   7) and the cron lines together with the deploy.
@@ -814,8 +814,6 @@ code, tests and docs land together, then a `graphify:` commit.
   update of `config.example.yaml` and the docs, and clear errors for the
   old names. Stored data keyed by config values (source `id`s, process
   `key`s, applet and sink `id`s) must not change meaning.
-- **Workflows as chains of global entities**: agreed, decision 0019;
-  the plan is its section above.
 - **Story digests, second version**: in `docs/DIGESTS.md` (*Backlog*).
 
 ---

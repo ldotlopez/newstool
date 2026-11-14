@@ -41,7 +41,7 @@ class AppletTestCase(unittest.TestCase):
         self.db = Database(
             f"sqlite:///{self.tmp_dir}/data.db", self.tmp_dir / "content"
         )
-        self.reader = AppletReader(self.db)
+        self.reader = AppletReader(self.db, [SOURCE.id])
         self.services = Services(db=self.db, fetcher=Mock())
 
     def tearDown(self) -> None:
@@ -191,12 +191,17 @@ class FeedTests(AppletTestCase):
     def test_link_is_omitted_when_not_configured(self) -> None:
         self.assertIsNone(self.feed().find("channel").find("link"))
 
-    def test_reads_only_its_sources(self) -> None:
+    def test_reads_only_its_workflow_sources(self) -> None:
         self.add_items(1)
+        self.reader = AppletReader(self.db, ["elsewhere"])
 
-        channel = self.feed(sources=["elsewhere"]).find("channel")
+        channel = self.feed().find("channel")
 
         self.assertEqual(channel.findall("item"), [])
+
+    def test_sources_is_not_an_option(self) -> None:
+        with self.assertRaises(pydantic.ValidationError):
+            feed.Options(sources=["s"])
 
 
 class ItemFeedTests(AppletTestCase):
@@ -343,13 +348,11 @@ class ItemFeedTests(AppletTestCase):
         with self.assertRaises(pydantic.ValidationError):
             itemfeed.ItemFeedOptions(backfill="forever")
 
-    def test_requirements_name_the_annotation(self) -> None:
-        options = itemfeed.ItemFeedOptions(sources=["s"], annotation="summary/es")
-
-        requirements = itemfeed.ItemFeedApplet.requirements(options)
+    def test_required_keys_name_the_annotation(self) -> None:
+        options = itemfeed.ItemFeedOptions(annotation="summary/es")
 
         self.assertEqual(
-            (requirements.sources, requirements.keys), (("s",), ("summary/es",))
+            itemfeed.ItemFeedApplet.required_keys(options), ("summary/es",)
         )
 
 

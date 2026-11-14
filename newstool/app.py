@@ -21,7 +21,7 @@ from sqlalchemy import make_url
 
 from .applets import AppletReader, check_result
 from .catalog import AppInstance, Catalog, Profile
-from .config import DEFAULT_WORKFLOW, Config, ConfigError, Workflow
+from .config import Config, ConfigError, Workflow
 from .consts import PACKAGE_NAME
 from .db import Database, DeliveryStatus
 from .errors import describe, log_failure, reason
@@ -106,13 +106,10 @@ class Application:
         register = ClassRegister(PLUGINS_NAMESPACE, PLUGIN_ENTRY_POINT)
         register.register_found()
         self._catalog = Catalog(config, register)
-        self._workflows = {
-            workflow.name: workflow for workflow in config.all_workflows()
-        }
+        self._workflows = {workflow.name: workflow for workflow in config.workflows}
         self._db = Database(
             config.database_uri, config.content_dir, create_schema=create_schema
         )
-        self._reader = AppletReader(self._db)
         self._cache = UserCache(
             app=PACKAGE_NAME,
             expiration_time=config.cache.expiration,
@@ -172,47 +169,49 @@ class Application:
 
     @property
     def workflows(self) -> list[str]:
-        """Workflow names, `default` first."""
+        """Workflow names, in configuration order."""
         return list(self._workflows)
 
-    def workflow(self, name: str = DEFAULT_WORKFLOW) -> Workflow:
+    def workflow(self, name: str) -> Workflow:
         return lookup(self._workflows, name, "workflow")
 
-    def source_ids(
-        self, workflows: Iterable[str], source: str | None = None
-    ) -> list[str]:
-        """The workflows' sources, each once, in configuration order; with
-        `source`, only it, which must be one of them."""
+    def workflow_apps(self, name: str) -> list[str]:
+        """The workflow's applet instances, in its order."""
+        return list(self.workflow(name).apps)
+
+    def workflow_sinks(self, workflows: Iterable[str]) -> list[str]:
+        """The sink instances the workflows' applet instances are routed to,
+        in configuration order."""
+        return self.routed_sinks(
+            app_id for name in workflows for app_id in self.workflow_apps(name)
+        )
+
+    def source_ids(self, workflows: Iterable[str]) -> list[str]:
+        """The workflows' sources, each once, in configuration order."""
         ids = {id_ for name in workflows for id_ in self.workflow(name).sources}
-        if source is not None:
-            if source not in ids:
-                raise ConfigError(f"source '{source}' is not in the workflow(s)")
-            ids = {source}
         return [entry.id for entry in self.config.sources if entry.id in ids]
 
-    def process_keys(
-        self, processor: str | None = None, *, workflow: str = DEFAULT_WORKFLOW
-    ) -> list[str]:
-        """The keys of the workflow's process runs, in order; with
-        `processor`, only its runs."""
-        self.workflow(workflow)
-        if processor is not None and processor not in self._catalog.processor_names:
-            raise ConfigError(f"processor '{processor}' does not exist")
-        return [
-            key
-            for (name, key), run in self._catalog.process.items()
-            if name == workflow and processor in (None, run.profile.name)
+    def process_runs(
+        self, workflows: Iterable[str], processor: str | None = None
+    ) -> list[tuple[str, str]]:
+        """The workflows' process runs as (workflow, key), each workflow's in
+        order; with `processor` (a `processors` id), only its runs, in one
+        workflow at least."""
+        names = [self.workflow(name).name for name in workflows]
+        runs = [
+            run for name in names for run in self._catalog.process if run[0] == name
         ]
+        if processor is None:
+            return runs
+        key = lookup(self._catalog.processor_keys, processor, "processor")
+        if not (runs := [run for run in runs if run[1] == key]):
+            raise ConfigError(f"processor '{processor}' is in none of the workflows")
+        return runs
 
     @property
     def app_ids(self) -> list[str]:
         """Every applet instance, in configuration order."""
         return list(self._catalog.apps)
-
-    @property
-    def default_app_ids(self) -> list[str]:
-        """The applet instances without `skip_default`, in configuration order."""
-        return self.config.default_app_ids()
 
     # --- Import ------------------------------------------------------------
 
@@ -287,7 +286,7 @@ class Application:
         self,
         key: str,
         *,
-        workflow: str = DEFAULT_WORKFLOW,
+        workflow: str,
         scope: ProcessingScope | None = None,
         force: bool = False,
     ) -> RunSummary:
@@ -336,14 +335,17 @@ class Application:
         what it returns, or record its failure. With `dry_run`, report what
         it would emit and store nothing."""
         app = self.app_instance(app_id)
+        if app.workflow is None:
+            raise ConfigError(f"app '{app_id}' is not in any workflow")
         applet = self._object(app.profile)
+        reader = AppletReader(self._db, app.workflow.sources)
         run = self._db.get_app_run(app_id)
         if not force and not applet.is_due(now, run, app.schedule):
             return AppReport(app_id, due=False)
         if not dry_run:
             self._db.start_app_run(app_id, now)
         try:
-            result = applet.run(now, run, self._reader)
+            result = applet.run(now, run, reader)
             check_result(result, app.profile.cls.outputs)
         except Exception as e:  # noqa: BLE001
             # One failing applet must not stop the others; the run record and

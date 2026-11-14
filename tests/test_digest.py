@@ -27,7 +27,7 @@ class DigestTestCase(unittest.TestCase):
         self.db = Database(
             f"sqlite:///{self.tmp_dir}/data.db", self.tmp_dir / "content"
         )
-        self.reader = AppletReader(self.db)
+        self.reader = AppletReader(self.db, [SOURCE.id, OTHER_SOURCE.id])
 
     def tearDown(self) -> None:
         self.db.close()
@@ -181,9 +181,8 @@ class DigestAppletTests(DigestTestCase):
         with self.assertRaises(PluginFailure):
             self.run_digest([" "])
 
-    def test_requirements_follow_the_options(self) -> None:
+    def test_required_keys_follow_the_options(self) -> None:
         options = digest.DigestOptions(
-            sources=["s"],
             input="summary/es",
             include={"about/spain": ["yes"]},
             exclude={"topics": ["sports"]},
@@ -192,15 +191,12 @@ class DigestAppletTests(DigestTestCase):
             embedding="summary/es",
         )
 
-        requirements = digest.DigestApplet.requirements(options)
-
-        self.assertEqual(requirements.sources, ("s",))
         self.assertEqual(
-            requirements.keys,
+            digest.DigestApplet.required_keys(options),
             ("summary/es", "tags", "about/spain", "topics", "summary/embedding/es"),
         )
         self.assertEqual(
-            digest.DigestApplet.requirements(digest.DigestOptions()).keys,
+            digest.DigestApplet.required_keys(digest.DigestOptions()),
             ("summary", "tags"),
         )
 

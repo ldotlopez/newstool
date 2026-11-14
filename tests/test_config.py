@@ -17,6 +17,21 @@ sources:
     url: https://castellonplaza.com/castellon9/
 """
 
+CATALOG = (
+    SOURCE
+    + """
+processors:
+  - markdownify
+  - {processor: summarize, id: summary-es, key: summary/es}
+apps:
+  - {id: items, app: itemfeed}
+"""
+)
+
+
+def workflows(*entries: str) -> str:
+    return "workflows:\n" + "".join(f"  - {entry}\n" for entry in entries)
+
 
 class ConfigTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -112,20 +127,19 @@ class ConfigTests(unittest.TestCase):
 
     def test_source_ids_must_be_unique(self) -> None:
         duplicated = SOURCE + SOURCE.removeprefix("\nsources:\n")
-        with self.assertRaisesRegex(ConfigError, "source ids must be unique"):
+        with self.assertRaisesRegex(ConfigError, "sources: id.s. plaza used twice"):
             Config.from_text(duplicated)
 
-    def test_unknown_sections_are_rejected(self) -> None:
-        # `process`, `remix` and `deliver` were the default workflow's runs;
-        # `remixers` was replaced by `apps` (decision 0015).
-        for section in (
+    def test_unknown_keys_are_rejected(self) -> None:
+        workflow = SOURCE + "workflows:\n  - name: w\n    sources: [plaza]\n"
+        for text in (
             "pipelines: []\n",
-            "process: []\n",
-            "deliver: []\n",
             "remixers: []\n",
+            "processors:\n  - {enricher: summarize}\n",
+            workflow + "    deliver: [feed]\n",
         ):
-            with self.subTest(section=section), self.assertRaises(ConfigError):
-                Config.from_text(section)
+            with self.subTest(text=text), self.assertRaises(ConfigError):
+                Config.from_text(text)
 
     def test_durations_are_seconds_or_take_a_unit_suffix(self) -> None:
         for text, seconds in (("90", 90), ("5m", 300), ("2h", 7200), ("3d", 259200)):
@@ -166,10 +180,10 @@ class ConfigTests(unittest.TestCase):
                 ("summarize", "summary-es", "summary/es", {"model": "m"}),
             ],
         )
-
-    def test_catalog_entries_reject_unknown_fields(self) -> None:
-        with self.assertRaises(ConfigError):
-            Config.from_text("processors:\n  - {enricher: summarize}\n")
+        # What workflows refer to them by: the id, or else the type name.
+        self.assertEqual(
+            [entry.ref for entry in config.processors], ["markdownify", "summary-es"]
+        )
 
     def test_catalog_ids_are_unique_per_section(self) -> None:
         with self.assertRaisesRegex(ConfigError, "processors: id.s. a used twice"):
@@ -182,6 +196,10 @@ class ConfigTests(unittest.TestCase):
             Config.from_text(
                 "apps:\n  - {app: digest, id: d}\n  - {app: feed, id: d}\n"
             )
+        with self.assertRaisesRegex(
+            ConfigError, "processors: id.s. summarize used twice .an entry without"
+        ):
+            Config.from_text("processors:\n  - summarize\n  - summarize\n")
         with self.assertRaisesRegex(ConfigError, "invalid id 'A b'"):
             Config.from_text("sinks:\n  - {sink: telegram, id: A b}\n")
 
@@ -210,48 +228,105 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(app=app), self.assertRaises(ConfigError):
                 Config.from_text(f"apps:\n  - {app}\n")
 
-    def test_workflow_entries_are_references_or_entries_of_its_own(self) -> None:
+    def test_workflows_refer_to_catalog_entries_by_id(self) -> None:
         config = Config.from_text(
-            SOURCE + "workflows:\n  - name: w\n    sources: [plaza]\n"
-            "    process: [markdownify, {processor: summarize, key: s}]\n"
+            CATALOG
+            + workflows(
+                "{name: w, sources: [plaza], process: [markdownify, summary-es],"
+                " apps: [items]}"
+            )
         )
 
         (workflow,) = config.workflows
-        reference, own = workflow.process
-        self.assertEqual(reference, "markdownify")
-        self.assertEqual((own.processor, own.key), ("summarize", "s"))
-
-    def test_workflow_entries_have_no_id_nor_skip_default(self) -> None:
-        for entry in (
-            "{processor: summarize, id: s}",
-            "{processor: summarize, skip_default: true}",
-        ):
-            with (
-                self.subTest(entry=entry),
-                self.assertRaisesRegex(ConfigError, "only catalog entries do"),
-            ):
-                Config.from_text(
-                    SOURCE + f"workflows:\n  - name: w\n    sources: [plaza]\n"
-                    f"    process: [{entry}]\n"
-                )
-
-    def test_workflows_have_no_remix_nor_deliver(self) -> None:
-        for section in ("remix", "deliver"):
-            with self.subTest(section=section), self.assertRaises(ConfigError):
-                Config.from_text(
-                    SOURCE + "workflows:\n  - name: w\n    sources: [plaza]\n"
-                    f"    {section}: [feed]\n"
-                )
-
-    def test_default_workflow_has_the_sources_without_skip_default(self) -> None:
-        config = Config.from_text(
-            SOURCE + "  - {id: other, name: O, provider: plaza, url: 'https://o.test/',"
-            " skip_default: true}\n"
+        self.assertEqual(
+            (workflow.name, workflow.sources, workflow.process, workflow.apps),
+            ("w", ["plaza"], ["markdownify", "summary-es"], ["items"]),
         )
 
-        (default,) = config.all_workflows()
-        self.assertEqual((default.name, default.sources), ("default", ["plaza"]))
-        self.assertEqual(default.process, [])
+    def test_default_is_an_ordinary_workflow_name(self) -> None:
+        config = Config.from_text(
+            CATALOG + workflows("{name: default, sources: [plaza]}")
+        )
+
+        self.assertEqual([w.name for w in config.workflows], ["default"])
+
+    def test_workflow_entries_of_their_own_are_rejected(self) -> None:
+        for field, section in (("process", "processors"), ("apps", "apps")):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    ConfigError, f"define it in `{section}` with an `id`"
+                ),
+            ):
+                Config.from_text(
+                    CATALOG
+                    + workflows(
+                        f"{{name: w, sources: [plaza], {field}: [{{processor: x}}]}}"
+                    )
+                )
+
+    def test_skip_default_was_removed(self) -> None:
+        for text in (
+            SOURCE + "    skip_default: true\n",
+            "processors:\n  - {processor: summarize, skip_default: true}\n",
+            "apps:\n  - {id: a, app: feed, skip_default: true}\n",
+        ):
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(
+                    ConfigError, "`skip_default` was removed .decision 0019."
+                ),
+            ):
+                Config.from_text(text)
+
+    def test_workflows_refer_only_to_known_entries(self) -> None:
+        for workflow, error in (
+            ("{name: w, sources: [nope]}", "unknown source.s. nope"),
+            # A type name refers to a root entry without `id`, not to the type.
+            (
+                "{name: w, sources: [plaza], process: [tagger]}",
+                "unknown processor.s. tagger",
+            ),
+            (
+                "{name: w, sources: [plaza], apps: [nope]}",
+                "unknown applet instance.s. nope",
+            ),
+            ("{name: w, sources: [plaza, plaza]}", "sources lists plaza twice"),
+        ):
+            with (
+                self.subTest(workflow=workflow),
+                self.assertRaisesRegex(ConfigError, error),
+            ):
+                Config.from_text(CATALOG + workflows(workflow))
+
+    def test_an_applet_instance_belongs_to_one_workflow(self) -> None:
+        with self.assertRaisesRegex(
+            ConfigError, "app 'items' is in workflows 'a' and 'b'"
+        ):
+            Config.from_text(
+                CATALOG
+                + workflows(
+                    "{name: a, sources: [plaza], apps: [items]}",
+                    "{name: b, sources: [plaza], apps: [items]}",
+                )
+            )
+
+        config = Config.from_text(
+            CATALOG
+            + "  - {id: other, app: feed}\n"
+            + workflows("{name: a, sources: [plaza], apps: [items]}")
+        )
+        self.assertEqual(config.workflow_of_app("items").name, "a")
+        self.assertIsNone(config.workflow_of_app("other"))
+
+    def test_workflow_names_are_unique(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "workflow names must be unique"):
+            Config.from_text(
+                CATALOG
+                + workflows(
+                    "{name: a, sources: [plaza]}", "{name: a, sources: [plaza]}"
+                )
+            )
 
     def test_unconfigured_source_has_clear_error(self) -> None:
         with self.assertRaisesRegex(ConfigError, "source 'missing' is not configured"):

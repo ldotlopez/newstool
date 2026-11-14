@@ -13,18 +13,17 @@ from ..applets import (
     AppletType,
     BaseApplet,
     Outputs,
-    SourcesOptions,
     run_key,
 )
 from ..models import AppletResult, AppletRun, EmittedDocument, SourceItem
-from . import PluginTypes
+from . import PluginOptions, PluginTypes
 
 RFC822 = "%a, %d %b %Y %H:%M:%S %z"
 OUTPUT = "feed"
 CONTENT_TYPE = "application/rss+xml"
 
 
-class Options(SourcesOptions):
+class Options(PluginOptions):
     title: str = "newstool feed"
     link: str | None = None
     description: str | None = None  # the title when unset
@@ -38,11 +37,7 @@ class FeedApplet(BaseApplet):
     options: Options
 
     def run(self, now: datetime, run: AppletRun, reader: AppletReader) -> AppletResult:
-        items = reader.items(
-            sources=self.options.sources,
-            limit=self.options.max_items,
-            newest_first=True,
-        )
+        items = reader.items(limit=self.options.max_items, newest_first=True)
         document = EmittedDocument(
             output=OUTPUT,
             key=run_key(now),

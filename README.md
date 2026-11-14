@@ -5,26 +5,25 @@ from them: markdown copies, LLM summaries, tags and topics, RSS feeds,
 digests of the stories several sources covered, and Telegram posts. It was written for local news (Castelló), but any
 site can be added with a provider.
 
-It works in two stages:
+A **workflow** is a chain of four phases:
 
-1. **Workflows** import and process:
-   - **import**: each configured **source** (a website) is fetched with its
-     **provider**, and every article becomes an **item**. Re-importing an
-     unchanged article does nothing; a changed one is updated in place.
-   - **process**: **processors** add **annotations** to each item (its
-     markdown, a summary, tags...).
-2. **Applets** build and deliver: each configured **applet instance** runs
-   when it is due (every hour, Mondays at 7:00...), reads what is stored,
-   and emits **documents** (an RSS feed, a weekly digest, a message per new
-   summarized item...). Each output of an instance is routed to **sinks**,
-   which send its documents to the outside world (a Telegram chat, a file a
-   web server serves...) and record each **delivery**, so nothing is sent
+1. **import**: each of its **sources** (a website) is fetched with its
+   **provider**, and every article becomes an **item**. Re-importing an
+   unchanged article does nothing; a changed one is updated in place.
+2. **process**: its **processors** add **annotations** to each item (its
+   markdown, a summary, tags...).
+3. **apps**: each of its **applet instances** runs when it is due (every
+   hour, Mondays at 7:00...), reads what is stored, and emits **documents**
+   (an RSS feed, a weekly digest, a message per new summarized item...).
+4. **deliver**: each output of an instance is routed to **sinks**, which
+   send its documents to the outside world (a Telegram chat, a file a web
+   server serves...) and record each **delivery**, so nothing is sent
    twice.
 
-Providers, processors, applets and sinks come from **plugins**. A
-**workflow** says which sources to import and what to process on them; the
-configuration's root keys are the `default` workflow, and `workflows` adds
-more. Applets and sinks belong to no workflow.
+Providers, processors, applets and sinks come from **plugins**. The
+configuration's root keys define the sources, processors, applet and sink
+instances; defining one never runs it. `workflows` is the only thing that
+runs: each refers to its sources, processors and applet instances by `id`.
 
 ## Requirements
 
@@ -69,7 +68,7 @@ sources:
     provider: plaza                  # see "Providers" below
     url: https://castellonplaza.com/castellon9/
 
-processors:                          # the `default` workflow runs them in order
+processors:                          # an entry without `id` takes its type name
   - markdownify
   - summarize
   - tagger
@@ -78,10 +77,15 @@ sinks:                               # where documents go
   - {id: main-chat, sink: telegram, options: {chat_id: "${TELEGRAM_CHAT_ID}", interval: 30m}}
   - {id: site, sink: file, options: {path: "/srv/www/{app}.xml"}}
 
-apps:                                # run by `apps run`, when due
+apps:                                # run by their workflow, when due
   - {id: items, app: itemfeed, sink: main-chat}
   - {id: headlines, app: feed, every: 1h, options: {title: Castelló news}, sink: site}
-  #   skip_default: true             # left out of `--default`; `--app ID` or `--all` runs it
+
+workflows:                           # the only thing that runs: `run -w news`
+  - name: news
+    sources: [castellonplaza]
+    process: [markdownify, summarize, tagger]
+    apps: [items, headlines]
 ```
 
 A source's `id` identifies its items: its `url` and `provider` can change
@@ -127,27 +131,30 @@ type's options for every use of it; the missing ones take the defaults
 listed below, and unknown or invalid ones are rejected with their path
 (`plugins.summarize.max_retries: ...`). A section builds nothing.
 
-The **catalog** lists the uses: `llms`, `sources` and `processors`. An
-entry is a type name, or a type with `id`, `key` and `options`. Its options
-override its type's section, merged key by key in nested mappings (any
-other value, lists included, replaces). `id` names the entry so workflows
-can refer to it, and cannot be a type's name. Everything configured is
-checked at start-up, whether it runs or not; an object is built only when
-a run needs it.
+The **catalog** defines the uses: `llms`, `sources`, `processors`, `apps`
+and `sinks`. A `processors` entry is a type name, or a type with `id`,
+`key` and `options`; an entry without `id` takes its type name, so two
+entries of one type need explicit ids. Its options override its type's
+section, merged key by key in nested mappings (any other value, lists
+included, replaces). `id` names the entry so workflows can refer to it, and
+cannot be another type's name. Everything configured is checked at
+start-up, whether it runs or not; an object is built only when a run needs
+it. A source, processor or applet instance no workflow refers to gets a
+warning at start-up: it never runs.
 
-Every processor run writes one annotation **key**, the processor's own
+Every processor entry writes one annotation **key**, the processor's own
 unless the entry names another with `key` (lowercase words, optionally in
 `/`-separated parts: `summary`, `summary/es`), so a processor can run
-several times with different options and keys:
+several times with different options and keys. A key is written by one
+entry: two entries with one key fail at start-up.
 
 ```yaml
 processors:
-  - markdownify                      # writes `markdown`
-  - summarize                        # writes `summary`
+  - markdownify                      # id `markdownify`, key `markdown`
+  - summarize                        # id `summarize`, key `summary`
   - processor: summarize
     id: summary-es                   # for the workflows that name it
     key: summary/es
-    skip_default: true
     options:
       prompt: "Resume en español el siguiente artículo:\n\n"
       model: gemma4:27b
@@ -160,8 +167,9 @@ at start-up with the option's path
 ### Applets and sinks
 
 `apps` and `sinks` list **instances**, each with a required `id`, its type
-(`app:` or `sink:`) and `options` over the type's section. They belong to
-no workflow.
+(`app:` or `sink:`) and `options` over the type's section. An applet
+instance runs in the one workflow that names it; a sink is reached through
+the routes of the instances.
 
 A **sink instance** is a destination with its own pacing: where to deliver
 (a chat, a webhook, a file) and how fast (`interval`, `max_per_run`). Two
@@ -171,10 +179,10 @@ An **applet instance** decides when it runs and what it emits:
 
 - **When:** `every` (a duration after its last successful run), `at`
   (`"HH:MM"`, local time: once a day from then) and `days` (weekdays,
-  `[mon, fri]`). They combine; without any, it runs on every `apps run`.
-  `days` is not `on`, which YAML reads as `true`.
-- **What it reads:** its options say which sources (`sources`, default
-  every source) and what else; an applet keeps a state of its own between
+  `[mon, fri]`). They combine; without any, it runs every time its
+  workflow's applets run. `days` is not `on`, which YAML reads as `true`.
+- **What it reads:** exactly the sources of its workflow, and the
+  annotations its options name; an applet keeps a state of its own between
   runs (a cursor, the last period it covered), so it can emit only what is
   new.
 - **Where it goes:** each applet has named **outputs**; `routes` sends each
@@ -192,9 +200,9 @@ apps:
   - id: items                        # each new summarized item, once
     app: itemfeed
     sink: chat
-  - id: politics-es
+  - id: politics-es                  # in a workflow with the juntas source
     app: itemfeed
-    options: {sources: [juntas], annotation: summary/es}
+    options: {annotation: summary/es}
     sink: politics
   - id: weekly                       # Mondays at 7:00
     app: digest
@@ -206,40 +214,52 @@ apps:
 
 At start-up, a route to an unknown output or sink, or to a sink that does
 not accept the output's content (an RSS feed to Telegram), is an error, and
-so is an applet that reads an unknown source or an annotation no process
-run writes on its sources.
+so is an applet that reads an annotation no process entry of its workflow
+writes.
 
 ### Workflows
 
-The `default` workflow uses every source and runs every catalog processor,
-in order, except those with `skip_default: true`. `workflows` lists more,
-each with the ids of its sources and its process runs: a catalog `id`, a
-type name (the type with its section's options) or an entry of its own,
-without `id`. A reference runs the entry as it is; to change an option,
-write an entry of the workflow's own.
+Workflows are the only thing that runs. Each has a `name` and lists, by
+`id`, its `sources`, its `process` entries (in order) and its `apps`; its
+sinks are those its applet instances are routed to. Running a workflow
+imports its sources, runs its process entries on them, runs its applet
+instances that are due, then delivers to its sinks. A workflow refers to
+catalog entries as they are: to run a processor with other options, define
+another entry with its own `id`.
 
 ```yaml
 sources:
   - {id: castellonplaza, name: Castellón Plaza, provider: plaza, url: ...}
-  - {id: juntas, name: Juntas, provider: csjuntasgobierno, url: ..., skip_default: true}
+  - {id: juntas, name: Juntas, provider: csjuntasgobierno, url: ...}
 
 workflows:
+  - name: news
+    sources: [castellonplaza]
+    process: [markdownify, summarize]
+    apps: [items]
   - name: juntas
     sources: [juntas]
     process: [markdownify, summary-es]
+    apps: [politics-es]
 ```
 
-`skip_default` only leaves an entry out of `default`: the workflows that
-name it still run it. Applet instances take `skip_default` too, which
-leaves them out of `--default` (see *Selecting what runs*). A workflow only
-touches its sources.
+A workflow only touches its sources. A source or processor can be in
+several workflows: a processor skips the items it has already done, so
+sharing one costs nothing. An applet instance belongs to at most one
+workflow and reads exactly its sources; one over several workflows'
+sources gets a workflow of its own (importing a source again is cheap:
+unchanged items are skipped and pages come from the HTTP cache).
 
-Annotations belong to items. Within a workflow a key is written by one run;
-on sources that workflows share, one processor type writes it, and other
-options for it only get a warning (the first run to process an item writes
-it). Every key a run reads must be written by a process run on its
-workflow's sources, in any workflow. Ids, workflow names and output names
-use lowercase letters, digits, `_` and `-`; `default` is reserved.
+Annotations belong to items; a key is written by one processor entry, so
+it means the same on every source. Every key a processor reads must be
+written by a process entry on its workflow's sources, in any workflow, and
+every key an applet instance reads by a process entry of its own workflow,
+so a chain produces everything its applets read. Ids, workflow names and
+output names use lowercase letters, digits, `_` and `-`.
+
+Configurations from before decision 0019 fail at start-up with what to
+write instead: `skip_default` is gone (list what runs in `workflows`), and
+a workflow's own `process` entry moves to `processors` with an `id`.
 
 `summarize`, `tagger`, `classify`, `embed` and `digest` use an LLM: `llm` names an
 `llms` entry by `id`, or an LLM type (with its section's options), and
@@ -260,60 +280,52 @@ moves its ledger to the new `id`.
 
 ### Selecting what runs
 
-Every command that runs something needs to be told what, so a bare command
-never runs by accident; without a selection it fails with its usage:
+There is a command per phase, `import`, `process`, `apps` and `deliver`,
+and `run` for the whole chain. Every one of them needs to be told which
+workflows, so a bare command never runs by accident; without a selection,
+or with both, it fails with its usage:
 
-- a name: `-w NAME` for workflows, `--app ID` and `--sink ID`
-  (repeatable) for applet and sink instances;
-- `--default`: the `default` set, what has no `skip_default`: the `default`
-  workflow, the applet instances without it, and the sinks those are routed
-  to;
-- `--all`: everything, skipped or not: every workflow (`default` first),
-  every applet instance and every sink.
+- `-w/--workflow NAME`, repeatable: those workflows;
+- `--all`: every workflow, in configuration order.
 
-| Command | Names | `--default` | `--all` |
-| :--- | :--- | :--- | :--- |
-| `import [SOURCE]` | `-w NAME` | the `default` workflow's sources | every workflow's sources, each once |
-| `process [PROCESSOR]` | `-w NAME` | the `default` workflow's process runs | every workflow's, in turn |
-| `workflows` | `-w NAME` | import and process of `default` | of every workflow, in turn |
-| `apps run` | `--app ID` | the instances without `skip_default` | every instance |
-| `deliver` | `--sink ID` | the sinks those instances are routed to | every sink |
-| `run` | — | `workflows`, `apps run` and `deliver`, `--default` | the same, `--all` |
+The phase commands narrow by `id` within the selection; an id outside the
+selected workflows is an error. `run` takes only the selection.
 
-`-w default` is the same as `--default`. `import SOURCE` imports only that
-source, which must be one of the selected workflows'.
+| Command | Runs, for the selected workflows | Narrowed by |
+| :--- | :--- | :--- |
+| `import` | their sources, each once | `--source ID` |
+| `process` | their process entries, workflow by workflow | `--source ID`, `--processor ID` |
+| `apps` | their applet instances that are due; delivers nothing | `--app ID` (repeatable) |
+| `deliver` | their sinks (every sink with `--all`) | `--sink ID` (repeatable) |
+| `run` | import, process and apps of each, then one delivery to their sinks | — |
 
 ```sh
 # Import the sources of a workflow, or only one of them
-uv run newstool -c config.yaml import --default
-uv run newstool -c config.yaml import castellonplaza -w news
+uv run newstool -c config.yaml import -w news
+uv run newstool -c config.yaml import -w news --source castellonplaza
 
-# Run the process runs of a workflow in order, or only one processor's
-uv run newstool -c config.yaml process --default
-uv run newstool -c config.yaml process markdownify --default --source castellonplaza --limit 20
+# Run a workflow's process entries in order, or only one of them
+uv run newstool -c config.yaml process -w news
+uv run newstool -c config.yaml process -w news --processor markdownify --source castellonplaza --limit 20
 
-# Run import and process in turn, for one workflow or every one
-uv run newstool -c config.yaml workflows -w juntas
-uv run newstool -c config.yaml workflows --all     # every workflow, default first
+# The whole chain (cron): import, process, applets, then deliver
+uv run newstool -c config.yaml run -w news
+uv run newstool -c config.yaml run -w news -w juntas
+uv run newstool -c config.yaml run --all
 
-# The whole default set (cron): its workflow, its applets, then deliver
-uv run newstool -c config.yaml run --default
-uv run newstool -c config.yaml run --all           # everything, skipped or not
-
-# Run the applet instances that are due, then deliver
-uv run newstool -c config.yaml apps run --default
-uv run newstool -c config.yaml apps run --app weekly --force
-uv run newstool -c config.yaml apps run --all --dry-run
-uv run newstool -c config.yaml apps run --app items --no-deliver
+# Run the applet instances that are due, sending nothing
+uv run newstool -c config.yaml apps -w news
+uv run newstool -c config.yaml apps -w news --app weekly --force
+uv run newstool -c config.yaml apps --all --dry-run
 
 # Deliver what is pending, without running applets
 uv run newstool -c config.yaml deliver --all
-uv run newstool -c config.yaml deliver --sink chat --dry-run
-uv run newstool -c config.yaml deliver --sink chat --ignore-interval --ignore-max-per-run
+uv run newstool -c config.yaml deliver -w news --sink chat --dry-run
+uv run newstool -c config.yaml deliver -w news --sink chat --ignore-interval --ignore-max-per-run
 
 # Start an applet instance from scratch, optionally dropping its documents
-uv run newstool -c config.yaml apps reset --app items
-uv run newstool -c config.yaml apps reset --app weekly --with-documents
+uv run newstool -c config.yaml delete apps --app items
+uv run newstool -c config.yaml delete apps --app weekly --with-documents
 
 # Inspect what is stored (read-only), as a table or --format json
 uv run newstool -c config.yaml inspect items --source castellonplaza --limit 20
@@ -351,8 +363,9 @@ uv run newstool -c config.yaml delete deliveries --sink chat --all
 Items and annotations are selected by their numeric id, which `inspect`
 shows; documents and deliveries too (`--document`, `--delivery`).
 `process`, `inspect items|annotations` and `delete items|annotations`
-accept `--source` (a source id), `--since`, `--until` (publication),
-`--item` (repeatable) and `--limit`; `inspect` and `delete` add
+accept `--source` (a source id; for `process`, one of the selected
+workflows'), `--since`, `--until` (publication), `--item` (repeatable) and
+`--limit`; `inspect` and `delete` add
 `--processor`, `--key` and `--annotation` for annotations. Documents are
 selected by `--app`, `--output`, `--key`, `--since` and `--until`
 (emission), `--document` and `--limit`, and deliveries by the same plus
@@ -374,24 +387,24 @@ to stdout as is.
 `--annotation` prints its full value (text as is, the rest as JSON).
 `inspect documents` loads contents only for `--document`, and one
 `--document` writes the content to stdout and its metadata to stderr, so
-it can be redirected. `inspect apps` shows each instance's schedule, last
-run, last success, next due time (local time) and last error.
-`--format json` prints full records.
+it can be redirected. `inspect apps` shows each instance's workflow,
+schedule, last run, last success, next due time (local time) and last
+error. `--format json` prints full records.
 
-`apps run` runs the selected instances that are due (`--force` runs them
-whether due or not), then delivers what is pending: with `--all` for every
-sink, otherwise for the sinks those instances are routed to. `--no-deliver` stores and queues what they emit and sends nothing, for
-`deliver` to send later. Its table shows, per instance, the documents it
-emitted that are new, those already stored, and `Routed`: the rows it
-queued for stored documents routed since they were emitted (see *How
-delivery behaves*). A failing instance is reported and the others still run;
-its state is kept, so its next run covers what the failed one did not. The
-exit status is non-zero if anything failed. `--dry-run` runs the applets
-and shows the documents they would emit (new, or already stored) and their
-new state, storing and delivering nothing. `apps reset --app ID` forgets an
-instance's state and run times; its documents stay, so what it emits again
+`apps` runs the selected workflows' instances that are due (`--app`
+narrows them; `--force` runs them whether due or not), stores what they
+emit and queues its deliveries; it sends nothing, which is `deliver`'s
+job. Its table shows, per instance, the documents it emitted that are new,
+those already stored, and `Routed`: the rows it queued for stored documents
+routed since they were emitted (see *How delivery behaves*). A failing
+instance is reported and the others still run; its state is kept, so its
+next run covers what the failed one did not. The exit status is non-zero if
+anything failed. `--dry-run` runs the applets and shows the documents they
+would emit (new, or already stored) and their new state, storing nothing.
+`delete apps --app ID` forgets an instance's state and run times, whether
+it is still configured or not; its documents stay, so what it emits again
 under their keys is not sent again, unless `--with-documents` deletes them
-and their deliveries too.
+and their deliveries too. `--dry-run` counts what it would delete.
 
 `delete` never asks, so run `inspect` with the same options first. A
 selection with no filter or id is refused. Deleting an item takes its
@@ -446,41 +459,40 @@ database, disk) are reported as `Type: message`; the traceback is shown only
 with debug logging (`-vv`). Unexpected errors always show it.
 
 Results (tables, `inspect` output, contents, `--help`, and the summaries of
-`run`, `workflows`, `import`, `process`, `apps run` and `deliver`) go to
-stdout; progress and logs go to stderr. Each stream is rich only when it is
-a terminal, so `newstool run --default > summary.txt` keeps the progress
-rows on screen and writes tab-separated tables, and with stderr redirected
-(cron) there is no progress and logs are one plain line per record. The
-progress shows a row per phase in `run` and `workflows`, and a row per
-source, processor, applet or sink while it runs. Set `DISABLE_RICH=1` (or `RICH_DISABLED=1`), or
+`run`, `import`, `process`, `apps` and `deliver`) go to stdout; progress
+and logs go to stderr. Each stream is rich only when it is a terminal, so
+`newstool run --all > summary.txt` keeps the progress rows on screen and
+writes tab-separated tables, and with stderr redirected (cron) there is no
+progress and logs are one plain line per record. The progress shows a row
+per phase in `run`, and a row per source, processor, applet or sink while
+it runs. Set `DISABLE_RICH=1` (or `RICH_DISABLED=1`), or
 `TERM=dumb`, for plain output on both streams; `NO_COLOR=1` only drops the
 colors.
 
 ### The phases, step by step
 
-newstool runs in four phases. Each is a command of its own, so they can
-run from separate cron lines or one by one by hand; `workflows` chains
-the first two, `apps run` the last two, and `run` all four. Every phase is safe to run again: what is already done
-is skipped, and what failed is retried.
+A workflow runs in four phases. Each is a command of its own, so they can
+run one by one by hand; `run` chains all four. Every phase is safe to run
+again: what is already done is skipped, and what failed is retried.
 
 | Phase | Command | Reads | Writes |
 | :--- | :--- | :--- | :--- |
 | Import | `import` | the sources' websites | items |
 | Process | `process` | items, annotations | annotations |
-| Applets | `apps run` | items, annotations, documents | documents, delivery rows, applet state |
+| Applets | `apps` | items, annotations, documents | documents, delivery rows, applet state |
 | Deliver | `deliver` | delivery rows, documents | the outside world, delivery rows |
 
-**1. Import** (`import [SOURCE]`) fetches every source of the selected
-workflows, each once, or only `SOURCE`, with its provider and stores each
+**1. Import** (`import`) fetches every source of the selected workflows,
+each once, or only `--source ID`, with its provider and stores each
 article as an item, oldest first. An unchanged article is left as it is;
 a changed one is updated in place, so its processors run on it again. A
 failing source is reported and the others are still imported; what was
 fetched before an error is kept. The `Import` table shows, per source,
 the items read and the error, if any.
 
-**2. Process** (`process [PROCESSOR]`) runs each selected workflow's
-process entries in configuration order, or only those of one processor
-type, over the items of its sources. Each entry writes one annotation key
+**2. Process** (`process`) runs each selected workflow's process entries
+in its order, or only `--processor ID` (a `processors` id), over the items
+of its sources. Each entry writes one annotation key
 (`markdown`, `summary/telegram/es`...) and only picks the items that need
 it (see *How `process` behaves*). `--source`, `--since`, `--until`,
 `--item` and `--limit` narrow the items; `--force` reprocesses them all.
@@ -489,13 +501,9 @@ the processor) and failed. A key whose run fails as a whole (its LLM is
 unreachable, say) counts one failure and the next key still runs; the exit
 status is non-zero if anything failed.
 
-`workflows` runs import, then process, for each selected workflow in
-turn, `default` first with `--all`; a failing phase is logged and the next
-one still runs.
-
-**3. Applets** (`apps run`) runs the selected applet instances that are
-due by their schedule (`every`, `at`, `days`; without any, on every call);
-`--force` runs them whether due or not. Each run reads what
+**3. Applets** (`apps`) runs the selected workflows' applet instances that
+are due by their schedule (`every`, `at`, `days`; without any, on every
+call); `--force` runs them whether due or not. Each run reads what
 is stored, emits its documents and saves its state, all in one
 transaction:
 
@@ -509,13 +517,13 @@ transaction:
 The `Apps` table shows, per instance, whether it was due, the documents
 that are `New`, those `Already stored`, the rows `Routed` for stored ones,
 and the error. A failing instance keeps its previous state and does not
-stop the others. Then `apps run` delivers (phase 4): with `--all` to every
-sink, otherwise to the sinks those instances are routed to. `--no-deliver` stops
-before that; `--dry-run` shows what the applets would emit and their new
-state, storing and sending nothing.
+stop the others. Nothing is sent: that is phase 4. `--dry-run` shows what
+the applets would emit and their new state, storing nothing.
 
 **4. Deliver** (`deliver`) sends the pending delivery rows of the
-selected sink instances: `queued` rows, and failed ones
+selected workflows' sinks, those their instances are routed to (with
+`--all`, every sink, so rows queued by hand for a sink no instance routes
+to go too; `--sink` narrows them): `queued` rows, and failed ones
 with attempts left once their backoff has passed. Each sink goes oldest
 first and keeps its own pace: with an `interval`, one row once its last
 delivery is that old; then at most `max_per_run` rows. `--ignore-interval`,
@@ -525,33 +533,35 @@ per sink, the rows delivered and failed; a sink whose run fails as a whole
 counts one failure and the next sink still delivers. Rows of a sink no
 longer configured are reported whatever is selected.
 
-`run` runs the four phases in turn: `workflows`, then `apps run` and its
-delivery, all `--default` or all `--all`. A failing phase is logged and the
-next one still runs, so a failed import does not hold back the applets.
+`run` runs, for each selected workflow in turn, its import, process and
+applets phases, then one delivery phase for the union of their sinks
+(every sink with `--all`), so each sink delivers once per call and its
+`max_per_run` holds. A failing phase is logged and the next one still
+runs, so a failed import does not hold back the applets.
 
 A typical setup is one cron line, at the pace imports should happen;
 applets run when due and sinks keep their own pace:
 
 ```sh
-*/15 * * * *  uv run newstool -c config.yaml run --default
+*/15 * * * *  uv run newstool -c config.yaml run --all
 ```
 
-Workflows and applet instances with `skip_default` get cron lines of their
-own (`workflows -w juntas`, `apps run --app weekly`). Every command that
-writes takes the write lock, so a run that starts while another holds it
-fails with a lock error and is picked up by its next cron run; keep them
-from overlapping where possible (`run` and `apps run` hold the lock while
-they send). The same phases by hand, checking each step before the next:
+or one `run -w NAME` line per workflow, each at its own pace. Every command
+that writes takes the write lock, so a run that starts while another holds
+it fails with a lock error and is picked up by its next cron run; keep
+them from overlapping where possible (`run` holds the lock while it
+sends). The same phases by hand, checking each step before the next:
 
 ```sh
-uv run newstool -c config.yaml workflows -w news               # import and process
+uv run newstool -c config.yaml import -w news
+uv run newstool -c config.yaml process -w news
 uv run newstool -c config.yaml inspect annotations --key summary
-uv run newstool -c config.yaml apps run --app items --dry-run  # what it would emit
-uv run newstool -c config.yaml apps run --app items --no-deliver
+uv run newstool -c config.yaml apps -w news --app items --dry-run  # what it would emit
+uv run newstool -c config.yaml apps -w news --app items
 uv run newstool -c config.yaml inspect documents --app items
 uv run newstool -c config.yaml inspect deliveries --status queued
-uv run newstool -c config.yaml deliver --sink chat --dry-run
-uv run newstool -c config.yaml deliver --sink chat
+uv run newstool -c config.yaml deliver -w news --sink chat --dry-run
+uv run newstool -c config.yaml deliver -w news --sink chat
 ```
 
 ### How `process` behaves
@@ -655,8 +665,8 @@ takes `input` (the annotation key embedded, default `tags`; one entry per
 input). `truncate`
 accepts `summarize`'s options and ignores them, so an entry swaps one for
 the other by its type alone; its `llm` is not checked, so it needs no
-`llms`. On shared sources, two types cannot write one key: give each its
-own. Consumers read annotations by key:
+`llms`. Two entries cannot write one key: give each its own. Consumers
+read annotations by key:
 `itemfeed` reads `summary` (or its `annotation` option's key), and
 `digest` its `input` (`summary`), `tags`, the keys of its filters,
 `topics` when it weights them and, with `algorithm: embeddings`, the
@@ -677,13 +687,13 @@ Options of `ollama`: `api_base` (default `http://localhost:11434`),
 | Plugin | Applet | Output (content type) | Document keys | Does |
 | :--- | :--- | :--- | :--- | :--- |
 | `itemfeed` | `itemfeed` | `items` (`text/plain`) | `item:<source>/<uid>` | One document per newly imported item with its `annotation`: the annotation as text, with the item's title, link and image |
-| `feed` | `feed` | `feed` (`application/rss+xml`) | the run's time | RSS feed of the newest items of its sources |
-| `digest` | `digest` | `plan` (`application/json`), `digest` (`text/markdown`) | `<from>_<to>` (first and last day) | One digest of the stories its sources covered over the last `span_days` days: items filtered by their annotations, grouped into stories, ranked, and each chosen story written with an LLM from its items' `input` |
+| `feed` | `feed` | `feed` (`application/rss+xml`) | the run's time | RSS feed of the newest items of its workflow's sources |
+| `digest` | `digest` | `plan` (`application/json`), `digest` (`text/markdown`) | `<from>_<to>` (first and last day) | One digest of the stories its workflow's sources covered over the last `span_days` days: items filtered by their annotations, grouped into stories, ranked, and each chosen story written with an LLM from its items' `input` |
 
 Options, in the type's section as defaults or per instance. Every applet
-takes `sources` (the source ids it reads; default every source). Lengths
-of time, here and in every other option, are seconds or a number with a
-unit suffix: `90s`, `5m`, `2h`, `3d`, `1h30m`.
+reads the sources of its workflow, and only those. Lengths of time, here
+and in every other option, are seconds or a number with a unit suffix:
+`90s`, `5m`, `2h`, `3d`, `1h30m`.
 
 - `itemfeed`: `annotation` (the key emitted as the text, default
   `summary`), `backfill` (how far before its first run it starts: default
@@ -719,7 +729,7 @@ unit suffix: `90s`, `5m`, `2h`, `3d`, `1h30m`.
     the entries), under a `# <title>: <from> – <to>` heading (`title`,
     default `Digest`); `llm`, `model` and `context_length` (default 32768)
     as above. `write: false` emits only the `plan`, to tune the options
-    without the LLM: read it with `inspect documents`, and `apps reset
+    without the LLM: read it with `inspect documents`, and `delete apps
     --app ID --with-documents` to run the same days again.
 
   Schedule it for its period (`days: [mon]`, `at: "07:00"`); a second run
@@ -785,8 +795,8 @@ apps:
 How delivery behaves:
 
 - Each document an applet emits is queued for every sink its output is
-  routed to. `apps run` delivers after running the applets, and `deliver`
-  on its own.
+  routed to. `run` delivers after running the applets, and `deliver` on
+  its own; `apps` only queues.
 - A document has no destination of its own: `inspect documents` shows what
   was emitted and by whom (applet, output, key, content, title, link,
   image, time), and no sink. The destination is the applet's `sink` or
@@ -802,10 +812,10 @@ How delivery behaves:
 
   ```sh
   uv run newstool -c config.yaml deliveries set-status --sink chat --app items --as queued
-  uv run newstool -c config.yaml deliver --sink chat
+  uv run newstool -c config.yaml deliver --all --sink chat
   ```
 
-  Or start over with `apps reset --app items --with-documents`: for `itemfeed`,
+  Or start over with `delete apps --app items --with-documents`: for `itemfeed`,
   the next run is a first run again, so only what its `backfill` reaches
   is emitted (with the default 0, none of the items already imported).
 - A sink instance delivers oldest first, whatever applet emitted them:
@@ -851,6 +861,11 @@ configuration: `process` moves to `processors` (or to workflows),
 routes to `sinks` instances; the `telegram` and `googlechat` item sinks
 become an `itemfeed` instance routed to them, and `telegram_artifacts`
 becomes a route from the digest's output to a `telegram` instance.
+Workflows as chains (decision 0019) need a rewritten configuration, not a
+new database: the root keys' implicit workflow becomes a named entry of
+`workflows`, a workflow's own `process` entries move to `processors` with
+an `id`, workflows list their `apps`, applets lose `sources`, and
+`skip_default` goes.
 
 Commands that write take a lock next to the database (`data.db.lock`), so
 a second one fails at once instead of running alongside the first.

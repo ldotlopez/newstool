@@ -24,17 +24,15 @@ from ..applets import (
     AppletType,
     BaseApplet,
     Outputs,
-    Requirements,
-    SourcesOptions,
 )
 from ..config import Duration
 from ..models import AppletResult, AppletRun, EmittedDocument, SourceItem
-from . import PluginTypes
+from . import PluginOptions, PluginTypes
 
 OUTPUT = "items"
 
 
-class ItemFeedOptions(SourcesOptions):
+class ItemFeedOptions(PluginOptions):
     annotation: str = "summary"  # the annotation key emitted as the text
     # How far before the first run to start: 0, nothing stored before it;
     # `all`, the whole history.
@@ -49,9 +47,8 @@ class ItemFeedApplet(BaseApplet):
     options: ItemFeedOptions
 
     @classmethod
-    def requirements(cls, options: ItemFeedOptions) -> Requirements:
-        sources = tuple(options.sources) if options.sources is not None else None
-        return Requirements(sources=sources, keys=(options.annotation,))
+    def required_keys(cls, options: ItemFeedOptions) -> tuple[str, ...]:
+        return (options.annotation,)
 
     def run(self, now: datetime, run: AppletRun, reader: AppletReader) -> AppletResult:
         options = self.options
@@ -62,7 +59,6 @@ class ItemFeedApplet(BaseApplet):
             start = self.first_start(now)
 
         items = reader.items(
-            sources=options.sources,
             imported_since=self.since(cursor, start),
             imported_until=now,
         )

@@ -24,9 +24,8 @@ cache:
   expiration: 6h
 
 # Plugin types and the defaults of their options in every use of the type:
-# the catalog entries, the workflows' own entries and the applet and sink
-# instances below override them (nested mappings key by key; any other
-# value, lists included, whole).
+# the catalog entries and the applet and sink instances below override them
+# (nested mappings key by key; any other value, lists included, whole).
 # Options left out take the type's defaults. A section builds nothing.
 plugins:
   ollama:
@@ -57,12 +56,10 @@ plugins:
 
 # The catalog: every configured use of a plugin type, with its `options` over
 # the type's section, validated at startup and built only when a workflow
-# runs it. An `id` names an entry so that workflows can refer to it; it
-# cannot be a type's name.
-#
-# The `default` workflow imports every source and runs every processor
-# without `skip_default: true`. `skip_default` only leaves an entry out of
-# `default`: the workflows that name it still run it.
+# runs it. Defining an entry never runs it: only `workflows` (at the end)
+# run, and an entry no workflow names gets a warning. An `id` names an entry
+# so that workflows can refer to it; a processor entry without one takes its
+# type's name.
 
 # LLMs, for the processors and applets that use one.
 llms:
@@ -92,12 +89,11 @@ sources:
     provider: theguardian
     url: https://www.theguardian.com/world/spain
 
-  # Used only by the workflows that name it (see `workflows` below).
+  # Only the `juntas` workflow names it (see `workflows` below).
   - id: juntagobiernolocal
     name: Junta de Gobierno Local
     provider: csjuntasgobierno
     url: https://www.castello.es/es/sesiones
-    skip_default: true
 
   # Any RSS or Atom feed. `options` override, for this source only, the
   # options in the provider's plugin section.
@@ -109,10 +105,10 @@ sources:
   #     fetch_article: true  # fetch the full article
   #     article_selector: article .post-body  # keep only its body
 
-# Each processor run writes one annotation key, the processor's own unless the
-# entry names another with `key`. On shared sources a key is written by one
-# processor type; other options for it only get a warning (the first run to
-# process an item writes it).
+# Each processor entry writes one annotation key, the processor's own unless
+# the entry names another with `key`; a key is written by one entry. An entry
+# without `id` is named by its type (`markdownify`), so two entries of one
+# type need ids.
 processors:
   - markdownify                      # markdown
   - summarize                        # summary
@@ -120,40 +116,30 @@ processors:
   - processor: classify              # topics, from a closed list
     options:
       labels: [política, urbanismo, vivienda, cultura, economía, deportes, sucesos]
-  - embed                            # tags/embedding
-  - processor: embed
-    options:
-      input: markdown                # markdown/embedding
-  # A second summary, in Spanish, with its own prompt and model, for the
-  # workflows that name it:
+  # Embeddings, for a digest with `algorithm: embeddings`:
+  # - processor: embed                 # tags/embedding
+  #   id: embed-tags
+  # - processor: embed                 # markdown/embedding
+  #   id: embed-markdown
+  #   options: {input: markdown}
+  # For the `spain-abroad` digest below: a second summary, in Spanish, with
+  # its own prompt and model, its embedding and a yes/no label, for sources
+  # that mix in other news:
   # - processor: summarize
   #   id: summary-es
   #   key: summary/es
-  #   skip_default: true
   #   options:
   #     prompt: "Resume en español el siguiente artículo:\n\n"
   #     model: gemma4:27b
   # - processor: embed                 # summary/embedding/es
   #   id: embed-summary-es
-  #   skip_default: true
   #   options: {input: summary/es}
-  # A yes/no label, for sources that mix in other news:
   # - processor: classify
   #   id: about-spain
   #   key: about/spain
-  #   skip_default: true
   #   options:
   #     question: Is the article mainly about Spain or Spaniards?
   #     labels: ["yes", "no"]          # quoted: YAML reads yes/no as booleans
-
-# Workflows, run with `-w NAME` (one cron line each), import and process. A
-# workflow sees only its sources. Entries are catalog ids, type names (the
-# type with its section's options) or entries of the workflow's own, which
-# have no `id`.
-workflows:
-  - name: juntas
-    sources: [juntagobiernolocal]
-    process: [markdownify, summarize]
 
 # Sink instances: where documents go and how fast. Every sink takes
 # `interval` (time between deliveries, oldest first; default 0),
@@ -184,27 +170,21 @@ sinks:
   #   options:
   #     path: /srv/www/{app}.xml     # {app}, {output}, {key} are replaced
 
-# Applet instances, run by `apps run` and `run` when due: `every` after
-# their last success, on `days`, once a day from `at` (local time).
-# `skip_default: true` leaves one out of `--default`; `--app ID` or `--all`
-# still runs it. Each output goes to the sink instances in `routes`;
-# `sink` is the shorthand for an applet with one output. An instance's `id`
-# keys its state and documents: renaming it starts it from scratch.
+# Applet instances, run by their workflow when due: `every` after their last
+# success, on `days`, once a day from `at` (local time); without any, on
+# every run of their workflow. An instance reads exactly its workflow's
+# sources. Each output goes to the sink instances in `routes`; `sink` is the
+# shorthand for an applet with one output. An instance's `id` keys its state
+# and documents: renaming it starts it from scratch.
 apps:
   - id: main-items                   # each new summarized item, once
     app: itemfeed
     options:
-      sources:
-        - elperiodicomediterraneo-castello
-        - castelloninformacion-castello
-        - castellonplaza
-        - the-guardian-spain
       annotation: summary            # the annotation posted, e.g. summary/es
     routes:
       items: [telegram-main, chat-main]
   - id: juntas-items
     app: itemfeed
-    options: {sources: [juntagobiernolocal]}
     sink: telegram-juntas
   - id: castello-weekly              # Mondays from 07:00, last week's stories
     app: digest
@@ -212,23 +192,18 @@ apps:
     days: [mon]
     options:
       title: Castelló
-      sources:
-        - elperiodicomediterraneo-castello
-        - castelloninformacion-castello
-        - castellonplaza
       exclude: {topics: [deportes, sucesos]}
       topic_weights: {vivienda: 3, urbanismo: 2}
       # write: false                 # only the plan, to tune the options
     routes:
       digest: [telegram-main]        # the plan: `inspect documents`
-  # Foreign media on Spain, daily, in Spanish (needs summary-es,
-  # embed-summary-es and about-spain run on its sources):
+  # Foreign media on Spain, daily, in Spanish (the `spain-abroad` workflow
+  # below runs summary-es, embed-summary-es and about-spain on its sources):
   # - id: spain-abroad
   #   app: digest
   #   at: "08:00"
   #   options:
   #     title: España en la prensa extranjera
-  #     sources: [the-guardian-spain]
   #     span_days: 1
   #     input: summary/es
   #     include: {about/spain: ["yes"]}
@@ -242,3 +217,37 @@ apps:
   #   every: 1h
   #   options: {max_items: 10}
   #   sink: site
+
+# Workflows: the only thing that runs. Each names, by `id`, its sources, its
+# process entries (in order) and its applet instances, and is the whole
+# chain: import its sources, process them, run its instances that are due,
+# then deliver to the sinks they are routed to. A source or processor can be
+# in several workflows (a processor skips what is done); an applet instance
+# in one only. Every key an instance reads must be written by its own
+# workflow. Run them with `run -w NAME` (repeatable) or `run --all`, e.g.
+# from cron:
+#   */15 * * * *  newstool -c config.yaml run --all
+workflows:
+  - name: castello                   # each new summary, to Telegram and Chat
+    sources:
+      - elperiodicomediterraneo-castello
+      - castelloninformacion-castello
+      - castellonplaza
+      - the-guardian-spain
+    process: [markdownify, summarize]
+    apps: [main-items]
+  - name: castello-weekly            # Mondays from 07:00: last week's stories
+    sources:
+      - elperiodicomediterraneo-castello
+      - castelloninformacion-castello
+      - castellonplaza
+    process: [markdownify, summarize, tagger, classify]
+    apps: [castello-weekly]
+  - name: juntas
+    sources: [juntagobiernolocal]
+    process: [markdownify, summarize]
+    apps: [juntas-items]
+  # - name: spain-abroad
+  #   sources: [the-guardian-spain]
+  #   process: [markdownify, tagger, summary-es, embed-summary-es, about-spain]
+  #   apps: [spain-abroad]

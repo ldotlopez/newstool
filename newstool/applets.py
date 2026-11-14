@@ -25,7 +25,7 @@ from .models import (
     ProcessingScope,
     SourceItem,
 )
-from .plugins import PluginOptions, Services
+from .plugins import NoOptions, Services
 
 # An applet's outputs: each name with the content types it emits.
 type Outputs = Mapping[str, frozenset[str]]
@@ -89,26 +89,18 @@ class Schedule:
         raise ValueError("the schedule is never due")
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class Requirements:
-    """What an instance's runs read: its sources (None: every source) and the
-    annotation keys, checked against the configuration at startup."""
-
-    sources: tuple[str, ...] | None = None
-    keys: tuple[str, ...] = ()
-
-
 class AppletReader:
-    """What an applet may read: items, their annotations and contents, and
-    the documents of any instance. Not another instance's state."""
+    """What an applet may read: the items of its workflow's sources, their
+    annotations, and the documents of any instance. Not another instance's
+    state."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, sources: Iterable[str]) -> None:
         self._db = db
+        self._sources = tuple(sources)
 
     def items(
         self,
         *,
-        sources: Iterable[str] | None = None,
         published_since: datetime | None = None,
         published_until: datetime | None = None,
         imported_since: datetime | None = None,
@@ -119,7 +111,7 @@ class AppletReader:
         """Items by publication date, oldest first unless `newest_first`,
         without their content. Since bounds are `>=`, until bounds `<`."""
         scope = ProcessingScope(
-            sources=tuple(sources) if sources is not None else None,
+            sources=self._sources,
             since=published_since,
             until=published_until,
             imported_since=imported_since,
@@ -134,9 +126,6 @@ class AppletReader:
         """The annotation `key` of each item, by item key; items without it
         are absent."""
         return self._db.get_annotation_values(items, key=key)
-
-    def content(self, item: SourceItem) -> bytes:
-        return self._db.get_content(item)
 
     def documents(
         self,
@@ -162,7 +151,6 @@ class AppletReader:
         )
 
 
-@runtime_checkable
 class Applet(Protocol):
     """Decides whether it is due, and runs: returns its new state and the
     documents it emits. It never writes anything itself."""
@@ -186,27 +174,21 @@ class AppletType(Protocol):
 
     def __call__(self, options: Any, services: Services) -> Applet: ...
 
-    def requirements(self, options: Any) -> Requirements:
-        """The sources and annotation keys a run with `options` reads."""
+    def required_keys(self, options: Any) -> tuple[str, ...]:
+        """The annotation keys a run with `options` reads, which its
+        workflow must write (decision 0019)."""
         ...
-
-
-class SourcesOptions(PluginOptions):
-    """Options of an applet that reads items: its sources, or every source
-    when unset."""
-
-    sources: list[str] | None = None
 
 
 class BaseApplet:
     """An applet that is due by its instance's schedule and reads the items
-    of `options.sources`; `requires` names the annotation keys it reads.
+    of its workflow's sources; `requires` names the annotation keys it reads.
     Subclasses declare `name`, `outputs` and `options_model`, and implement
     `run`."""
 
     name: str
     outputs: ClassVar[Outputs]
-    options_model: type[pydantic.BaseModel] = SourcesOptions
+    options_model: type[pydantic.BaseModel] = NoOptions
     requires: tuple[str, ...] = ()
 
     def __init__(self, options: Any, services: Services) -> None:
@@ -214,12 +196,8 @@ class BaseApplet:
         self.services = services
 
     @classmethod
-    def requirements(cls, options: Any) -> Requirements:
-        sources = getattr(options, "sources", None)
-        return Requirements(
-            sources=tuple(sources) if sources is not None else None,
-            keys=cls.requires,
-        )
+    def required_keys(cls, options: Any) -> tuple[str, ...]:
+        return cls.requires
 
     def is_due(self, now: datetime, run: AppletRun, schedule: Schedule) -> bool:
         return schedule.is_due(now, run.last_success)

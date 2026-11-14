@@ -22,11 +22,8 @@ class SourceData(BaseModel):
     url: HttpUrl
     provider: str
     # Over the provider's `plugins` section, the options its provider is
-    # built with. Config only, like `skip_default`: the database stores
-    # neither.
+    # built with. Config only: the database does not store them.
     options: dict[str, JsonCompatible] = Field(default_factory=dict)
-    # Left out of the `default` workflow; workflows that name it use it.
-    skip_default: bool = False
 
     def __hash__(self) -> int:
         # The id is the identity (decision 0001), and the options are a dict.

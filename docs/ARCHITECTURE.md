@@ -19,8 +19,9 @@ config.yaml ─► Config ─► Application (app.py) ◄── cli.py, external
                      process                           ▼
                      Processor ◄── Database.get_unprocessed_items / get_content
                         └─► annotations + processing state
-                     apps run (when due)
-                     Applet ◄── AppletReader: items, annotations, documents
+                     apps (when due)
+                     Applet ◄── AppletReader (its workflow's sources):
+                                items, annotations, documents
                         └─► AppletResult: state + emitted documents
                               └─► Database.commit_app_run: documents,
                                   a queued delivery per route, run record
@@ -33,17 +34,17 @@ config.yaml ─► Config ─► Application (app.py) ◄── cli.py, external
 
 | Module | Responsibility |
 | :--- | :--- |
-| `app.py` | `Application`, the single entry point: registers the plugin classes, resolves the configuration into a `Catalog`, wires config, HTTP cache and database, builds each profile's object on first use (`_object`), runs import and process one unit at a time on a workflow's sources (`import_source`, `run_process`; `source_ids()` lists the sources of some workflows, each once, and `process_keys()` a workflow's process runs, in configuration order, `workflows` the workflows), runs applet instances (`run_app`, `reset_app`, `app_status`; `app_ids`, `default_app_ids`) and deliveries (`deliver`, `plan_delivery`, `send_deliveries`, `mark_deliveries`; `sink_ids`), answers queries and deletes. The database is private to it. `write_lock`, the exclusive lock every writing command takes. |
-| `cli.py` | Click commands only: the workflow phases (`import`, `process`, and `workflows` for both), `apps run\|reset`, `deliver`, and `run` for all four; every command that runs something takes exactly one selection (`selection_options`: a name option, `--default` or `--all`, resolved by `selected_workflows`/`selected_apps`/`selected_sinks`), and a bare one is a usage error; read-only `inspect items\|annotations\|documents\|apps\|content\|deliveries`, `delete items\|annotations\|documents\|deliveries`, `deliveries set-status\|send\|rename`; builds an `Application` per invocation, locked for the commands that write, and runs each unit through it with its own progress row; a unit that raises is logged and counted as failed, and the rest still run. `inspect` and `delete` share their selection options, so `inspect` is `delete`'s dry run. Results go to stdout and progress and logs to stderr, each rich only when it is a terminal (`RICH_STDOUT_*`/`RICH_STDERR_*` from `foundation.clilib`); summaries print after the progress ends. Global logging options and the log handler come from `foundation.clilib` and `foundation.loglib`. |
-| `catalog.py` | `Catalog`: the configuration resolved against the registered classes, at start-up. Every use becomes a `Profile` (class, validated options), every workflow's process runs a `Run` (workflow, key, profile), every applet instance an `AppInstance` (profile, `Schedule`, routes) and every sink instance a profile, with every check of decisions 0010 and 0015 (sections, ids, keys, routes and content types, what runs and applets read, LLMs). Builds nothing. |
-| `config.py` | Pydantic models for `config.yaml` (log level, `plugins` defaults per type, the catalog: `llms`, `sources`, `processors`; `workflows`, the instances `apps` and `sinks`, `cache`, `cache_dir`, `storage_dir`); `Config.all_workflows()` adds `default` (the sources without `skip_default`), and `Config.default_app_ids()` lists the applet instances without it. `Duration`, a length of time as seconds or with a unit suffix (`5m`, `2h`, `3d`), parsed to seconds at load. `Config` is a pydantic-settings `BaseSettings`: `NEWSTOOL_*` variables, then a `.env` next to the config file, then the YAML, then the `ENV_ALIASES` variables (`OLLAMA_HOST`, `OLLAMA_API_KEY`), then defaults (`settings_customise_sources`). `ConfigPath`, a path relative to the config file's directory (the `LoadContext` of the load in progress); `storage_dir` holds `data.db` and `content/` (`database_uri`, `content_dir`). `${VAR}` expansion, in the YAML only, from the environment and a `.env` next to the config file, and the formatting of option errors with their config path. |
+| `app.py` | `Application`, the single entry point: registers the plugin classes, resolves the configuration into a `Catalog`, wires config, HTTP cache and database, builds each profile's object on first use (`_object`), runs import and process one unit at a time on a workflow's sources (`import_source`, `run_process`; `workflows` lists the workflows in configuration order, `workflow(name)` gives one, `source_ids(workflows)` the sources of some workflows, each once, and `process_runs(workflows, processor=None)` their process runs as (workflow, key), each workflow's in its order, or one processor entry's by its `ref`), runs a workflow's applet instances (`run_app`, `reset_app`, `app_status`; `app_ids`, `workflow_apps(name)`) and deliveries (`deliver`, `plan_delivery`, `send_deliveries`, `mark_deliveries`; `sink_ids`, `workflow_sinks(workflows)`, the sinks some workflows' instances are routed to), answers queries and deletes. The database is private to it. `write_lock`, the exclusive lock every writing command takes. |
+| `cli.py` | Click commands only: one per phase (`import`, `process`, `apps`, `deliver`) and `run` for the whole chain; each takes exactly one selection of workflows (`workflow_selection`: `-w/--workflow NAME`, repeatable, or `--all`, resolved by `selected_workflows`), and a bare one is a usage error; the phase commands narrow by id within it (`--source`, `--processor`, `--app`, `--sink`), an id outside it being an error; read-only `inspect items\|annotations\|documents\|apps\|content\|deliveries`, `delete items\|annotations\|documents\|deliveries\|apps`, `deliveries set-status\|send\|rename`; builds an `Application` per invocation, locked for the commands that write, and runs each unit through it with its own progress row; a unit that raises is logged and counted as failed, and the rest still run. `inspect` and `delete` share their selection options, so `inspect` is `delete`'s dry run. Results go to stdout and progress and logs to stderr, each rich only when it is a terminal (`RICH_STDOUT_*`/`RICH_STDERR_*` from `foundation.clilib`); summaries print after the progress ends. Global logging options and the log handler come from `foundation.clilib` and `foundation.loglib`. |
+| `catalog.py` | `Catalog`: the configuration resolved against the registered classes, at start-up. Every use becomes a `Profile` (class, validated options), every workflow's process runs a `Run` (workflow, key, profile), every applet instance an `AppInstance` (profile, `Schedule`, routes, its `workflow`) and every sink instance a profile, with every check of decisions 0010, 0015 and 0019 (sections, ids, unique keys, one workflow per applet instance, routes and content types, what runs and applets read, LLMs, unused entities). Builds nothing. |
+| `config.py` | Pydantic models for `config.yaml` (log level, `plugins` defaults per type, the catalog: `llms`, `sources`, `processors`, the instances `apps` and `sinks`; `workflows`, lists of ids; `cache`, `cache_dir`, `storage_dir`); `ProcessEntry.ref` is an entry's `id`, or else its type name. Removed shapes (`skip_default`, a workflow's own `process` entry) fail with what to write instead (decision 0019). `Duration`, a length of time as seconds or with a unit suffix (`5m`, `2h`, `3d`), parsed to seconds at load. `Config` is a pydantic-settings `BaseSettings`: `NEWSTOOL_*` variables, then a `.env` next to the config file, then the YAML, then the `ENV_ALIASES` variables (`OLLAMA_HOST`, `OLLAMA_API_KEY`), then defaults (`settings_customise_sources`). `ConfigPath`, a path relative to the config file's directory (the `LoadContext` of the load in progress); `storage_dir` holds `data.db` and `content/` (`database_uri`, `content_dir`). `${VAR}` expansion, in the YAML only, from the environment and a `.env` next to the config file, and the formatting of option errors with their config path. |
 | `models.py` | Domain models: `SourceData` (a configured source), `SourceItemData` (provider output, validated), the DTOs `SourceItem`, `Annotation`, `Document`, `Delivery` and `AppletRun` (each with its database `id`), what applets return (`EmittedDocument`, `AppletResult`), and the selections `ProcessingScope` (`sources` holds a workflow's; publication and import bounds) and `DocumentFilter`. |
 | `httpclient.py` | `requests` session with browser headers and a `foundation` cache, which `get(url, use_cache=False)` skips. |
 | `errors.py` | How failures reach the user: `PluginFailure`, the exception a plugin raises, with a message written for the user, when it cannot do its job in an expected way; `EXPECTED_ERRORS`, that and the failures of the network, the LLM backend and the database; `describe` (the message of a `PluginFailure`, `Type: message` for any other exception) and `log_failure` (error-level log; the traceback only with debug logging or when the exception is unexpected). |
 | `db.py` | SQLAlchemy models and `Database`, the only code that touches SQLite or the content storage. |
 | `providers.py` | The `Provider`, `PreflightProvider` and `ProviderType` protocols, `BaseProvider` and `IndexSiteProvider`, optional base classes. |
 | `processors.py` | The `Processor` and `ProcessorType` protocols, `ProcessorOptions`, `BaseProcessor`, `SkipItem` and `RunSummary`; `publisher_tags` (an item's `data["tags"]`) and `embedding_key` (the key `embed` writes for an input), shared by the bundles that need them. |
-| `applets.py` | The `Applet` and `AppletType` protocols, `BaseApplet`, `SourcesOptions`, `Schedule` (when an instance is due), `Requirements`, `AppletReader` (what applets may read), `check_result` and `run_key`. |
+| `applets.py` | The `Applet` and `AppletType` protocols, `BaseApplet`, `Schedule` (when an instance is due), `required_keys` (the annotation keys an instance reads, which its workflow must write), `AppletReader` (what applets may read, scoped to the instance's workflow's sources), `check_result` and `run_key`. |
 | `sinks.py` | The `Sink` and `SinkType` protocols, `SinkOptions`, `accepts`, and `Deliverer`, the delivery cycle of one sink instance over the ledger. |
 | `llms.py` | The `LLM` and `LLMType` protocols, `LLMUnavailableError` and `strip_code_fence`, for answers wrapped in a code fence. |
 | `plugins/` | The plugin bundles: one module per site provider (`telegram_channel` included), `markdownify`, the `ollama` LLM, `summarize`, `tagger`, `classify`, `embed`, `truncate` (a test stand-in for `summarize`), the applets `digest`, `feed` and `itemfeed`, and the sinks `telegram`, `googlechat`, `filesink` (`file`) and `stdout`. `PluginOptions`, `NoOptions`, `UsesLLMOptions`, `merge_options`, `PluginTypes`, `Services` and `ClassRegister` live in its `__init__`. |
@@ -74,7 +75,7 @@ code:
 A type protocol declares `options_model` and `__call__(options, services)`;
 `ProcessorType` adds `output_key(options)` and `required_key(options)`,
 `AppletType` `outputs` (output name to content types) and
-`requirements(options)` (sources and annotation keys), and `SinkType`
+`requirements(options)` (the annotation keys it reads), and `SinkType`
 `accepts` (content types), as class attributes or methods, so keys, routes
 and requirements are checked without objects. An object keeps its options
 (`self.options`) and what it takes from `services` (decision 0013):
@@ -104,35 +105,36 @@ builds nothing; `Catalog` checks its keys and each value against the
 type's `options_model` (`check_section`), and rules across options when a
 use is validated. The catalog lists the uses: `llms`, `sources` and
 `processors`, each a type name or `{<type>, id, key, options}`; `apps` and
-`sinks` list instances, each with a required `id`. A use's options are
+`sinks` list instances, each with a required `id`. Defining a use never
+runs it: only workflows do. A use's options are
 `merge_options(section, options)`, merged key by key in nested mappings,
 any other value replacing, validated with `options_model`. A rejected
 option is a `ConfigError` with its path
 (`sinks.0.options.chat_id: Field required`).
 
-An `id` lets workflows refer to a catalog entry; it cannot be a type's name
-of its kind. A workflow entry is an id, a type name (the type with its
-section's options: one profile per type), or an entry of the workflow's own
-(no `id`, no `skip_default`). Every profile of the catalog is validated,
-whether a workflow runs it or not.
+An `id` lets workflows refer to a catalog entry; it cannot be another
+type's name of its kind. A `processors` entry without one is referred to by
+its type name (`ProcessEntry.ref`), so two entries of one type need
+explicit ids. Every profile of the catalog is validated, whether a workflow
+runs it or not; a source, processor or applet instance no workflow refers
+to gets a warning. Sinks do not: rows queued by hand reach them.
 
 ## Workflows
 
-`config.all_workflows()` returns `default`, with every source not marked
-`skip_default`, then the `workflows` list. `Catalog` gives `default` the
-catalog's processors without `skip_default`, in order; the other workflows
-resolve their entries. Each run is a `Run` (workflow, key, profile,
-location), and import and process restrict the scope to its workflow's
-sources (`workflow_scope`, `ProcessingScope.sources`). Workflows only
-import and process: applets and sinks are global (see *Applets*).
+Decision 0019. `config.workflows` is the list as written: each `Workflow`
+holds ids (`sources`, `process`, `apps`); there is no implicit workflow.
+`Catalog` resolves a workflow's `process` ids to the `processors` entries'
+uses; each run is a `Run` (workflow, key, profile, location), and import
+and process restrict the scope to its workflow's sources (`workflow_scope`,
+`ProcessingScope.sources`). A workflow is the whole chain: its import,
+process and applets, then the delivery to its sinks (see *Applets*).
 
-Process runs are keyed `(workflow, key)`, one per key in a workflow. On
-shared sources, two processor types cannot write one key (each would see
-the other's `processor_version` and process every item again); the same
-type with other options gets a warning, since the first run to process an
-item writes it. Annotations and processing state are per `(item, key)`.
-Every key a process run reads (`required_key`) must be written by a process
-run on its workflow's sources, in any workflow.
+Process runs are keyed `(workflow, key)`. A key is written by one
+`processors` entry, so two entries with one key are a `ConfigError`, and
+workflows that run a key share its profile: a key means the same on every
+source. Annotations and processing state are per `(item, key)`. Every key a
+process run reads (`required_key`) must be written by a process run on its
+workflow's sources, in any workflow.
 
 Bundles never import each other. `digest` reads the vectors `embed`
 stores under `embedding_key(input)` (`tags/embedding`,
@@ -168,7 +170,7 @@ sources:
 
 An unknown or invalid option fails every command at start-up as a
 configuration error (`sources.<id>.options.<option>`). The options live in
-the configuration only, like `skip_default`; the database stores neither.
+the configuration only; the database does not store them.
 
 HTML providers keep the article's cleaned HTML rather than converting it:
 `foundation.scrapelib.prune_to_spine` keeps the main node and its ancestors,
@@ -254,8 +256,8 @@ they never show in a `repr` or a traceback. Processors usually subclass
 `BaseProcessor` (`process_item(item)`, plus `key` and `requires` class
 attributes, options from `ProcessorOptions`) and read the database through
 `self.db`. Applets subclass `BaseApplet`: they declare `outputs` and
-`requires`, take their sources from `SourcesOptions`, and implement
-`run(now, run, reader)`, reading only through the `AppletReader` and
+`requires`, and implement `run(now, run, reader)`, reading only through
+the `AppletReader`, already scoped to their workflow's sources, and
 returning an `AppletResult` (see *Applets*). Sinks declare `accepts` and
 implement `send(document)`, with options from `SinkOptions`. Each sets
 `name` and `options_model` as class attributes and is returned as
@@ -346,11 +348,11 @@ touch `modified_at` (spec §4.1).
 
 The eligibility and retry rules are in spec §4.2; this is where they live:
 
-- A workflow's process runs come from the catalog or its own entries: a
-  processor, an optional `key` and its options. At start-up `Catalog`
-  validates the options, asks the class for its `output_key(options)` when
-  the entry names no key, and checks the keys (see *Workflows*).
-  `run_process(key, workflow=...)` calls
+- A workflow's process runs are `processors` entries it refers to by
+  `ref`: a processor, an optional `key` and its options. At start-up
+  `Catalog` validates the options, asks the class for its
+  `output_key(options)` when the entry names no key, and checks the keys
+  (see *Workflows*). `run_process(key, workflow=...)` calls
   `processor.process(key=key, scope=..., force=...)`.
 - `BaseProcessor.process_item(item)` returns the value of one
   annotation for one item, with its options in `self.options`.
@@ -371,22 +373,26 @@ The eligibility and retry rules are in spec §4.2; this is where they live:
 
 ## Applets
 
-Decision 0015. `Catalog` builds an `AppInstance` per `apps` entry: its
-profile, a `Schedule` (`every`, `at`, `days` as weekday numbers) and its
-routes, `routes` or the `sink` shorthand turned into `{output: (sink ids)}`.
-At start-up it checks that every routed output exists in the class's
-`outputs`, that every sink exists and `accepts` the output's content types
-(`sinks.accepts`), and that the class's `requirements(options)` name known
-sources and annotation keys some process run writes on one of them.
+Decisions 0015 and 0019. `Catalog` builds an `AppInstance` per `apps`
+entry: its profile, a `Schedule` (`every`, `at`, `days` as weekday
+numbers), its routes, `routes` or the `sink` shorthand turned into
+`{output: (sink ids)}`, and its `workflow`, the one that names it in its
+`apps` (None if none does). At start-up it checks that every routed output
+exists in the class's `outputs`, that every sink exists and `accepts` the
+output's content types (`sinks.accepts`), that no instance is in two
+workflows, and that every key of the class's `requirements(options)` is
+written by a process run of the instance's workflow.
 
-`Application.run_app(app_id, now, force, dry_run)`:
+`Application.run_app(app_id, now, force, dry_run)` (an instance of no
+workflow is a `ConfigError`):
 
 1. reads the run record (`Database.get_app_run`, an empty `AppletRun` if it
    never ran) and asks `applet.is_due(now, run, schedule)`;
    `BaseApplet.is_due` defers to `Schedule.is_due(now, last_success)`.
    `force` skips it;
 2. commits `last_started` on its own (`start_app_run`);
-3. calls `applet.run(now, run, reader)`, `run` being the record read before
+3. calls `applet.run(now, run, reader)`, `reader` an `AppletReader(db,
+   sources)` over its workflow's sources and `run` the record read before
    the start, and validates the result with `check_result` (declared
    outputs and content types, no key twice);
 4. stores it with `Database.commit_app_run`: in one transaction, each
@@ -401,24 +407,28 @@ sources and annotation keys some process run writes on one of them.
 
 `dry_run` runs the applet and reports which keys are new
 (`existing_document_keys`), the rows it would add for stored ones
-(`count_missing_routes`) and the state, writing nothing. `apps run --app`
-and `--default` deliver only to `routed_sinks(app_ids)`, `--all` to every
-sink; `--no-deliver` delivers nothing. `run` chains the workflow phases,
-the applets and the delivery as phases of one `run_phases`. `apps run` takes
-the write lock, so two of them never overlap. `reset_app` deletes the run
-record, and with `with_documents` the instance's documents (deliveries
-cascade); `app_status` gives each instance's record and
+(`count_missing_routes`) and the state, writing nothing. `apps` runs the
+selected workflows' instances and delivers nothing; `deliver -w` covers
+`workflow_sinks`, `--all` every sink. `run` chains each selected
+workflow's import, process and applets, then one delivery phase for the
+union of their sinks (every sink with `--all`), as phases of one
+`run_phases`, so a sink delivers once per call. Commands that write take
+the write lock, so two of them never overlap. `reset_app` (`delete apps`)
+deletes the run record, and with `with_documents` the instance's
+documents (deliveries cascade); `app_status` gives each instance's record,
+its workflow and
 `Schedule.next_due`, which tries the moments where being due can change
 (`last_success + every`, each day's start and `at`) over the next week.
 
-`AppletReader` is what an applet reads: `items` (by sources, publication
-and import bounds, through `ProcessingScope`), `annotations(items, key)`
+`AppletReader` is what an applet reads, built per run with its instance's
+workflow's sources: `items` (of those sources only, by publication and
+import bounds, through `ProcessingScope`), `annotations(items, key)`
 (by item key, one query), `content(item)` and `documents` (any instance's,
 with content). It never exposes the `Database` or another instance's state.
 
 The applets:
 
-- `feed` builds an RSS feed of the newest `max_items` items of its sources,
+- `feed` builds an RSS feed of the newest `max_items` items it reads,
   keyed by the run's UTC time (`run_key`), so each run emits a new one.
 - `itemfeed` emits a `text/plain` document per item imported since its
   cursor (its state, the last run's time) that has its `annotation`, keyed

@@ -26,8 +26,6 @@ from ..applets import (
     AppletType,
     BaseApplet,
     Outputs,
-    Requirements,
-    SourcesOptions,
 )
 from ..config import Duration
 from ..errors import PluginFailure
@@ -66,7 +64,7 @@ type Algorithm = Literal["singlelink", "avglink", "embeddings"]
 type Matrix = list[list[float]]
 
 
-class DigestOptions(SourcesOptions, UsesLLMOptions):
+class DigestOptions(UsesLLMOptions):
     title: str = "Digest"
     span_days: int = 7  # whole local days, ending yesterday
     input: str = "summary"  # the annotation each story is written from
@@ -123,14 +121,13 @@ class DigestApplet(BaseApplet):
         self.llm = services.llm(options.llm)
 
     @classmethod
-    def requirements(cls, options: DigestOptions) -> Requirements:
+    def required_keys(cls, options: DigestOptions) -> tuple[str, ...]:
         keys = [options.input, "tags", *options.include, *options.exclude]
         if options.topic_weights:
             keys.append("topics")
         if options.algorithm == "embeddings":
             keys.append(embedding_key(options.embedding))
-        sources = tuple(options.sources) if options.sources is not None else None
-        return Requirements(sources=sources, keys=tuple(dict.fromkeys(keys)))
+        return tuple(dict.fromkeys(keys))
 
     def run(self, now: datetime, run: AppletRun, reader: AppletReader) -> AppletResult:
         options = self.options
@@ -199,9 +196,7 @@ def read_candidates(
     reader: AppletReader, options: DigestOptions, since: datetime, until: datetime
 ) -> list[Candidate]:
     """The items of the period with `input` that pass the filters."""
-    items = reader.items(
-        sources=options.sources, published_since=since, published_until=until
-    )
+    items = reader.items(published_since=since, published_until=until)
     texts = reader.annotations(items, options.input)
     items = [item for item in items if item.key in texts]
     filters = {

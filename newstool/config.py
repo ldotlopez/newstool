@@ -4,7 +4,7 @@ import dataclasses
 import os
 import re
 import string
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from datetime import time
 from pathlib import Path
@@ -27,8 +27,6 @@ from pydantic_settings import (
 from .consts import PACKAGE_NAME
 from .models import SourceData
 
-# The workflow built from the catalog (`Config.default_workflow`).
-DEFAULT_WORKFLOW = "default"
 # Ids (of catalog entries, applet and sink instances), workflow names and
 # output names.
 NAME_PATTERN = re.compile(r"[a-z0-9_-]+")
@@ -84,7 +82,6 @@ class MissingVariableError(ConfigError):
     def __init__(self, variable: str, location: str) -> None:
         super().__init__(f"{location}: environment variable '{variable}' is not set")
         self.variable = variable
-        self.location = location
 
 
 def parse_duration(value: Any) -> Any:
@@ -143,7 +140,7 @@ class CacheConfig(pydantic.BaseModel):
 class Entry(pydantic.BaseModel):
     """A configured use of a plugin type: its `options` over the type's
     `plugins` section. `id` names it in the catalog, so that workflows can
-    refer to it; the entries of a workflow have none."""
+    refer to it."""
 
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
     id: str | None = None
@@ -185,7 +182,6 @@ class ProcessEntry(Entry):
 
     processor: str
     key: str | None = None
-    skip_default: bool = False  # catalog only: left out of `default`
 
     @pydantic.model_validator(mode="before")
     @classmethod
@@ -196,6 +192,11 @@ class ProcessEntry(Entry):
     @property
     def type_name(self) -> str:
         return self.processor
+
+    @property
+    def ref(self) -> str:
+        """What workflows refer to it by: its `id`, or else its type name."""
+        return self.id or self.processor
 
 
 class SinkEntry(Entry):
@@ -223,7 +224,6 @@ class AppEntry(Entry):
     days: list[Weekday] = []
     sink: str | None = None
     routes: dict[str, list[str]] = {}
-    skip_default: bool = False  # left out of `--default` (`run`, `apps run`...)
 
     @pydantic.model_validator(mode="after")
     def sink_or_routes(self) -> AppEntry:
@@ -237,32 +237,41 @@ class AppEntry(Entry):
 
 
 class Workflow(pydantic.BaseModel):
-    """Which sources to import and what to process on them. A string refers
-    to a catalog entry by `id`, or else to a type with its section's
-    options; a mapping is an entry of the workflow's own. `default`, built
-    from the catalog, has no entries of its own."""
+    """A chain (decision 0019): its sources are imported, its process entries
+    run on them in order, then its applet instances, whose outputs go to the
+    sinks they are routed to. Every entry is a catalog id."""
 
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
     name: str
-    sources: list[str]  # source ids
-    process: list[str | ProcessEntry] = []
+    sources: list[str]
+    process: list[str] = []  # `processors` refs
+    apps: list[str] = []
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def entries_are_ids(cls, value: Any) -> Any:
+        """Entries of a workflow's own were removed: point to the catalog."""
+        if not isinstance(value, Mapping):
+            return value
+        for field, section in (("process", "processors"), ("apps", "apps")):
+            for index, entry in enumerate(value.get(field) or []):
+                if not isinstance(entry, str):
+                    # A ValueError: pydantic reports it as a validation error.
+                    raise ValueError(  # noqa: TRY004
+                        f"workflow '{value.get('name')}': {field}.{index}: define"
+                        f" it in `{section}` with an `id` and refer to it"
+                    )
+        return value
 
     @pydantic.model_validator(mode="after")
     def entries_are_valid(self) -> Workflow:
         if not NAME_PATTERN.fullmatch(self.name):
             raise ValueError(f"invalid workflow name '{self.name}'")
-        for index, entry in enumerate(self.process):
-            if isinstance(entry, str):
-                continue
-            if entry.id is not None:
+        for field in ("sources", "process", "apps"):
+            ids: list[str] = getattr(self, field)
+            if repeated := sorted({id_ for id_ in ids if ids.count(id_) > 1}):
                 raise ValueError(
-                    f"workflow '{self.name}': process.{index} has an id;"
-                    " only catalog entries do"
-                )
-            if entry.skip_default:
-                raise ValueError(
-                    f"workflow '{self.name}': process.{index} sets"
-                    " skip_default; only catalog entries do"
+                    f"workflow '{self.name}': {field} lists {', '.join(repeated)} twice"
                 )
         return self
 
@@ -310,16 +319,15 @@ class Config(BaseSettings):
     # Plugin type name -> the defaults of its options in every use of the
     # type. Nothing is built from a section.
     plugins: dict[str, dict[str, Any] | None] = {}
-    # The catalog: every configured use, built when a workflow runs it.
+    # The catalog (decision 0019): what can run, built when a workflow runs
+    # it. Applet instances route their outputs to the sinks.
     llms: list[LLMEntry] = []
     sources: list[SourceData] = []
     processors: list[ProcessEntry] = []
-    # Workflows, run by name; a list, since YAML drops duplicate keys.
-    workflows: list[Workflow] = []
-    # Global instances (decision 0015): applets, run by `apps run`, and the
-    # sinks their outputs are routed to.
     apps: list[AppEntry] = []
     sinks: list[SinkEntry] = []
+    # What runs, by name; a list, since YAML drops duplicate keys.
+    workflows: list[Workflow] = []
     cache: CacheConfig = CacheConfig()
     # Where the HTTP cache lives.
     cache_dir: ConfigPath = pydantic.Field(
@@ -354,54 +362,77 @@ class Config(BaseSettings):
     def content_dir(self) -> Path:
         return self.storage_dir / "content"
 
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def no_skip_default(cls, value: Any) -> Any:
+        """`skip_default` was removed (decision 0019): say what replaces it."""
+        if not isinstance(value, Mapping):
+            return value
+        for section in ("sources", "processors", "apps"):
+            for index, entry in enumerate(value.get(section) or []):
+                if isinstance(entry, Mapping) and "skip_default" in entry:
+                    raise ValueError(
+                        f"{section}.{index}: `skip_default` was removed (decision"
+                        " 0019): list what runs in `workflows`"
+                    )
+        return value
+
     @pydantic.model_validator(mode="after")
     def catalog_ids_are_unique(self) -> Config:
-        source_ids = [source.id for source in self.sources]
-        if len(source_ids) != len(set(source_ids)):
-            raise ValueError("source ids must be unique")
-        catalog: dict[str, Sequence[Entry]] = {
-            "llms": self.llms,
-            "processors": self.processors,
-            "apps": self.apps,
-            "sinks": self.sinks,
+        catalog: dict[str, list[str]] = {
+            "sources": [source.id for source in self.sources],
+            "llms": [entry.id for entry in self.llms if entry.id is not None],
+            "processors": [entry.ref for entry in self.processors],
+            "apps": [entry.id for entry in self.apps],
+            "sinks": [entry.id for entry in self.sinks],
         }
-        for section, entries in catalog.items():
-            ids = [entry.id for entry in entries if entry.id is not None]
-            if duplicated := sorted({id for id in ids if ids.count(id) > 1}):
-                raise ValueError(f"{section}: id(s) {', '.join(duplicated)} used twice")
+        for section, ids in catalog.items():
+            if duplicated := sorted({id_ for id_ in ids if ids.count(id_) > 1}):
+                hint = (
+                    " (an entry without `id` takes its type name: give each its own)"
+                    if section == "processors"
+                    else ""
+                )
+                raise ValueError(
+                    f"{section}: id(s) {', '.join(duplicated)} used twice{hint}"
+                )
         return self
 
     @pydantic.model_validator(mode="after")
     def workflows_are_valid(self) -> Config:
+        """Names are unique, every entry is in the catalog, and an applet
+        instance belongs to one workflow."""
         names = [workflow.name for workflow in self.workflows]
-        if DEFAULT_WORKFLOW in names:
-            raise ValueError(f"the workflow name '{DEFAULT_WORKFLOW}' is reserved")
         if len(names) != len(set(names)):
             raise ValueError("workflow names must be unique")
-        known = {source.id for source in self.sources}
+        known = {
+            "source": {source.id for source in self.sources},
+            "processor": {entry.ref for entry in self.processors},
+            "applet instance": {entry.id for entry in self.apps},
+        }
+        owners: dict[str, str] = {}
         for workflow in self.workflows:
-            if unknown := [s for s in workflow.sources if s not in known]:
-                raise ValueError(
-                    f"workflow '{workflow.name}': unknown source(s)"
-                    f" {', '.join(unknown)}"
-                )
+            for kind, ids in (
+                ("source", workflow.sources),
+                ("processor", workflow.process),
+                ("applet instance", workflow.apps),
+            ):
+                if unknown := [id_ for id_ in ids if id_ not in known[kind]]:
+                    raise ValueError(
+                        f"workflow '{workflow.name}': unknown {kind}(s)"
+                        f" {', '.join(unknown)}"
+                    )
+            for app_id in workflow.apps:
+                if (owner := owners.setdefault(app_id, workflow.name)) != workflow.name:
+                    raise ValueError(
+                        f"app '{app_id}' is in workflows '{owner}' and"
+                        f" '{workflow.name}'; an applet instance belongs to one"
+                    )
         return self
 
-    def default_workflow(self) -> Workflow:
-        """The `default` workflow: the sources without `skip_default`. Its
-        runs are the catalog's processors without it."""
-        return Workflow(
-            name=DEFAULT_WORKFLOW,
-            sources=[source.id for source in self.sources if not source.skip_default],
-        )
-
-    def default_app_ids(self) -> list[str]:
-        """The applet instances without `skip_default`, in configuration order."""
-        return [entry.id for entry in self.apps if not entry.skip_default]
-
-    def all_workflows(self) -> list[Workflow]:
-        """Every workflow, `default` first."""
-        return [self.default_workflow(), *self.workflows]
+    def workflow_of_app(self, app_id: str) -> Workflow | None:
+        """The workflow an applet instance belongs to, if any."""
+        return next((w for w in self.workflows if app_id in w.apps), None)
 
     def get_source(self, source_id: str) -> SourceData:
         for source in self.sources:
