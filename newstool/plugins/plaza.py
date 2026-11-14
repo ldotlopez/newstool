@@ -26,12 +26,10 @@ DATETIME_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})[^\d]+(\d{2}):(\d{2})")
 
 
 def get_section(tag: bs4.Tag, title: str) -> bs4.Tag:
-    sections = tag.select("h2 span")
-    for sect in sections:
-        if sect.get_text().strip().lower() == "castellón":
-            return sect
-
-    raise PluginFailure("Could not find section 'Castellón' in index page")
+    for section in tag.select("h2 span"):
+        if section.get_text().strip().lower() == title.lower():
+            return section
+    raise PluginFailure(f"Could not find section '{title}' in index page")
 
 
 def parse_datetime(tag: bs4.Tag) -> datetime:

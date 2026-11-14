@@ -38,11 +38,11 @@ class SinkOptions(PluginOptions):
     max_retries: int = 3
 
 
-@runtime_checkable
 class Sink(Protocol):
     """Sends one document; returns its external reference. Raise on failure;
-    the error is logged with its traceback, so it must not chain an exception
-    that holds a secret (raise it `from None`)."""
+    the error may be logged with its traceback (with debug logging, or when
+    unexpected), so it must not chain an exception that holds a secret
+    (raise it `from None`)."""
 
     def send(self, document: Document) -> JsonCompatible: ...
 

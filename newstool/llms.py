@@ -12,7 +12,6 @@ class LLMUnavailableError(LookupError):
     """The LLM a plugin asked for is not configured."""
 
 
-@runtime_checkable
 class LLM(Protocol):
     """Serves language models. Without `model`, each method uses the
     backend's default model for it."""

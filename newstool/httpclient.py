@@ -24,20 +24,15 @@ DEFAULT_HEADERS = {
 
 
 class HTTPClient:
-    def __init__(self, cache: cache.Cache, headers: dict[str, str] = DEFAULT_HEADERS):
+    """GET requests with a browser's headers, through a cache."""
+
+    def __init__(self, cache: cache.Cache) -> None:
         self.cache = cache
         self.session = requests.Session()
-        self.session.headers.update(headers)
+        self.session.headers.update(DEFAULT_HEADERS)
 
     def get(self, url: str, *, use_cache: bool = True) -> bytes:
-        return self.fetch("GET", url, use_cache=use_cache)
-
-    def fetch(
-        self, method: str, url: str, *args, use_cache: bool = True, **kwargs
-    ) -> bytes:
-        is_cacheable = use_cache and method.upper() == "GET"
-
-        if is_cacheable:
+        if use_cache:
             try:
                 content = self.cache.get(url)
                 LOGGER.debug(f"{url} found in cache ({len(content)} bytes)")
@@ -45,13 +40,11 @@ class HTTPClient:
             except cache.CacheMissError:
                 pass
 
-        resp = self.session.request(method, url, *args, **kwargs)
+        resp = self.session.request("GET", url)
         content = resp.content
-
         LOGGER.debug(f"{url} fetched {len(content)} bytes")
         # Error pages must not be served from cache for the whole TTL.
-        if is_cacheable and resp.ok:
+        if use_cache and resp.ok:
             self.cache.set(url, content)
             LOGGER.debug(f"{url} saved {len(content)} bytes")
-
         return content

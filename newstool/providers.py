@@ -15,7 +15,6 @@ LOGGER = logging.getLogger(__name__)
 type URI = str
 
 
-@runtime_checkable
 class Provider(Protocol):
     """Retrieves all of a source's items in one go."""
 

@@ -88,7 +88,6 @@ class CSJuntasGobiernoProvider(BaseProvider):
             href = link.get("href") or ""
             if ".pdf/" not in href:
                 # Ignore this type of link, as it is not relevant for our purposes
-                # LOGGER.warning(f"not a pdf link: {href}")
                 continue
             uri = urljoin(base_url, href)  # ty: ignore[invalid-argument-type]
 
@@ -98,12 +97,11 @@ class CSJuntasGobiernoProvider(BaseProvider):
             elif "extracto" in link.get_text(strip=True).lower():
                 type_ = "extract"
             else:
-                # LOGGER.warning(f"unknown type for {link.get_text(strip=True)}")
                 # Ignore this type of link, as it is not relevant for our purposes
                 continue
 
             # Parse date
-            li_parent = find_parent_by_tag_name(link, "li")
+            li_parent = link.find_parent("li")
             if li_parent is None:
                 LOGGER.warning(f"no parent <li> found for link: {href}")
                 continue
@@ -137,25 +135,8 @@ class CSJuntasGobiernoProvider(BaseProvider):
             )
 
 
-#
-# foundation scrapelib candidates
-#
-def find_parent_by_tag_name(
-    node: bs4.Tag,
-    name: str,
-) -> bs4.element.Tag | None:
-    current = node
-    while current is not None and current.name != name:
-        current = current.parent
-    return current
-
-
-def get_date_from_text(tag: bs4.Tag, pattern: str | re.Pattern) -> re.Match:
+def get_date_from_text(tag: bs4.Tag, pattern: re.Pattern[str]) -> re.Match[str]:
     text = tag.get_text().strip()
-
-    if isinstance(pattern, str):
-        pattern = re.compile(pattern)
-
     if (m := pattern.search(text)) is None:
         raise PluginFailure(f"Unable to extract date from: {text!r}")
 

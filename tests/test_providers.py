@@ -2,7 +2,6 @@ import datetime
 import hashlib
 import unittest
 from pathlib import Path
-from pprint import pprint as pp
 from unittest.mock import Mock
 
 import pydantic
@@ -261,10 +260,6 @@ class TestPrensaIberica(unittest.TestCase):
         self.assertEqual(entry_data.data["section"], expected.data["section"])
         self.assertEqual(entry_data.data["author"], expected.data["author"])
         self.assertEqual(set(entry_data.data["tags"]), set(expected.data["tags"]))
-
-    def dump_entry_data(self, entry_data: SourceItemData) -> None:
-        # entry_data.content = entry_data.content[0:50]
-        pp(entry_data)
 
     def test_parse_item_0(self) -> None:
         self.check_parser(

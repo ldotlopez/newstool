@@ -233,14 +233,10 @@ class ProcessingStatus(enum.StrEnum):
     IGNORED = "ignored"
 
 
-def backoff_seconds(
-    attempts: int,
-    base: float = 60.0,
-    factor: float = 2.0,
-    max_seconds: float = 24 * 3600,
-) -> float:
-    """Exponential backoff between retries: base * factor**(attempts-1), capped."""
-    return min(base * (factor ** max(attempts - 1, 0)), max_seconds)
+def backoff_seconds(attempts: int) -> float:
+    """Exponential backoff between retries: a minute, doubling each attempt,
+    at most a day."""
+    return min(60.0 * 2.0 ** max(attempts - 1, 0), 24 * 3600.0)
 
 
 class DBItemAnnotation(Base):

@@ -17,7 +17,7 @@ paths:
 - **Database-Native Integrity:** Prefer database-level constraints and triggers over ORM-level or Python-level validation hooks.
   - Define `CheckConstraint`, `UniqueConstraint`, and foreign key cascade rules directly in SQLAlchemy model table definitions so they execute natively in SQL.
 - **No Migrations Framework:** The schema is created, never migrated. Changes to existing tables or stored data need a one-shot migration plus its test in `private/`, which is git-ignored: they run once in production and are never committed.
-- **Content on Disk:** Annotation and artifact values are stored as files under `content_dir`, not in the DB (ADR 0004).
+- **Content on Disk:** Annotation values and item and document contents are stored as files under `content_dir`, not in the DB (ADR 0004).
 
 ## DTO, Protocol & ORM Implementation Reference
 

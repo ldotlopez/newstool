@@ -29,7 +29,6 @@ class RunSummary:
     failed: int = 0
 
 
-@runtime_checkable
 class Processor(Protocol):
     """Annotates items. Each run writes one annotation key, which also keys
     its processing state."""
