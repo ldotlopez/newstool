@@ -25,6 +25,7 @@ The docs are large (~100 KB together); read only the one the task needs, when it
 - `docs/ARCHITECTURE.md`: internals and how to write a plugin. Read before adding a plugin or module, or changing boundaries between layers.
 - `docs/SPECIFICATION.md`: the full definition of the application's behavior.
 - `docs/decisions/`: recorded design decisions (ADRs). Check before proposing changes to an established approach; do not reverse a recorded decision without asking.
+- `docs/DIGESTS.md`: story digests (`digest`, `classify`, `tagger`, `embed`): design decisions, roadmap, plan and backlog. Read before changing those plugins.
 - `PLAN.md`: the backlog. Read only when asked about pending work.
 
 ---
